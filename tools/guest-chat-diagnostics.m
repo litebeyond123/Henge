@@ -1,4 +1,5 @@
 #import "guest-chat-diagnostics.h"
+#import <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -57,15 +58,21 @@ NSDictionary *HengeChatDiagnosticsValidateRequest(NSData *data, NSDate *now, BOO
     if (![json isKindOfClass:NSDictionary.class] || ![json[@"schema_version"] isEqual:@1] ||
         ![json[@"task"] isEqual:@"chat_error_summary"] ||
         !uuid(json[@"vm_session_id"]) || !uuid(json[@"request_id"])) return nil;
+    // New hosts explicitly distinguish a heartbeat request from permission to collect. An expired
+    // timestamp alone is insufficient when the guest clock lags. Old hosts retain their prior behavior.
+    id collectValue = json[@"collect"];
+    if (collectValue && (![collectValue isKindOfClass:NSNumber.class] ||
+        CFGetTypeID((__bridge CFTypeRef)collectValue) != CFBooleanGetTypeID())) return nil;
+    BOOL shouldCollect = collectValue ? [collectValue boolValue] : YES;
     NSDate *created = dateValue(json[@"created_utc"]), *expires = dateValue(json[@"expires_utc"]);
     NSTimeInterval duration = [expires timeIntervalSinceDate:created ?: now];
     if (!created || !expires || duration < 1 || duration > 90) return nil;
-    if (requireFresh && ([created timeIntervalSinceDate:now] > 30 || [expires timeIntervalSinceDate:now] <= 0)) return nil;
+    if (requireFresh && (!shouldCollect || [created timeIntervalSinceDate:now] > 30 || [expires timeIntervalSinceDate:now] <= 0)) return nil;
     // Return a new allowlisted dictionary; the caller never evaluates request strings as code/paths.
     return @{@"schema_version": @1, @"task": @"chat_error_summary",
              @"vm_session_id": [json[@"vm_session_id"] uppercaseString],
              @"request_id": [json[@"request_id"] uppercaseString],
-             @"created_utc": utc(created), @"expires_utc": utc(expires)};
+             @"created_utc": utc(created), @"expires_utc": utc(expires), @"collect": @(shouldCollect)};
 }
 
 static NSArray<NSString *> *countKeys(void) {
@@ -314,6 +321,7 @@ static int pollOnce(HengeChatTransport transport) {
         transport(@"PUT", readyPath, ready, 1024, &status);
         if (status == 200 || status == 201 || status == 204) { readySession = request[@"vm_session_id"]; lastReady = mono(); }
     }
+    if (![request[@"collect"] boolValue]) { pendingReport = nil; return 0; } // Explicit heartbeat-only request, regardless of clock skew.
     if (!HengeChatDiagnosticsValidateRequest(bytes, NSDate.date, YES)) return 0; // Enabled, waiting for a fresh host request.
     NSString *key = [NSString stringWithFormat:@"%@/%@", request[@"vm_session_id"], request[@"request_id"]];
     if (![handledRequest isEqual:key]) {

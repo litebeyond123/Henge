@@ -1,6 +1,6 @@
 # Henge 0.4 test packages
 
-The test release is version **0.4.0**, build **4003**. This build setup starts
+The test release is version **0.4.0**, build **4004**. This build setup starts
 from the successful `2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f` workflow and
 keeps its `xcode-27` runner and dependency build procedure. It does not contain
 a prebuilt 0.4 app. A successful macOS build is required to produce one.
@@ -18,7 +18,7 @@ TrollStore **Henge.tipa** first, and uploads it with a JSON manifest and SHA-256
 checksum. Select `include_ipa` only if an additional sideloading IPA is needed.
 On `litebeyond123/Henge`, a successful push build of
 `work/0.4-ipados17-test` also publishes the validated package as the
-`v0.4.0-test3` prerelease. The publication job checks the package digest,
+`v0.4.0-test4` prerelease. The publication job checks the package digest,
 version, build and full source commit against this run's manifest before
 uploading it. That separate job alone has repository write permission.
 Other repositories and branches only receive build artifacts. The workflow
@@ -29,8 +29,9 @@ the successful base build's checkout log. The workflow records both source
 commits and the Xcode/SDK versions, and includes Husk's commit in the cache key.
 
 The build runs the package-validator regression tests, host-services tests,
-small-surface layout/Metal tests, Foundation-only Swift diagnostics tests, and
-the Swift/Objective-C guest Chat summary protocol tests before compiling the
+small-surface layout/Metal tests, Foundation-only Swift diagnostics tests,
+helper install/rollback and health/status checks, reduced-load resource policy
+checks, and the Swift/Objective-C guest Chat summary protocol tests before compiling the
 app. A missing compatible Metal device is reported
 as a native pixel-test skip, not a pass. Logs are
 uploaded even when a subsequent build or validation step fails. The log
@@ -53,9 +54,11 @@ runs the native Metal pixel checks when a compatible GPU is available. Exit 77
 means that the native GPU test could not run. Test 2's texture compatibility
 notes remain in `docs/0.4-test2-zh-CN.md`; Test 3's automatic Chat diagnostics,
 sharing changes and runtime limitations are in `docs/release-test3.md`.
+Test 4 helper installation, connection states and reduced-load settings are
+documented in `docs/release-test4.md`.
 
 Validate an actual downloaded build against the full source commit used by its
-workflow. The default expected version/build are 0.4.0/4003:
+workflow. The default expected version/build are 0.4.0/4004:
 
 ```sh
 python3 ci/validate-package.py /path/to/Henge.tipa \

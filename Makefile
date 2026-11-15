@@ -48,9 +48,9 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
 RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
 
 # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
-$(B)/henge-agent: tools/henge-agent.m tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h
+$(B)/henge-agent: tools/henge-agent.m tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h
 	@mkdir -p $(B)
-	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit tools/henge-agent.m tools/guest-chat-diagnostics.m -o $@
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit tools/henge-agent.m tools/guest-chat-diagnostics.m tools/helper-health.m -o $@
 	codesign -f -s - $@
 
 # Compressed in the app: tools that sign an IPA would try to sign a bare Mach-O too.
@@ -61,7 +61,11 @@ $(B)/test_guest_chat_diagnostics: tests/test_guest_chat_diagnostics.m tools/gues
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -DHENGE_CHAT_DIAGNOSTICS_TEST -framework Foundation tests/test_guest_chat_diagnostics.m tools/guest-chat-diagnostics.m -o $@
 
-$(B)/share.o: host/share.c host/share.h
+$(B)/test_helper_health: tests/test_helper_health.m tools/helper-health.m tools/helper-health.h
+	@mkdir -p $(B)
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework Foundation tests/test_helper_health.m tools/helper-health.m -o $@
+
+$(B)/share.o: host/share.c host/share.h host/helper-install-script.inc
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a

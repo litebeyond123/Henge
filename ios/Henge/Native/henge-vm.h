@@ -59,6 +59,7 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
 void henge_share_set_clipboard(const char *text);
 char *henge_share_take_clipboard(void);
 long henge_share_agent_seen(void);
+char *henge_share_helper_health(void);
 
 /* Optional host services over the same guest-only HTTP connection. UI thread publishes/handles requests.
    The apply callback is synchronous and must not call these services again or run an event loop. */

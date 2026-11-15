@@ -2,12 +2,15 @@
 // and keeps the shared folder mounted. It talks to host/share.c at 10.0.2.4, which only exists inside Henge.
 #import <AppKit/AppKit.h>
 #import "guest-chat-diagnostics.h"
+#import "helper-health.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -53,7 +56,7 @@ static NSData *requestWithSession(NSString *method, NSString *path, NSData *body
         struct pollfd wait = {.fd = fd, .events = POLLOUT};
         int error = 0;
         socklen_t size = sizeof error;
-        if (errno != EINPROGRESS || poll(&wait, 1, 5000) <= 0 ||
+        if (errno != EINPROGRESS || poll(&wait, 1, seconds < 5 ? seconds * 1000 : 5000) <= 0 ||
             getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error) {
             close(fd);
             return nil;
@@ -92,7 +95,7 @@ static NSData *requestWithSession(NSString *method, NSString *path, NSData *body
     NSRange end = [all rangeOfData:[NSData dataWithBytes:"\r\n\r\n" length:4] options:0 range:NSMakeRange(0, all.length)];
     if (end.location == NSNotFound) return nil;
     NSString *headers = [[NSString alloc] initWithData:[all subdataWithRange:NSMakeRange(0, end.location)] encoding:NSUTF8StringEncoding];
-    if (sscanf(headers.UTF8String, "HTTP/1.1 %d", status) != 1) return nil;
+    if (!headers || sscanf(headers.UTF8String, "HTTP/1.1 %d", status) != 1) return nil;
     NSRange found = [headers rangeOfString:@"X-Henge-Seq: "];
     if (found.location != NSNotFound && seq) *seq = strtoul(headers.UTF8String + NSMaxRange(found), NULL, 10);
     NSUInteger start = NSMaxRange(end);
@@ -106,6 +109,41 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
 
 static NSData *chatTransport(NSString *method, NSString *path, NSData *body, NSUInteger limit, int *status) {
     return requestWithSession(method, path, body, nil, 4, limit, status, NULL);
+}
+
+// Health is separate from clipboard long polls and diagnostic collection. A probe never marks a daemon alive.
+static NSData *helperTransport(NSString *method, NSString *path, NSString *session, int *status) {
+    return requestWithSession(method, path, nil, session, 2, 4096, status, NULL);
+}
+
+static atomic_int helperStartupStage;
+static NSString *helperStage(void) {
+    switch (atomic_load(&helperStartupStage)) {
+        case 1: return @"clipboard_starting";
+        case 2: return @"ready";
+        case 3: return @"clipboard_unavailable";
+        default: return @"network_ready";
+    }
+}
+
+static void startHelperHealth(void) {
+    // Report before the first AppKit/NSPasteboard call. Later heartbeats run even if AppKit is blocked.
+    HengeHelperPing(helperTransport, @"network_ready", NO);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        double nextHealth = monotonicSeconds() + 10;
+        for (;;) {
+            @autoreleasepool {
+                // Polling/receipts must not depend on NSPasteboard or the main run loop becoming ready.
+                // The collector itself serializes bounded work and skips expired startup requests.
+                HengeChatDiagnosticsPoll(chatTransport);
+                if (monotonicSeconds() >= nextHealth) {
+                    HengeHelperPing(helperTransport, helperStage(), NO);
+                    nextHealth = monotonicSeconds() + 10;
+                }
+            }
+            sleep(2);
+        }
+    });
 }
 
 static int printHostResponse(NSData *data, int status) {
@@ -162,24 +200,33 @@ static NSInteger lastChange;
 static void followDevice(void) {
     unsigned long seq = 0;
     for (BOOL first = YES;; first = NO) {
-        int status = 0;
-        unsigned long now = seq;
-        NSData *body = request(@"GET", [NSString stringWithFormat:@"/.henge/clipboard?since=%lu", first ? ULONG_MAX >> 1 : seq], nil, &status, &now);
-        if (!body) {
-            sleep(5);
-            continue;
+        if (atomic_load(&helperStartupStage) != 2) return;
+        @autoreleasepool {
+            int status = 0;
+            unsigned long now = seq;
+            NSData *body = request(@"GET", [NSString stringWithFormat:@"/.henge/clipboard?since=%lu", first ? ULONG_MAX >> 1 : seq], nil, &status, &now);
+            if (!body) {
+                sleep(5);
+                continue;
+            }
+            BOOL news = !first && status == 200 && now != seq;
+            seq = now; // what the device had before this helper started isn't news
+            if (!news) continue;
+            NSString *text = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+            if (!text) continue;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (atomic_load(&helperStartupStage) != 2) return;
+                @try {
+                    NSPasteboard *board = NSPasteboard.generalPasteboard;
+                    [board clearContents];
+                    [board setString:text forType:NSPasteboardTypeString];
+                    lastChange = board.changeCount;
+                } @catch (NSException *exception) {
+                    (void)exception;
+                    atomic_store(&helperStartupStage, 3);
+                }
+            });
         }
-        BOOL news = !first && status == 200 && now != seq;
-        seq = now; // what the device had before this helper started isn't news
-        if (!news) continue;
-        NSString *text = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-        if (!text) continue;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSPasteboard *board = NSPasteboard.generalPasteboard;
-            [board clearContents];
-            [board setString:text forType:NSPasteboardTypeString];
-            lastChange = board.changeCount;
-        });
     }
 }
 
@@ -217,16 +264,40 @@ static void keepMounted(void) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "--version")) { puts("henge-agent 4"); return 0; }
+        if (argc == 2 && !strcmp(argv[1], "--connection-check")) {
+            BOOL connected = HengeHelperPing(helperTransport, @"network_ready", YES);
+            if (!connected) fputs("Henge helper connection probe failed. Keep Henge open with this Mac running.\n", stderr);
+            return connected ? 0 : 1;
+        }
+        if (argc == 3 && !strcmp(argv[1], "--health-check")) {
+            char *end = NULL;
+            errno = 0;
+            long pid = strtol(argv[2], &end, 10);
+            if (errno || !argv[2][0] || *end || pid <= 0 || pid > INT_MAX) return 2;
+            return HengeHelperCheckPID(helperTransport, (int)pid) ? 0 : 1;
+        }
         if (argc == 2 && !strcmp(argv[1], "--chat-diagnostics")) return HengeChatDiagnosticsRun(chatTransport);
         if (argc > 1) return hostCommand(argc, argv);
-        lastChange = NSPasteboard.generalPasteboard.changeCount;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
+        startHelperHealth();
+        atomic_store(&helperStartupStage, 1);
+        HengeHelperPing(helperTransport, @"clipboard_starting", NO);
+        @try {
+            lastChange = NSPasteboard.generalPasteboard.changeCount;
+            atomic_store(&helperStartupStage, 2);
+        } @catch (NSException *exception) {
+            (void)exception;
+            atomic_store(&helperStartupStage, 3);
+        }
+        if (atomic_load(&helperStartupStage) == 2)
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
         keepMounted();
-        HengeChatDiagnosticsPoll(chatTransport);
-        [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *timer) {
-            (void)timer; HengeChatDiagnosticsPoll(chatTransport);
+        [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) {
+            (void)timer;
+            if (atomic_load(&helperStartupStage) != 2) return;
+            @try { checkClipboard(); }
+            @catch (NSException *exception) { (void)exception; atomic_store(&helperStartupStage, 3); }
         }];
-        [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; checkClipboard(); }];
         [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) { (void)timer; keepMounted(); }];
         [NSRunLoop.mainRunLoop run];
     }

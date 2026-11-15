@@ -46,6 +46,7 @@ struct SessionView: View {
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
     @State private var helperRunning = false
+    @State private var helperHealth = HelperHealthSnapshot.unavailable
     @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
     @Environment(\.scenePhase) private var scenePhase
 
@@ -507,17 +508,20 @@ struct SessionView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Sharing") {
-                    LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
-                    Button(helperRunning ? "Type the Update Helper Command" : "Type the Set Up Command") {
+                    LabeledContent("Helper connection", value: helperHealth.connectionTitle)
+                    LabeledContent("Install / Repair", value: helperHealth.installationTitle)
+                    LabeledContent("Clipboard channel", value: helperRunning ? "Connected" : "Waiting")
+                    Text(helperHealth.detail).font(.footnote).foregroundStyle(.secondary)
+                    Button("Type Install / Repair Command") {
                         showDetails = false
                         Task {
                             try? await Task.sleep(nanoseconds: 600_000_000)
                             await Sharing.typeSetUpCommand()
                         }
                     }
-                    Text(helperRunning
-                         ? "Put files in Files, Henge, Shared to see them in the Henge folder in this Mac's home folder. What you copy on the Mac is copied here too, and the paste button pastes from here into the Mac."
-                         : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
+                    Text("To install, update or repair: focus Terminal in the Mac, then tap this button. Wait until the entire command has finished typing before pressing Return in Terminal. The installer result appears here automatically. Allow local networking if macOS asks. The typed command needs the Mac's keyboard layout to be U.S.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text("Shared files are in Files → Henge → Shared on this iPad and in the Henge folder in the Mac's home folder.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 HostServicesSection()
@@ -543,7 +547,7 @@ struct SessionView: View {
                     DiagnosticsExportButton()
                     Button {
                         Diagnostics.markInputIssue(softwareKeyboardVisible: typing, externalDisplay: display.isExternal,
-                                                   zoomed: zoomed, helperRunning: helperRunning)
+                                                   zoomed: zoomed, helperRunning: helperHealth.isConnected)
                         inputIssueMarkers += 1
                     } label: {
                         Label(inputIssueMarkers == 0 ? "Mark missing input candidates" : "Input issue marked (\(inputIssueMarkers))",
@@ -644,6 +648,7 @@ struct SessionView: View {
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
             helperRunning = Sharing.helperRunning
+            helperHealth = Sharing.helperHealth
             log = Array(HengeLog.recentLines(200))
             let heat = ProcessInfo.processInfo.thermalState
             if heat.rawValue != thermalState.rawValue {

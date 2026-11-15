@@ -14,6 +14,19 @@ int main(void) {
         assert(HengeChatDiagnosticsValidateRequest(json(request), now, YES));
         assert(!HengeChatDiagnosticsValidateRequest(json(request), [now dateByAddingTimeInterval:61], YES));
         assert(HengeChatDiagnosticsValidateRequest(json(request), [now dateByAddingTimeInterval:61], NO));
+        request[@"collect"] = @NO;
+        assert(HengeChatDiagnosticsValidateRequest(json(request), now, NO));
+        // At host now+120 these timestamps are expired, but a guest clock 90 seconds behind sees them
+        // as fresh. An explicit false still permits only the heartbeat, never collect/log show.
+        assert(!HengeChatDiagnosticsValidateRequest(json(request), [now dateByAddingTimeInterval:30], YES));
+        request[@"collect"] = @YES;
+        assert(HengeChatDiagnosticsValidateRequest(json(request), [now dateByAddingTimeInterval:30], YES));
+        for (id invalid in @[@0, @1, @"false", NSNull.null]) {
+            request[@"collect"] = invalid;
+            assert(!HengeChatDiagnosticsValidateRequest(json(request), now, NO));
+        }
+        [request removeObjectForKey:@"collect"]; // Legacy hosts omit this field and retain existing behavior.
+        assert(HengeChatDiagnosticsValidateRequest(json(request), now, YES));
         request[@"task"] = @"run_command";
         assert(!HengeChatDiagnosticsValidateRequest(json(request), now, YES));
         request[@"task"] = @"chat_error_summary";

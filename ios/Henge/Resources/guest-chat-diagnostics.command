@@ -7,7 +7,7 @@ trap '/bin/rm -rf "$HENGE_CHAT_SETUP_TMP"' EXIT HUP INT TERM
 /usr/bin/curl --fail --silent --show-error --connect-timeout 3 --max-time 20 \
     http://10.0.2.4/.henge/install -o "$HENGE_CHAT_SETUP_TMP/install.sh"
 /bin/sh "$HENGE_CHAT_SETUP_TMP/install.sh"
-echo 'Enabled. Return to Henge and use Collect Chat diagnostics.'
+echo 'Helper connection confirmed. Return to Henge and use Collect Chat diagnostics.'
 echo 'Versions, signature status and fixed error categories are included automatically.'
 echo 'No conversation database, cookies, tokens, keychain or raw log text is exported.'
 echo 'If macOS asks about henge-agent and local networks, choose Allow.'

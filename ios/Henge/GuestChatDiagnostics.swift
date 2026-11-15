@@ -10,6 +10,23 @@ extension Notification.Name {
     static let hengeGuestChatDiagnosticsDidUpdate = Notification.Name("HengeGuestChatDiagnosticsUpdated")
 }
 
+struct GuestChatReadiness: Equatable {
+    enum State: String { case ready, missing_or_unreadable, invalid, version_mismatch, other_session, stale, clock_ahead }
+    let state: State
+    let ageSeconds: Int?
+    var explanation: String {
+        switch state {
+        case .ready: return "The diagnostic heartbeat is current."
+        case .missing_or_unreadable: return "No diagnostic heartbeat has been received."
+        case .invalid: return "The diagnostic heartbeat could not be validated."
+        case .version_mismatch: return "The diagnostic protocol version differs."
+        case .other_session: return "The diagnostic heartbeat belongs to a different Mac session."
+        case .stale: return "The diagnostic heartbeat has expired."
+        case .clock_ahead: return "The Mac heartbeat time is ahead of the iPad clock."
+        }
+    }
+}
+
 /// The guest can submit only a small, typed summary. Shared files are untrusted input.
 enum GuestChatDiagnosticsSchema {
     struct Request {
@@ -17,15 +34,20 @@ enum GuestChatDiagnosticsSchema {
         let requestID: UUID
         let created: Date
         let expires: Date
-        init(sessionID: UUID, now: Date = Date()) {
+        let collect: Bool
+        init(sessionID: UUID, now: Date = Date(), collect: Bool = true) {
             self.sessionID = sessionID
             requestID = UUID()
-            created = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970))
+            self.collect = collect
+            // New helpers use the explicit Bool; the old timestamp also keeps
+            // an older helper from collecting under ordinary clock drift.
+            let start = collect ? now : now.addingTimeInterval(-86_400)
+            created = Date(timeIntervalSince1970: floor(start.timeIntervalSince1970))
             expires = created.addingTimeInterval(60)
         }
         var dictionary: [String: Any] {
             ["schema_version": 1, "task": "chat_error_summary", "vm_session_id": sessionID.uuidString,
-             "request_id": requestID.uuidString, "created_utc": utc(created), "expires_utc": utc(expires)]
+             "request_id": requestID.uuidString, "created_utc": utc(created), "expires_utc": utc(expires), "collect": collect]
         }
     }
 
@@ -62,7 +84,7 @@ enum GuestChatDiagnosticsSchema {
 
     /// Rebuild rather than redact the input. No guest-provided free text is retained.
     static func canonicalReport(_ data: Data, request: Request, now: Date = Date()) -> [String: Any]? {
-        guard data.count <= 16_384, now <= request.expires,
+        guard request.collect, data.count <= 16_384, now <= request.expires,
               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any], raw.count <= 64,
               integer(raw["schema_version"], maximum: 1) == 1,
               integer(raw["collector_version"], maximum: 1) == 1,
@@ -130,12 +152,23 @@ enum GuestChatDiagnosticsSchema {
     }
 
     static func ready(_ data: Data, session: UUID, now: Date = Date()) -> Bool {
+        readiness(data, session: session, now: now).state == .ready
+    }
+
+    static func readiness(_ data: Data?, session: UUID, now: Date = Date()) -> GuestChatReadiness {
+        guard let data else { return .init(state: .missing_or_unreadable, ageSeconds: nil) }
         guard data.count <= 4096, let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              integer(raw["schema_version"], maximum: 1) == 1,
-              integer(raw["collector_version"], maximum: 1) == 1,
-              (raw["vm_session_id"] as? String).flatMap(UUID.init(uuidString:)) == session,
-              let seen = date(raw["seen_utc"]) else { return false }
-        return seen.timeIntervalSince(now) <= 30 && now.timeIntervalSince(seen) <= 45
+              let schema = integer(raw["schema_version"], maximum: 65535),
+              let collector = integer(raw["collector_version"], maximum: 65535),
+              let identifier = (raw["vm_session_id"] as? String).flatMap(UUID.init(uuidString:)),
+              let seen = date(raw["seen_utc"]) else { return .init(state: .invalid, ageSeconds: nil) }
+        guard schema == 1 && collector == 1 else { return .init(state: .version_mismatch, ageSeconds: nil) }
+        guard identifier == session else { return .init(state: .other_session, ageSeconds: nil) }
+        let age = now.timeIntervalSince(seen)
+        let boundedAge = Int(min(max(age, -2_147_483_648), 2_147_483_647))
+        if age < -30 { return .init(state: .clock_ahead, ageSeconds: boundedAge) }
+        if age > 45 { return .init(state: .stale, ageSeconds: boundedAge) }
+        return .init(state: .ready, ageSeconds: boundedAge)
     }
 }
 
@@ -222,6 +255,8 @@ import UIKit
     private static var refreshing = false
     private static var requestedAfterReady = false
     private static var nextAutomaticRequest: TimeInterval = 0
+    private static var memoryPauseUntil: TimeInterval = 0
+    private static var loggedAutomaticPause: String?
     private static var folder: URL { Sharing.folder.appendingPathComponent("Henge-Chat-Diagnostics", isDirectory: true) }
     private static var inputFolder: URL {
         fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -231,7 +266,8 @@ import UIKit
     /// Each VM start rotates the identifier. Old requests/results cannot enter this session's report.
     static func prepare() {
         monitor?.cancel()
-        session = UUID(); imported = nil; lastSafeReport = nil; requestedAfterReady = false
+        session = UUID(); request = nil; imported = nil; lastSafeReport = nil; requestedAfterReady = false
+        loggedAutomaticPause = nil
         nextAutomaticRequest = ProcessInfo.processInfo.systemUptime + 120
         try? fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: inputFolder, withIntermediateDirectories: true)
@@ -241,10 +277,12 @@ import UIKit
         }
         let webloc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>URL</key><string>https://chatgpt.com/</string></dict></plist>\n"
         GuestChatDiagnosticsFiles.write(Data(webloc.utf8), directory: folder, name: "ChatGPT in Browser.webloc")
-        let help = "Once for this existing Mac: open Terminal in the Mac, then Henge > running Mac > Details > Sharing > Type the Update Helper Command (or Type the Set Up Command). Return to the focused Terminal and press Return. Choose Allow if macOS asks about local networks. No VM rebuild is needed.\nThen use Collect Chat diagnostics in Henge. The Mac contributes fixed error categories, versions and signature status automatically.\nEnable Chat Diagnostics.command is an optional installer for locations that allow executable scripts; WebDAV volumes may prevent double-click execution. Use the Terminal/setup-button procedure above in that case.\nNo conversation databases, cookies, tokens, keychain, full environment or raw log messages are exported.\nSystem DeviceCheck messages are counted separately and do not prove that ChatGPT requested them. This is a log summary, not a live DeviceCheck capability/token probe.\nThe browser shortcut opens https://chatgpt.com/ as an alternative; it does not repair the native app.\n"
+        let help = "Details > Sharing shows the helper connection and the latest installer receipt separately. An absent heartbeat does not determine whether the helper is installed.\nTo install, update or repair: focus Terminal in the Mac, then tap Details > Sharing > Type Install / Repair Command. Return to Terminal, wait until the entire command has finished typing, then press Return. The result appears in Henge automatically. Allow local networking if macOS asks. No VM rebuild is needed.\nUse Collect Chat diagnostics in Henge for a fresh combined report. Background guest checks wait until startup settles and pause during heat or recent memory pressure.\nEnable Chat Diagnostics.command is an optional installer; WebDAV volumes may prevent double-click execution. The Terminal procedure above is available in that case.\nNo conversation databases, cookies, tokens, keychain, full environment or raw log messages are exported.\nSystem DeviceCheck messages are counted separately and do not prove that ChatGPT requested them. This summary does not generate a DeviceCheck token.\nThe browser shortcut opens https://chatgpt.com/ as an alternative; it does not repair the native app.\n"
         GuestChatDiagnosticsFiles.write(Data(help.utf8), directory: folder, name: "Read Me.txt")
-        _ = makeRequest()
-        writeState("not_enabled")
+        // collect:false explicitly prohibits executing the session/heartbeat
+        // probe, independent of the guest clock. The old expiry aids old helpers.
+        _ = makeRequest(collect: false)
+        writeState("waiting_for_helper")
         let thisSession = session
         monitor = Task { @MainActor in
             var sawRunning = false
@@ -259,12 +297,18 @@ import UIKit
                 }
                 if !requestedAfterReady && isReady() {
                     requestedAfterReady = true
-                    if request == nil || request!.expires.timeIntervalSinceNow < 20 { _ = makeRequest() }
-                    nextAutomaticRequest = ProcessInfo.processInfo.systemUptime + 120
-                    writeState("pending")
+                    if lastSafeReport == nil {
+                        writeState((request?.expires.timeIntervalSinceNow ?? 0) > 0 ? "pending" : "connected")
+                    }
                 }
                 _ = importAvailable()
+                let pause = automaticPauseReason()
+                if pause != loggedAutomaticPause {
+                    loggedAutomaticPause = pause
+                    HengeLog.log("guest-diagnostics", "automatic_collection=\(pause == nil ? "available" : "paused") reason=\(pause ?? "none")")
+                }
                 if state == 1 && UIApplication.shared.applicationState == .active && !refreshing && isReady(),
+                   pause == nil,
                    ProcessInfo.processInfo.systemUptime >= nextAutomaticRequest,
                    request == nil || imported == request!.requestID || request!.expires <= Date() {
                     if makeRequest() { writeState("pending") }
@@ -275,12 +319,13 @@ import UIKit
         }
     }
 
-    private static func makeRequest() -> Bool {
+    private static func makeRequest(collect: Bool = true) -> Bool {
         guard let session else { return false }
-        let next = GuestChatDiagnosticsSchema.Request(sessionID: session)
+        let next = GuestChatDiagnosticsSchema.Request(sessionID: session, collect: collect)
         guard let data = try? JSONSerialization.data(withJSONObject: next.dictionary, options: [.sortedKeys]),
               GuestChatDiagnosticsFiles.write(data, directory: folder, name: "request.json") else { return false }
         request = next; imported = nil
+        HengeLog.log("guest-diagnostics", "request=\(collect ? "collection" : "heartbeat_only")")
         return true
     }
 
@@ -291,8 +336,23 @@ import UIKit
     }
 
     private static func isReady() -> Bool {
-        guard let session, let data = GuestChatDiagnosticsFiles.read(directory: folder, name: "agent-status.json", limit: 4096) else { return false }
-        return GuestChatDiagnosticsSchema.ready(data, session: session)
+        readiness().state == .ready
+    }
+
+    private static func readiness() -> GuestChatReadiness {
+        guard let session else { return .init(state: .missing_or_unreadable, ageSeconds: nil) }
+        let data = GuestChatDiagnosticsFiles.read(directory: folder, name: "agent-status.json", limit: 4096)
+        return GuestChatDiagnosticsSchema.readiness(data, session: session)
+    }
+
+    static func pauseAutomaticCollectionAfterMemoryWarning() {
+        memoryPauseUntil = ProcessInfo.processInfo.systemUptime + 120
+    }
+
+    private static func automaticPauseReason() -> String? {
+        if ProcessInfo.processInfo.systemUptime < memoryPauseUntil { return "recent_memory_warning" }
+        if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { return "thermal" }
+        return nil
     }
 
     @discardableResult private static func save(_ value: [String: Any]) -> Bool {
@@ -318,11 +378,18 @@ import UIKit
         value["host_status_utc"] = GuestChatDiagnosticsSchema.utc(Date())
         if let session { value["active_vm_session_id"] = session.uuidString }
         if let request { value["active_request_id"] = request.requestID.uuidString }
+        let heartbeat = readiness(), health = Sharing.helperHealth
+        value["diagnostic_heartbeat_state"] = heartbeat.state.rawValue
+        if let age = heartbeat.ageSeconds { value["diagnostic_heartbeat_age_seconds"] = age }
+        value["helper_connected"] = health.isConnected
+        value["helper_install_stage"] = health.install.rawValue
+        value["helper_install_error"] = health.installError.rawValue
+        value["automatic_collection_pause"] = automaticPauseReason() ?? "none"
         _ = save(value)
     }
 
     @discardableResult private static func importAvailable() -> Bool {
-        guard let request, imported != request.requestID,
+        guard let request, request.sessionID == session, imported != request.requestID,
               let data = GuestChatDiagnosticsFiles.read(directory: folder, name: "report.json", limit: 16_384),
               let value = GuestChatDiagnosticsSchema.canonicalReport(data, request: request), save(value) else { return false }
         lastSafeReport = value; imported = request.requestID
@@ -332,18 +399,34 @@ import UIKit
 
     /// Main actor stays responsive. The single pending task has a fixed deadline, not arbitrary guest commands.
     static func refresh(timeout: TimeInterval = 15) async -> String {
-        guard session != nil, henge_vm_state() == 1 else {
+        guard let activeSession = session, henge_vm_state() == 1 else {
             try? fileManager.createDirectory(at: inputFolder, withIntermediateDirectories: true)
             writeState("not_running")
             return "Mac diagnostics unavailable: start this Mac first. Host diagnostics are ready."
         }
-        guard isReady() else {
-            writeState("not_enabled")
-            return "Host diagnostics are ready. Once: focus Terminal in the Mac, tap Details > Sharing > Type the Update Helper Command (or Set Up Command), then press Return in Terminal."
-        }
         guard !refreshing else { return "Mac diagnostics is already being collected; host diagnostics are ready." }
         refreshing = true
         defer { refreshing = false }
+        let end = ProcessInfo.processInfo.systemUptime + min(max(timeout, 0), 15)
+        let reconnectUntil = min(end, ProcessInfo.processInfo.systemUptime + 3)
+        if !isReady() { writeState("connecting") }
+        while !isReady() && ProcessInfo.processInfo.systemUptime < reconnectUntil && !Task.isCancelled {
+            guard session == activeSession, henge_vm_state() == 1 else { return "The Mac session changed while connecting. Host diagnostics are ready." }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        guard session == activeSession, henge_vm_state() == 1, !Task.isCancelled else {
+            return "The Mac session changed while connecting. Host diagnostics are ready."
+        }
+        guard isReady() else {
+            writeState("helper_unreachable")
+            let health = Sharing.helperHealth
+            if health.install == .failed || health.install == .rolled_back {
+                return "Host diagnostics include the installer failure. Details > Sharing shows its result; collection did not start."
+            }
+            return health.isConnected
+                ? "The helper is connected. \(readiness().explanation) Host diagnostics include this state; guest collection did not start."
+                : "The helper has not reconnected yet. Host diagnostics include its connection and installation receipt; guest collection did not start."
+        }
         guard makeRequest(), let requested = request else {
             writeState("unavailable")
             return "The Mac diagnostic request could not be saved. Host diagnostics are ready."
@@ -353,7 +436,6 @@ import UIKit
         if GuestChatDiagnosticsPersistence.status.hasPrefix("summary_write_failed") {
             return "Host diagnostics are ready. The Mac summary could not be saved; its previous file was not treated as a new result."
         }
-        let end = ProcessInfo.processInfo.systemUptime + min(max(timeout, 0), 15)
         while ProcessInfo.processInfo.systemUptime < end && !Task.isCancelled {
             guard request?.requestID == requested.requestID, henge_vm_state() == 1 else {
                 return "The Mac session changed while collecting. Host diagnostics are ready."

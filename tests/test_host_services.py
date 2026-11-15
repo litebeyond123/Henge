@@ -275,7 +275,7 @@ class HostServicesTests(unittest.TestCase):
         status, script = self.server.request("GET", "/.henge/install")
         self.assertEqual(status, 200)
         self.assertIn(b"com.henge.agent", script)
-        self.assertIn(b"--host-state", script)
+        self.assertIn(b"--health-check", script)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 import Foundation
 
 /// Engine settings, without a rebuild. Defaults below, then the Performance settings,
-/// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
-/// Applied at launch and again before each Mac starts, so changes need no relaunch.
+/// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder).
+/// The reduced-load profile applies its refresh limit last. Its selection is
+/// fixed at app launch, matching the lifetime of the JIT allocation.
 enum EngineTuning {
     static let refreshKey = "henge.perf.hz"
     static let superblocksKey = "henge.perf.superblocks"
@@ -39,6 +40,8 @@ enum EngineTuning {
                     .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
             }
         }
+        ResourcePolicy.applyRefreshLimit(to: &env, reducedLoad: ResourcePolicy.reducedLoadAtLaunch)
+        HengeLog.log("tuning", "reduced-load profile: \(ResourcePolicy.reducedLoadAtLaunch ? "on (512 MB code cache, 30 Hz)" : "off")")
         for (k, v) in env.sorted(by: { $0.key < $1.key }) {
             setenv(k, v, 1)
             HengeLog.log("tuning", "\(k)=\(v)")

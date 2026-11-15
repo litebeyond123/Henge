@@ -491,6 +491,7 @@ enum Diagnostics {
             observers.append(center.addObserver(forName: notification, object: nil, queue: .main) { _ in
                 Task { @MainActor in
                     let backgroundTime = event == "entered_background" ? DiagnosticBackgroundTime() : nil
+                    if event == "memory_warning" { GuestChatDiagnostics.pauseAutomaticCollectionAfterMemoryWarning() }
                     queue.async {
                         if event == "memory_warning" { memoryWarnings += 1 }
                         sample(event)
@@ -529,6 +530,7 @@ enum Diagnostics {
             "jit_region_bytes": JITBootstrap.jitBytes,
             "code_cache_setting_mib": UserDefaults.standard.object(forKey: JITBootstrap.codeCacheKey) as? Int ?? JITBootstrap.defaultCodeCacheMB,
             "numeric_engine_settings": environment,
+            "resource_policy": ResourcePolicy.snapshot(),
         ]
         queue.async { run["last_session"] = session; sample("session_start") }
     }
@@ -578,6 +580,8 @@ enum Diagnostics {
         run["peak_observed_footprint_bytes"] = peakFootprint
         run["lowest_observed_allocation_headroom_bytes"] = lowestHeadroom
         run["memory_warning_count"] = memoryWarnings
+        run["helper_health"] = Sharing.helperHealth.diagnostics
+        run["clipboard_recently_seen"] = Sharing.helperRunning
         let footprint = result == KERN_SUCCESS ? String(info.phys_footprint) : "unavailable"
         let resident = result == KERN_SUCCESS ? String(info.resident_size) : "unavailable"
         HengeLog.log("diagnostics", "event=\(event) elapsed_s=\(Int(elapsed)) phys_bytes=\(footprint) resident_bytes=\(resident) allocation_headroom_bytes=\(headroom) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) memory_warnings=\(memoryWarnings)")

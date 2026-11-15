@@ -15,6 +15,8 @@ void hv_share_set_clipboard(const char *text);
 char *hv_share_take_clipboard(void);
 /* Seconds since the helper in macOS was last heard from, or -1 if it never has been. */
 long hv_share_agent_seen(void);
+/* Malloc-owned, fixed-schema helper liveness/install receipt. Ages use the host monotonic clock. */
+char *hv_share_helper_health(void);
 
 /* Version 1 host services, on the same guest-only HTTP transport. A fresh UUID is supplied for each VM
    session; it separates sessions, not processes inside the same guest. No host account/radio APIs live here.

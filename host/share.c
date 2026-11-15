@@ -108,6 +108,35 @@ static int host_uuid(const char *s) {
     return 1;
 }
 
+/* Helper liveness is independent of clipboard access and the guest wall clock. Only fixed enums and
+   numeric status are retained; no installer output, paths, command text or account data is accepted. */
+static const char *const helper_startup_names[] = {"unseen", "network_ready", "clipboard_starting", "ready", "clipboard_unavailable"};
+static const char *const helper_install_names[] = {"not_started", "script_started", "downloaded", "verified", "replacing", "launch_requested", "confirmed", "failed", "rolled_back"};
+static const char *const helper_error_names[] = {"none", "download_failed", "gzip_invalid", "signature_invalid", "version_invalid", "replace_failed", "plist_invalid", "bootout_failed", "bootstrap_failed", "connection_failed", "health_unconfirmed", "rollback_failed"};
+static struct {
+    int protocol, pid, startup, install, error, exit_code;
+    int64_t agent_ms, probe_ms, install_ms;
+} helper_health;
+
+static void helper_reset_locked(void) { memset(&helper_health, 0, sizeof helper_health); }
+static long helper_age(int64_t now, int64_t seen) { return seen ? (long)((now - seen) / 1000) : -1; }
+
+char *hv_share_helper_health(void) {
+    char json[768];
+    pthread_mutex_lock(&host_mu);
+    int64_t now = host_now_ms();
+    int n = snprintf(json, sizeof json,
+        "{\"protocol\":1,\"session\":\"%s\",\"helper_protocol\":%d,\"helper_pid\":%d,"
+        "\"agent_seen_s\":%ld,\"probe_seen_s\":%ld,\"install_seen_s\":%ld,"
+        "\"startup_stage\":\"%s\",\"install_stage\":\"%s\",\"install_error\":\"%s\",\"install_exit_code\":%d}\n",
+        host_session, helper_health.protocol, helper_health.pid,
+        helper_age(now, helper_health.agent_ms), helper_age(now, helper_health.probe_ms), helper_age(now, helper_health.install_ms),
+        helper_startup_names[helper_health.startup], helper_install_names[helper_health.install],
+        helper_error_names[helper_health.error], helper_health.exit_code);
+    pthread_mutex_unlock(&host_mu);
+    return n > 0 && (size_t)n < sizeof json ? strdup(json) : NULL;
+}
+
 static int host_fresh_locked(void) {
     return host_session[0] && host_updated_ms && host_now_ms() - host_updated_ms <= HOST_STATE_MAX_AGE_MS;
 }
@@ -125,6 +154,7 @@ void hv_share_host_begin(const char *session) {
     pthread_mutex_lock(&host_mu);
     host_finish_locked(409, "session_changed", 0);
     host_session[0] = 0;
+    helper_reset_locked();
     if (host_uuid(session)) memcpy(host_session, session, sizeof host_session);
     host_running = host_foreground = host_brightness_control = 0;
     host_updated_ms = 0;
@@ -134,6 +164,7 @@ void hv_share_host_begin(const char *session) {
 void hv_share_host_end(void) {
     pthread_mutex_lock(&host_mu);
     host_session[0] = 0;
+    helper_reset_locked();
     host_running = host_foreground = host_brightness_control = 0;
     host_updated_ms = 0;
     host_finish_locked(409, "session_ended", 0);
@@ -696,30 +727,10 @@ static int do_lock(Conn *c, Request *r) {
 
 /* ---- /.henge/ ---- */
 
-/* What "curl -s http://10.0.2.4/.henge/install | sh" runs in macOS. */
+/* Generated verbatim from tools/install-guest-helper.sh; tests verify that the served script agrees. */
 static const char install_script[] =
-    "#!/bin/sh\n"
-    "D=\"$HOME/Library/Application Support/Henge\"\n"
-    "P=\"$HOME/Library/LaunchAgents/com.henge.agent.plist\"\n"
-    "mkdir -p \"$D\" \"$HOME/Library/LaunchAgents\"\n"
-    "launchctl bootout \"gui/$(id -u)/com.henge.agent\" 2>/dev/null\n"
-    "curl -fsS http://" HV_SHARE_ADDR "/.henge/agent | gunzip > \"$D/henge-agent\" || { echo 'Could not reach Henge.'; exit 1; }\n"
-    "chmod 755 \"$D/henge-agent\"\n"
-    "cat > \"$P\" <<EOF\n"
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-    "<plist version=\"1.0\"><dict>\n"
-    "<key>Label</key><string>com.henge.agent</string>\n"
-    "<key>ProgramArguments</key><array><string>$D/henge-agent</string></array>\n"
-    "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n"
-    "<key>LimitLoadToSessionType</key><string>Aqua</string>\n"
-    "<key>ProcessType</key><string>Background</string>\n"
-    "</dict></plist>\n"
-    "EOF\n"
-    "launchctl bootstrap \"gui/$(id -u)\" \"$P\"\n"
-    "echo 'Henge is set up. You can close this window.'\n"
-    "echo 'Host services: run the helper with --host-state, --host-capabilities, or --host-brightness 0.6.'\n"
-    "printf 'Helper: %s/henge-agent\\n' \"$D\"\n";
+#include "helper-install-script.inc"
+;
 
 /* What "curl -s http://10.0.2.4/.henge/lighten | sh" runs in macOS: less background work and drawing, for a Mac
    whose CPUs are emulated: less animation and drawing, and the system part (update checks, Time Machine) with the
@@ -1008,13 +1019,105 @@ static int serve_host(Conn *c, Request *r, const char *what) {
     return host_error(c, r, 404, "unknown_service");
 }
 
+static int helper_enum(const char *name, const char *const *names, size_t count) {
+    for (size_t i = 0; i < count; i++) if (!strcmp(name, names[i])) return (int)i;
+    return -1;
+}
+
+static int serve_helper_health(Conn *c, Request *r, const char *what) {
+    r->close = 1;
+    struct timeval timeout = {.tv_sec = 3};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+    if (r->host_bad_headers || r->transfer_encoding_seen) return host_error(c, r, 400, "invalid_headers");
+    if (r->host_has_origin) return host_error(c, r, 403, "browser_origin_not_allowed");
+    if (r->length) return host_error(c, r, 400, "unexpected_body");
+    if (!strcmp(what, "health")) {
+        if (strcmp(r->method, "GET") || r->query[0]) return host_error(c, r, 400, "invalid_health_request");
+        char *json = hv_share_helper_health();
+        if (!json) return host_error(c, r, 503, "health_unavailable");
+        int result = respond(c, r, 200, "OK", "Content-Type: application/json\r\nCache-Control: no-store\r\n", json, strlen(json));
+        free(json);
+        return result;
+    }
+    if (!host_uuid(r->host_session)) return host_error(c, r, 403, "session_required");
+    if (strspn(r->query, "abcdefghijklmnopqrstuvwxyz0123456789_=&") != strlen(r->query))
+        return host_error(c, r, 400, "invalid_query");
+    int status = 200;
+    const char *error = NULL;
+    pthread_mutex_lock(&host_mu);
+    if (!host_session[0] || strcmp(r->host_session, host_session)) {
+        status = 409; error = "session_changed";
+    } else if (!strcmp(what, "ping") && !strcmp(r->method, "GET")) {
+        char kind[12], stage[32];
+        unsigned int pid = 0;
+        int used = 0;
+        if (sscanf(r->query, "kind=%11[a-z]&protocol=4&pid=%10u&stage=%31[a-z_]%n", kind, &pid, stage, &used) != 3 ||
+            !used || r->query[used] || !pid || pid > INT_MAX || (strcmp(kind, "agent") && strcmp(kind, "probe"))) {
+            status = 400; error = "invalid_ping";
+        } else {
+            int value = helper_enum(stage, helper_startup_names, sizeof helper_startup_names / sizeof *helper_startup_names);
+            if (value < 1) { status = 400; error = "invalid_stage"; }
+            else if (!strcmp(kind, "probe")) helper_health.probe_ms = host_now_ms();
+            else {
+                helper_health.agent_ms = host_now_ms();
+                helper_health.protocol = 4;
+                helper_health.pid = (int)pid;
+                helper_health.startup = value;
+            }
+        }
+    } else if (!strcmp(what, "install-status") && !strcmp(r->method, "POST")) {
+        char stage[32], reason[32];
+        unsigned int code = 0, pid = 0;
+        int used = 0;
+        if (sscanf(r->query, "stage=%31[a-z_]&error=%31[a-z_]&code=%3u&pid=%10u%n", stage, reason, &code, &pid, &used) != 4 ||
+            !used || r->query[used] || code > 255 || pid > INT_MAX) {
+            status = 400; error = "invalid_receipt";
+        } else {
+            int value = helper_enum(stage, helper_install_names, sizeof helper_install_names / sizeof *helper_install_names);
+            int why = helper_enum(reason, helper_error_names, sizeof helper_error_names / sizeof *helper_error_names);
+            if (value < 1 || why < 0 || (value < 7 && (why || code)) || (value >= 7 && !why)) {
+                status = 400; error = "invalid_receipt";
+            } else if (value == 6 && (!pid || (int)pid != helper_health.pid || helper_health.protocol != 4 ||
+                       !helper_health.agent_ms || host_now_ms() - helper_health.agent_ms >= 30000)) {
+                status = 409; error = "health_unconfirmed";
+            } else {
+                helper_health.install = value;
+                helper_health.error = why;
+                helper_health.exit_code = (int)code;
+                helper_health.install_ms = host_now_ms();
+                if (value == 5) { // A prior daemon heartbeat cannot confirm a new launch.
+                    helper_health.agent_ms = 0;
+                    helper_health.protocol = helper_health.pid = helper_health.startup = 0;
+                }
+            }
+        }
+    } else { status = 404; error = "unknown_helper_service"; }
+    pthread_mutex_unlock(&host_mu);
+    if (error) return host_error(c, r, status, error);
+    return respond(c, r, 200, "OK", "Content-Type: application/json\r\nCache-Control: no-store\r\n", "{\"ok\":true}\n", 12);
+}
+
+static int serve_install(Conn *c, Request *r) {
+    if (body_discard(c, r) != 0) return -1;
+    char session[37];
+    pthread_mutex_lock(&host_mu);
+    memcpy(session, host_session, sizeof session);
+    pthread_mutex_unlock(&host_mu);
+    if (!host_uuid(session)) return host_error(c, r, 409, "session_required");
+    Text script = {0};
+    addf(&script, "#!/bin/sh\nHENGE_INSTALL_SESSION='%s'\n", session);
+    adds(&script, install_script);
+    int result = respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", script.s, script.len);
+    free(script.s);
+    return result;
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strncmp(what, "v1/", 3)) return serve_host(c, r, what + 3);
-    if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
-        if (body_discard(c, r) != 0) return -1;
-        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
-    }
+    if (!strncmp(what, "helper/", 7)) return serve_helper_health(c, r, what + 7);
+    if (!strcmp(what, "install") && !strcmp(r->method, "GET")) return serve_install(c, r);
     if ((!strcmp(what, "lighten") || !strcmp(what, "unlighten")) && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         const char *s = what[0] == 'l' ? lighten_script : unlighten_script;

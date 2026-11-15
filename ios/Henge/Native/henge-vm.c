@@ -264,6 +264,7 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
 void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
 char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
 long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
+char *henge_share_helper_health(void) { return hv_share_helper_health(); }
 
 void henge_host_services_begin(const char *session) { hv_share_host_begin(session); }
 void henge_host_services_end(void) { hv_share_host_end(); }

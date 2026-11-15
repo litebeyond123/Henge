@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
+    @AppStorage(ResourcePolicy.reducedLoadKey) private var reducedLoad = ResourcePolicy.defaultReducedLoad
     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
 
     /// The second footer paragraph: how you click, given the selected input mode.
@@ -104,12 +105,21 @@ struct SettingsView: View {
                     .listRowBackground(Desk.card)
                 }
                 Section("Performance") {
+                    Toggle("Reduced load", isOn: $reducedLoad)
+                    Text("Limits the code cache to 512 MB and the Mac display to 30 Hz. Enabled by default on iPads with up to 8 GB of RAM for this test. Your normal settings are kept. Save your Mac work, shut it down, then close Henge from the app switcher and reopen it after changing this setting.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    LabeledContent("Profile this launch", value: ResourcePolicy.reducedLoadAtLaunch ? "Reduced load" : "Normal settings")
+                    if reducedLoad != ResourcePolicy.reducedLoadAtLaunch {
+                        Text("Restart Henge to apply the selected profile.")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
                     Picker("Mac refresh rate", selection: $refreshRate) {
                         Text("30 Hz").tag(30)
                         Text("60 Hz").tag(60)
                         Text("120 Hz").tag(120)
                     }
                     .pickerStyle(.segmented)
+                    .disabled(reducedLoad || ResourcePolicy.reducedLoadAtLaunch)
                     Toggle("Faster disk writes", isOn: $fastFlush)
                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
@@ -118,7 +128,8 @@ struct SettingsView: View {
                         Text("1 GB").tag(1024)
                         Text("1.5 GB").tag(1536)
                     }
-                    Text("A smaller code cache uses less memory but fills and flushes more often, which can reduce speed. Henge uses 1 GB by default on iPads with up to 8 GB of RAM; an existing choice is kept. Changes apply after Henge is closed and reopened.")
+                    .disabled(reducedLoad || ResourcePolicy.reducedLoadAtLaunch)
+                    Text("The pickers retain your normal settings. Reduced load uses 512 MB and 30 Hz while active, including when henge-env.txt requests a higher refresh rate. A smaller code cache uses less memory but fills and flushes more often, which can reduce speed. Code cache changes apply after Henge is closed and reopened.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text("macOS draws a frame for every refresh: 30 Hz leaves the most of the emulated CPU to apps, at the cost of choppier animation; 60 Hz is smoother. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
                         .font(.footnote).foregroundStyle(.secondary)

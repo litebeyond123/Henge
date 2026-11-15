@@ -63,8 +63,8 @@ enum JITBootstrap {
     /// 512 MB, 1 GB, or 1.5 GB (Settings > Performance > Code cache). A smaller
     /// cache leaves more room for the guest and Metal, but flushes translated
     /// code more often. The allocation is fixed for this launch.
-    /// An iPad with up to 8 GB of physical RAM starts at 1 GB unless the user
-    /// has already made a choice. This is a test default, not an OOM diagnosis.
+    /// The saved normal setting is retained. ResourcePolicy may cap the actual
+    /// allocation at 512 MB for a reduced-load test; it never resizes it live.
     static let defaultCodeCacheMB: Int = {
         if HengeLog.deviceModel.hasPrefix("iPad"),
            ProcessInfo.processInfo.physicalMemory <= UInt64(8) << 30 {
@@ -74,7 +74,8 @@ enum JITBootstrap {
     }()
     static let jitBytes: Int = {
         let requested = (UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB
-        let megabytes = [512, 1024, 1536].contains(requested) ? requested : defaultCodeCacheMB
+        let megabytes = ResourcePolicy.codeCacheMB(requested: requested, fallback: defaultCodeCacheMB,
+                                                   reducedLoad: ResourcePolicy.reducedLoadAtLaunch)
         return megabytes << 20
     }()
 
