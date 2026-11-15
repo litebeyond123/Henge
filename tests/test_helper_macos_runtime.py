@@ -142,7 +142,8 @@ def main():
                "status": "failed", "launchd_runtime": args.mode == "legacy", "launchservices_runtime": args.mode == "app",
                "lan_privacy_authorization_tested": False, "clipboard_tested": False,
                "shared_mount_tested": False, "login_registration_tested": False,
-               "smoke_test_marker_verified": False, "cleanup_complete": False}
+               "smoke_test_marker_verified": False, "app_pid_cli_verified": False,
+               "app_quit_cli_verified": False, "cleanup_complete": False}
     failure = None
     launched_app_pids = set()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -236,6 +237,11 @@ def main():
                     (args.mode == "legacy" or marker)):
                     if command([helper, "--health-check", str(pid)], check=False).returncode:
                         raise GateError("real_helper_pid_health_check_failed")
+                    if args.mode == "app":
+                        app_pid_result = command([helper, "--app-pid"], check=False, timeout=10)
+                        if app_pid_result.returncode or app_pid_result.stdout.strip() != str(pid):
+                            raise GateError("real_app_pid_cli_mismatch")
+                        summary["app_pid_cli_verified"] = True
                     request_http("POST", f"/.henge/helper/install-status?stage=confirmed&error=none&code=0&pid={pid}", session)
                     if request_http("GET", "/.henge/helper/health").get("install_stage") != "confirmed":
                         raise GateError("production_install_confirmation_failed")
@@ -268,6 +274,25 @@ def main():
             # This also finds a just-launched app that never reached the health server. The preflight
             # rejected an already-running copy, and every PID is path-checked again before a signal.
             launched_app_pids.update(matching_pids(helper))
+            if launched_app_pids:
+                quit_ok = False
+                try:
+                    quit_result = command([helper, "--quit-app"], check=False, timeout=12)
+                    summary["app_quit_cli_return_code"] = quit_result.returncode
+                    quit_ok = quit_result.returncode == 0
+                    if not quit_ok:
+                        cleanup_errors.append("app_quit_cli_failed")
+                except subprocess.TimeoutExpired:
+                    cleanup_errors.append("app_quit_cli_timeout")
+                quit_deadline = time.monotonic() + 5
+                while time.monotonic() < quit_deadline and any(process_path(pid) == helper for pid in launched_app_pids):
+                    time.sleep(0.1)
+                remaining = {pid for pid in launched_app_pids if process_path(pid) == helper}
+                if remaining:
+                    cleanup_errors.append("app_quit_cli_did_not_exit")
+                summary["app_quit_cli_verified"] = quit_ok and not remaining
+            # Cleanup is still mandatory after a failed CLI, but a signal fallback never counts as
+            # a successful --quit-app test and therefore cannot make the runtime gate pass.
             for pid in launched_app_pids:
                 if process_path(pid) == helper:
                     try:

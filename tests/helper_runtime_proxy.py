@@ -119,7 +119,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = False
+    # Permit a sequential probe after the previous server's connections enter TIME_WAIT.
+    # A live listener on the same endpoint must still fail; never enable SO_REUSEPORT.
+    allow_reuse_address = True
+    allow_reuse_port = False
 
 
 for sig in (signal.SIGTERM, signal.SIGINT):
