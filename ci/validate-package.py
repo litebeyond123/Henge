@@ -226,7 +226,7 @@ def inspect_guest_app(data):
                 "Guest app archive is missing its bundle or signature resources")
         info = plistlib.loads(files[base + "Info.plist"])
         require(info.get("CFBundleIdentifier") == "com.henge.guesthelper" and
-                info.get("CFBundleExecutable") == "henge-agent" and info.get("CFBundleVersion") == "5" and
+                info.get("CFBundleExecutable") == "henge-agent" and info.get("CFBundleVersion") == "6" and
                 info.get("CFBundlePackageType") == "APPL" and info.get("LSUIElement") is True and
                 isinstance(info.get("NSLocalNetworkUsageDescription"), str) and
                 bool(info["NSLocalNetworkUsageDescription"].strip()), "Guest app identity or privacy description is invalid")
@@ -242,7 +242,7 @@ def inspect_guest_app(data):
         raise InvalidPackage("Invalid compressed guest application") from exc
 
 
-def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4006",
+def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4007",
                      kind=None, maximum_ios="17.0", husk_commit=None, run_url=None):
     package = Path(package)
     require(bool(re.fullmatch(r"[0-9a-f]{40}", expected_commit)), "Expected commit must be a full git SHA-1")
@@ -346,7 +346,7 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-version", default="0.4.0")
-    parser.add_argument("--expected-build", default="4006")
+    parser.add_argument("--expected-build", default="4007")
     parser.add_argument("--kind", choices=("ipa", "tipa"))
     parser.add_argument("--maximum-ios", default="17.0")
     parser.add_argument("--husk-commit")

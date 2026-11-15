@@ -71,7 +71,7 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
 
 def guest_app_archive(binary=None, extra=None):
     info = {"CFBundleIdentifier": "com.henge.guesthelper", "CFBundleExecutable": "henge-agent",
-            "CFBundleVersion": "5", "CFBundlePackageType": "APPL", "LSUIElement": True,
+            "CFBundleVersion": "6", "CFBundlePackageType": "APPL", "LSUIElement": True,
             "LSMinimumSystemVersion": "13.0", "NSLocalNetworkUsageDescription": "Connect to Henge."}
     files = {"Henge Helper.app/Contents/Info.plist": plistlib.dumps(info),
              "Henge Helper.app/Contents/MacOS/henge-agent": binary if binary is not None else macho(platform=1, minimum=0x0D0000),
@@ -90,7 +90,7 @@ def guest_app_archive(binary=None, extra=None):
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4006",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4007",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }

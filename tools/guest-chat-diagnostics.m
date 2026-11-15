@@ -2,12 +2,16 @@
 #import <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
+#include <string.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 static NSString *const requestPath = @"/Henge-Chat-Diagnostics/request.json";
@@ -99,15 +103,13 @@ static NSDate *logDate(id value) {
     return [format dateFromString:value];
 }
 
-NSDictionary *HengeChatDiagnosticsClassifyLog(NSData *data) {
+static NSDictionary *classifyEvents(NSArray *events, NSString *executable, NSString *bundleID) {
     NSMutableDictionary *result = [NSMutableDictionary dictionaryWithDictionary:
         @{@"log_status": @"unavailable", @"log_event_count": @0, @"matched_event_count": @0,
           @"classification": @"logs_unavailable", @"source_scope": @"mixed_chatgpt_device_services",
           @"chatgpt_matched_event_count": @0, @"system_devicecheck_matched_event_count": @0,
           @"unknown_source_matched_event_count": @0}];
     for (NSString *key in countKeys()) result[key] = @0;
-    if (!data || data.length > 2 * 1024 * 1024) return result;
-    id events = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
     if (![events isKindOfClass:NSArray.class] || [events count] > 50000) return result;
     result[@"log_status"] = @"complete";
     result[@"log_event_count"] = @([events count]);
@@ -145,7 +147,9 @@ NSDictionary *HengeChatDiagnosticsClassifyLog(NSData *data) {
         NSString *process = [event[@"process"] isKindOfClass:NSString.class] ? event[@"process"] : nil;
         if (!process && [event[@"processImagePath"] isKindOfClass:NSString.class]) process = [event[@"processImagePath"] lastPathComponent];
         NSString *subsystem = [event[@"subsystem"] isKindOfClass:NSString.class] ? event[@"subsystem"] : @"";
-        NSString *scopeKey = [process isEqual:@"ChatGPT"] ? @"chatgpt_matched_event_count" :
+        BOOL fromClient = [process isEqual:@"ChatGPT"] || (executable.length && [process isEqual:executable]) ||
+                          (bundleID.length && [subsystem hasPrefix:bundleID]);
+        NSString *scopeKey = fromClient ? @"chatgpt_matched_event_count" :
             (([process isEqual:@"devicecheckd"] || [process isEqual:@"mobileactivationd"] || contains(subsystem, @"DeviceCheck"))
              ? @"system_devicecheck_matched_event_count" : @"unknown_source_matched_event_count");
         result[scopeKey] = @([result[scopeKey] unsignedIntegerValue] + 1);
@@ -169,64 +173,215 @@ NSDictionary *HengeChatDiagnosticsClassifyLog(NSData *data) {
     return result;
 }
 
-// Output is bounded while being read. Nothing from a child process is written to disk or the helper log.
-static NSData *run(NSString *path, NSArray<NSString *> *arguments, double deadline, NSUInteger limit,
-                   BOOL captureError, NSString **status) {
-    *status = @"unavailable";
-    if (mono() >= deadline) { *status = @"timed_out"; return nil; }
+NSDictionary *HengeChatDiagnosticsClassifyLog(NSData *data) {
+    id events = data && data.length <= 2 * 1024 * 1024
+        ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+    return classifyEvents(events, @"ChatGPT", nil);
+}
+
+NSString *HengeChatDiagnosticsLogPredicate(NSString *executable, NSString *bundleID) {
+    if (!matches(executable, @"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", 64)) executable = @"ChatGPT";
+    if (!matches(bundleID, @"[A-Za-z][A-Za-z0-9-]{0,40}(\\.[A-Za-z0-9-]{1,40}){1,5}", 128)) bundleID = @"com.openai.chat";
+    // Use the installed app's executable/subsystem as well as the legacy process name. The classifier
+    // accepts DCDevice messages too, so the prefilter must not silently discard that same category.
+    return [NSPredicate predicateWithFormat:
+        @"(process == %@ OR process == 'ChatGPT' OR subsystem BEGINSWITH %@ OR process == 'devicecheckd' OR process == 'mobileactivationd' OR subsystem CONTAINS[c] 'DeviceCheck') AND (eventMessage CONTAINS[c] 'devicecheck' OR eventMessage CONTAINS[c] 'DCDevice' OR eventMessage CONTAINS[c] 'DCErrorDomain' OR eventMessage CONTAINS[c] 'NSURLErrorDomain' OR eventMessage CONTAINS[c] 'request failed' OR eventMessage CONTAINS[c] 'request_failed' OR eventMessage CONTAINS[c] 'failed to create conversation' OR eventMessage CONTAINS[c] 'HTTP' OR eventMessage CONTAINS[c] 'statusCode' OR eventMessage CONTAINS[c] 'status code')",
+        executable, bundleID].predicateFormat;
+}
+
+// Only fixed counters/timestamps survive each line. No complete raw log or event array is retained.
+@interface HengeLogLines : NSObject
+@property(nonatomic, strong) NSMutableData *pending;
+@property(nonatomic, strong) NSMutableDictionary *summary;
+@property(nonatomic, copy) NSString *executable;
+@property(nonatomic, copy) NSString *bundleID;
+@property(nonatomic) NSUInteger invalidLines;
+@property(nonatomic) BOOL limitReached;
+@property(nonatomic) BOOL budgetReached;
+@property(nonatomic) double processingDeadline;
+- (instancetype)initWithExecutable:(NSString *)executable bundleID:(NSString *)bundleID;
+- (BOOL)append:(NSData *)chunk;
+- (NSDictionary *)finish:(BOOL)complete;
+@end
+
+@implementation HengeLogLines
+- (instancetype)initWithExecutable:(NSString *)executable bundleID:(NSString *)bundleID {
+    if ((self = [super init])) {
+        _pending = [NSMutableData data];
+        _summary = [classifyEvents(nil, nil, nil) mutableCopy];
+        _executable = [executable copy]; _bundleID = [bundleID copy];
+        _processingDeadline = INFINITY;
+    }
+    return self;
+}
+- (void)line:(NSData *)line {
+    if (!line.length) return;
+    @autoreleasepool {
+        id event = [NSJSONSerialization JSONObjectWithData:line options:0 error:NULL];
+        if (![event isKindOfClass:NSDictionary.class]) { self.invalidLines++; return; }
+        if (event[@"finished"] && !event[@"eventMessage"]) return; // log's NDJSON end-of-events record.
+        if (![event[@"eventMessage"] isKindOfClass:NSString.class]) { self.invalidLines++; return; }
+        if ([self.summary[@"log_event_count"] unsignedIntegerValue] >= 50000) { self.limitReached = YES; return; }
+        NSDictionary *one = classifyEvents(@[event], self.executable, self.bundleID);
+        NSMutableArray *keys = [countKeys() mutableCopy];
+        [keys addObjectsFromArray:@[@"log_event_count", @"matched_event_count", @"chatgpt_matched_event_count",
+                                   @"system_devicecheck_matched_event_count", @"unknown_source_matched_event_count"]];
+        for (NSString *key in keys) self.summary[key] = @([self.summary[key] unsignedIntegerValue] + [one[key] unsignedIntegerValue]);
+        for (NSString *key in @[@"first_match_utc", @"last_match_utc"]) {
+            NSDate *next = dateValue(one[key]), *old = dateValue(self.summary[key]);
+            if (next && (!old || ([next compare:old] == ([key isEqual:@"first_match_utc"] ? NSOrderedAscending : NSOrderedDescending))))
+                self.summary[key] = one[key];
+        }
+        // Reuse the production classifier's category priority when merging lines.
+        NSArray *priority = @[@"devicecheck_unavailable_observed", @"devicecheck_error_observed", @"network_error_observed",
+                              @"http_error_observed", @"request_error_observed", @"no_known_error_observed", @"logs_unavailable"];
+        if ([priority indexOfObject:one[@"classification"]] < [priority indexOfObject:self.summary[@"classification"]])
+            self.summary[@"classification"] = one[@"classification"];
+    }
+}
+- (BOOL)append:(NSData *)chunk {
+    // The runner supplies at most 8192 bytes. Keep one unfinished line, never the full command output.
+    if (self.limitReached || chunk.length > 8192) { self.limitReached = YES; return NO; }
+    [self.pending appendData:chunk];
+    for (;;) {
+        NSRange newline = [self.pending rangeOfData:[NSData dataWithBytes:"\n" length:1]
+                                           options:0 range:NSMakeRange(0, self.pending.length)];
+        if (newline.location == NSNotFound) break;
+        if (mono() >= self.processingDeadline) { self.budgetReached = YES; return NO; }
+        if (newline.location > 65536) { self.limitReached = YES; return NO; }
+        [self line:[self.pending subdataWithRange:NSMakeRange(0, newline.location)]];
+        if (self.limitReached) return NO;
+        [self.pending replaceBytesInRange:NSMakeRange(0, NSMaxRange(newline)) withBytes:NULL length:0];
+    }
+    if (self.pending.length > 65536) { self.limitReached = YES; return NO; }
+    return YES;
+}
+- (NSDictionary *)finish:(BOOL)complete {
+    // An interrupted final line is never classified as an event fragment.
+    if (complete && !self.limitReached && self.pending.length) {
+        if (mono() >= self.processingDeadline) self.budgetReached = YES;
+        else [self line:self.pending];
+    }
+    BOOL full = complete && !self.limitReached && !self.budgetReached && self.invalidLines == 0;
+    NSUInteger events = [self.summary[@"log_event_count"] unsignedIntegerValue];
+    self.summary[@"log_counts_status"] = full ? @"complete" : (events ? @"partial" : @"unavailable");
+    self.summary[@"log_status"] = full ? @"complete" : @"unavailable";
+    if (![self.summary[@"matched_event_count"] unsignedIntegerValue])
+        self.summary[@"classification"] = full ? @"no_known_error_observed" : @"logs_unavailable";
+    [self.pending setLength:0];
+    return [self.summary copy];
+}
+@end
+
+@interface HengeCommandResult : NSObject
+@property(nonatomic, copy) NSString *status;
+@property(nonatomic) BOOL started;
+@property(nonatomic) NSUInteger elapsedMilliseconds;
+@property(nonatomic, strong) NSNumber *exitCode;
+@property(nonatomic, strong) NSNumber *terminationSignal;
+@property(nonatomic, strong) NSData *data;
+@end
+@implementation HengeCommandResult
+@end
+
+typedef BOOL (^HengeOutputConsumer)(NSData *chunk);
+
+// All deadlines include bounded cleanup. The log consumer sees each complete line before timeout;
+// codesign callers still receive output only when their own command completes successfully.
+static HengeCommandResult *runCommand(NSString *path, NSArray<NSString *> *arguments, double deadline,
+                                     NSUInteger limit, BOOL captureError, HengeOutputConsumer consumer) {
+    double startedAt = mono();
+    HengeCommandResult *result = [HengeCommandResult new];
+    result.status = @"not_run_budget";
+    if (startedAt >= deadline) return result;
+    double readDeadline = MAX(startedAt, deadline - 0.10); // Reserve cleanup inside this command's budget.
     NSTask *task = [NSTask new];
     NSPipe *pipe = [NSPipe pipe];
-    task.executableURL = [NSURL fileURLWithPath:path];
-    task.arguments = arguments;
+    task.executableURL = [NSURL fileURLWithPath:path]; task.arguments = arguments;
     task.standardInput = NSFileHandle.fileHandleWithNullDevice;
     task.standardOutput = pipe;
     task.standardError = captureError ? pipe : NSFileHandle.fileHandleWithNullDevice;
-    if (![task launchAndReturnError:NULL]) return nil;
+    if (![task launchAndReturnError:NULL]) {
+        result.status = @"launch_failed"; result.elapsedMilliseconds = (NSUInteger)((mono() - startedAt) * 1000); return result;
+    }
+    result.started = YES;
     [pipe.fileHandleForWriting closeFile];
     int fd = pipe.fileHandleForReading.fileDescriptor;
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    NSMutableData *data = [NSMutableData data];
-    BOOL eof = NO, exceeded = NO, timedOut = NO;
-    while (!eof) {
-        if (mono() >= deadline) { timedOut = YES; break; }
+    result.status = flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 ? @"complete" : @"read_failed";
+    NSMutableData *data = consumer ? nil : [NSMutableData data];
+    NSUInteger bytesRead = 0;
+    BOOL eof = NO;
+    while ([result.status isEqual:@"complete"] && !eof) {
+        if (mono() >= readDeadline) { result.status = @"timed_out"; break; }
         struct pollfd p = {.fd = fd, .events = POLLIN};
-        int ready = poll(&p, 1, 50);
+        int ready = poll(&p, 1, 20);
         if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) break;
-        if (!ready) {
-            if (!task.running) { // Drain a child's final buffered output, then observe EOF.
-                p.revents = POLLIN;
-            } else continue;
-        }
+        if (ready < 0) { result.status = @"read_failed"; break; }
+        if (!ready && task.running) continue;
         char bytes[8192];
         ssize_t n = read(fd, bytes, sizeof bytes);
         if (n > 0) {
-            if (data.length + (NSUInteger)n > limit) { exceeded = YES; break; }
-            [data appendBytes:bytes length:(NSUInteger)n];
+            if (bytesRead + (NSUInteger)n > limit) { result.status = @"output_limit"; break; }
+            bytesRead += (NSUInteger)n;
+            @autoreleasepool {
+                if (consumer) {
+                    if (!consumer([NSData dataWithBytes:bytes length:(NSUInteger)n])) result.status = @"output_limit";
+                } else [data appendBytes:bytes length:(NSUInteger)n];
+            }
         } else if (!n) eof = YES;
-        else if (errno != EAGAIN && errno != EINTR) break;
+        else if (errno != EAGAIN && errno != EINTR) { result.status = @"read_failed"; break; }
     }
-    while (eof && !exceeded && !timedOut && task.running && mono() < deadline) usleep(5000);
+    while (eof && [result.status isEqual:@"complete"] && task.running && mono() < readDeadline) usleep(5000);
     if (task.running) {
-        timedOut = !exceeded;
+        if ([result.status isEqual:@"complete"]) result.status = @"timed_out";
         kill(task.processIdentifier, SIGKILL);
-        // Do not wait without a deadline even after a kill request.
-        double reapDeadline = mono() + 0.25;
-        while (task.running && mono() < reapDeadline) usleep(5000);
+        while (task.running && mono() < deadline) usleep(5000);
     }
     [pipe.fileHandleForReading closeFile];
-    if (exceeded) { *status = @"output_limit"; return nil; }
-    if (timedOut) { *status = @"timed_out"; return nil; }
-    if (!eof || task.running || task.terminationStatus != 0) return nil;
-    *status = @"complete";
-    return data;
+    if (!task.running) {
+        if (task.terminationReason == NSTaskTerminationReasonUncaughtSignal) result.terminationSignal = @(task.terminationStatus);
+        else result.exitCode = @(task.terminationStatus);
+        if (task.terminationStatus != 0 && [result.status isEqual:@"complete"]) result.status = @"exit_nonzero";
+    }
+    if (eof && [result.status isEqual:@"complete"]) result.data = data;
+    result.elapsedMilliseconds = (NSUInteger)((mono() - startedAt) * 1000);
+    return result;
+}
+
+static void commandFields(NSMutableDictionary *report, NSString *prefix, HengeCommandResult *command) {
+    report[[prefix stringByAppendingString:@"_status"]] = command.status;
+    report[[prefix stringByAppendingString:@"_elapsed_ms"]] = @(command.elapsedMilliseconds);
+    if ([prefix isEqual:@"log_command"]) {
+        report[@"log_command_started"] = @(command.started);
+        if (command.exitCode) report[@"log_command_exit_code"] = command.exitCode;
+        if (command.terminationSignal) report[@"log_command_termination_signal"] = command.terminationSignal;
+    }
+}
+
+static NSDictionary *logResult(HengeLogLines *lines, HengeCommandResult *command) {
+    if (lines.budgetReached) command.status = @"timed_out";
+    NSMutableDictionary *result = [[lines finish:[command.status isEqual:@"complete"]] mutableCopy];
+    commandFields(result, @"log_command", command);
+    if ([@[@"timed_out", @"output_limit", @"not_run_budget"] containsObject:command.status]) result[@"log_status"] = command.status;
+    return result;
 }
 
 #ifdef HENGE_CHAT_DIAGNOSTICS_TEST
 NSData *HengeChatDiagnosticsTestCommand(NSString *path, NSArray<NSString *> *arguments,
                                       double seconds, NSUInteger limit, NSString **status) {
-    return run(path, arguments, mono() + seconds, limit, NO, status);
+    HengeCommandResult *command = runCommand(path, arguments, mono() + seconds, limit, NO, nil);
+    *status = command.status;
+    return command.data;
+}
+NSDictionary *HengeChatDiagnosticsTestLogCommand(NSString *path, NSArray<NSString *> *arguments, double seconds,
+                                               NSString *executable, NSString *bundleID) {
+    HengeLogLines *lines = [[HengeLogLines alloc] initWithExecutable:executable bundleID:bundleID];
+    double deadline = mono() + seconds;
+    lines.processingDeadline = deadline - 0.10;
+    HengeCommandResult *command = runCommand(path, arguments, deadline, 2 * 1024 * 1024, NO,
+                                           ^BOOL(NSData *chunk) { return [lines append:chunk]; });
+    return logResult(lines, command);
 }
 #endif
 
@@ -249,15 +404,16 @@ static NSData *readSmallFile(NSString *path, NSUInteger limit) {
     return data;
 }
 
-static NSString *commandText(NSString *path, NSArray *arguments, double deadline, BOOL captureError) {
-    NSString *status;
-    NSData *data = run(path, arguments, MIN(deadline, mono() + 1.0), 16384, captureError, &status);
-    NSString *text = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
-    return [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-}
-
 static void safeField(NSMutableDictionary *report, NSString *key, id value, NSString *pattern, NSUInteger limit) {
     if (matches(value, pattern, limit)) report[key] = value;
+}
+
+static NSString *sysctlText(const char *name) {
+    char text[128] = {0};
+    size_t length = sizeof text;
+    if (sysctlbyname(name, text, &length, NULL, 0) || !length || length > sizeof text) return nil;
+    text[sizeof text - 1] = 0;
+    return [[NSString alloc] initWithBytes:text length:strnlen(text, sizeof text) encoding:NSUTF8StringEncoding];
 }
 
 static NSDictionary *collect(NSDictionary *request) {
@@ -268,39 +424,63 @@ static NSDictionary *collect(NSDictionary *request) {
           @"request_created_utc": request[@"created_utc"], @"request_expires_utc": request[@"expires_utc"],
           @"log_window_seconds": @900, @"privacy_mode": @"error_categories_only", @"client_found": @NO,
           @"client_signature_kind": @"unavailable", @"client_signature_check": @"not_found"}];
-    safeField(report, @"os_version", commandText(@"/usr/bin/sw_vers", @[@"-productVersion"], deadline, NO), @"[0-9]{1,3}(\\.[0-9]{1,6}){0,5}", 40);
-    safeField(report, @"os_build", commandText(@"/usr/bin/sw_vers", @[@"-buildVersion"], deadline, NO), @"[0-9]{1,3}[A-Z][0-9]{1,8}[a-z]?", 20);
-    safeField(report, @"hardware_model", commandText(@"/usr/sbin/sysctl", @[@"-n", @"hw.model"], deadline, NO), @"[A-Za-z]{1,32}[0-9]{1,3},[0-9]{1,3}", 40);
-    NSString *arch = commandText(@"/usr/bin/uname", @[@"-m"], deadline, NO);
+    // Fixed metadata queries use in-process APIs. Starting four external utilities could consume
+    // the evidence budget before log show launches on a slowly emulated Mac.
+    NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
+    report[@"os_version"] = [NSString stringWithFormat:@"%ld.%ld.%ld", (long)version.majorVersion,
+                            (long)version.minorVersion, (long)version.patchVersion];
+    safeField(report, @"os_build", sysctlText("kern.osversion"), @"[0-9]{1,3}[A-Z][0-9]{1,8}[a-z]?", 20);
+    safeField(report, @"hardware_model", sysctlText("hw.model"), @"[A-Za-z]{1,32}[0-9]{1,3},[0-9]{1,3}", 40);
+    struct utsname system;
+    NSString *arch = uname(&system) == 0 ? [NSString stringWithUTF8String:system.machine] : nil;
     report[@"architecture"] = [@[@"arm64", @"arm64e", @"x86_64"] containsObject:arch ?: @""] ? arch : @"unknown";
-    // Only these two named app bundles are read. Never enumerate the user's home or application data.
+    NSString *clientApp = nil;
     NSArray *apps = @[@"/Applications/ChatGPT.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/ChatGPT.app"]];
     for (NSString *app in apps) {
         NSData *data = readSmallFile([app stringByAppendingPathComponent:@"Contents/Info.plist"], 256 * 1024);
         id plist = data ? [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL] : nil;
         if (![plist isKindOfClass:NSDictionary.class]) continue;
+        clientApp = app;
         report[@"client_found"] = @YES;
         safeField(report, @"client_bundle_id", plist[@"CFBundleIdentifier"], @"[A-Za-z][A-Za-z0-9-]{0,40}(\\.[A-Za-z0-9-]{1,40}){1,5}", 128);
+        safeField(report, @"client_executable", plist[@"CFBundleExecutable"], @"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", 64);
         safeField(report, @"client_version", plist[@"CFBundleShortVersionString"], @"[0-9]{1,12}(\\.[0-9]{1,12}){0,5}([a-z][0-9]{0,4})?", 64);
         safeField(report, @"client_build", plist[@"CFBundleVersion"], @"[0-9]{1,12}(\\.[0-9]{1,12}){0,5}([a-z][0-9]{0,4})?", 64);
-        NSString *signature = commandText(@"/usr/bin/codesign", @[@"-d", @"--verbose=2", app], deadline, YES);
+        break;
+    }
+    report[@"metadata_status"] = report[@"os_build"] && report[@"hardware_model"] && ![report[@"architecture"] isEqual:@"unknown"] ? @"complete" : @"partial";
+    report[@"metadata_elapsed_ms"] = @((NSUInteger)((mono() - started) * 1000));
+
+    // The first subprocess is the evidence query. Preserve the 15-minute window and all log levels;
+    // NDJSON lets a timeout retain complete observed events without retaining incomplete fragments.
+    NSString *executable = report[@"client_executable"] ?: @"ChatGPT", *bundleID = report[@"client_bundle_id"];
+    NSString *predicate = HengeChatDiagnosticsLogPredicate(executable, bundleID);
+    HengeLogLines *lines = [[HengeLogLines alloc] initWithExecutable:executable bundleID:bundleID];
+    lines.processingDeadline = MIN(deadline, started + 8.0) - 0.10;
+    HengeCommandResult *log = runCommand(@"/usr/bin/log",
+        @[@"show", @"--last", @"15m", @"--style", @"ndjson", @"--info", @"--debug", @"--predicate", predicate],
+        MIN(deadline, started + 8.0), 2 * 1024 * 1024, NO, ^BOOL(NSData *chunk) { return [lines append:chunk]; });
+    [report addEntriesFromDictionary:logResult(lines, log)];
+
+    // Signature metadata is supplementary, never a prerequisite for getting Chat error evidence.
+    // Each step has its own small budget, inside the unchanged overall ten-second deadline.
+    HengeCommandResult *display = [HengeCommandResult new], *verify = [HengeCommandResult new];
+    display.status = verify.status = @"not_found";
+    if (clientApp) {
+        display = runCommand(@"/usr/bin/codesign", @[@"-d", @"--verbose=2", clientApp], MIN(deadline, mono() + 0.75), 16384, YES, nil);
+        NSString *signature = display.data ? [[NSString alloc] initWithData:display.data encoding:NSUTF8StringEncoding] : nil;
         if (signature) {
             report[@"client_signature_kind"] = contains(signature, @"Signature=adhoc") ? @"adhoc" : @"signed";
             for (NSString *line in [signature componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
                 if ([line hasPrefix:@"TeamIdentifier="]) safeField(report, @"client_team_identifier", [line substringFromIndex:15], @"[A-Z0-9]{10}", 10);
             }
         }
-        NSString *check;
-        NSData *verified = run(@"/usr/bin/codesign", @[@"--verify", @"--strict", app], MIN(deadline, mono() + 1.5), 4096, NO, &check);
-        report[@"client_signature_check"] = verified ? @"valid_main_bundle" : ([check isEqual:@"timed_out"] ? @"timed_out" : @"not_verified");
-        break;
+        verify = runCommand(@"/usr/bin/codesign", @[@"--verify", @"--strict", clientApp], MIN(deadline, mono() + 0.75), 4096, NO, nil);
+        report[@"client_signature_check"] = verify.data ? @"valid_main_bundle" : ([verify.status isEqual:@"timed_out"] ? @"timed_out" : @"not_verified");
     }
-    NSString *predicate = @"(process == 'ChatGPT' OR process == 'devicecheckd' OR process == 'mobileactivationd' OR subsystem CONTAINS[c] 'DeviceCheck') AND (eventMessage CONTAINS[c] 'devicecheck' OR eventMessage CONTAINS[c] 'DCErrorDomain' OR eventMessage CONTAINS[c] 'NSURLErrorDomain' OR eventMessage CONTAINS[c] 'request failed' OR eventMessage CONTAINS[c] 'request_failed' OR eventMessage CONTAINS[c] 'failed to create conversation' OR eventMessage CONTAINS[c] 'HTTP' OR eventMessage CONTAINS[c] 'statusCode' OR eventMessage CONTAINS[c] 'status code')";
-    NSString *logStatus;
-    NSData *log = run(@"/usr/bin/log", @[@"show", @"--last", @"15m", @"--style", @"json", @"--info", @"--debug", @"--predicate", predicate], deadline, 2 * 1024 * 1024, NO, &logStatus);
-    [report addEntriesFromDictionary:HengeChatDiagnosticsClassifyLog(log)];
-    if (![logStatus isEqual:@"complete"]) report[@"log_status"] = logStatus;
-    report[@"collection_status"] = [report[@"log_status"] isEqual:@"complete"] ? @"complete" : @"partial";
+    commandFields(report, @"signature_display", display);
+    commandFields(report, @"signature_verify", verify);
+    report[@"collection_status"] = [report[@"log_counts_status"] isEqual:@"complete"] ? @"complete" : @"partial";
     report[@"collected_utc"] = utc(NSDate.date);
     report[@"collection_elapsed_ms"] = @((NSUInteger)((mono() - started) * 1000));
     return report;

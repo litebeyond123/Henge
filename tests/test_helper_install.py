@@ -159,7 +159,7 @@ scenario=os.environ.get("HENGE_INSTALL_TEST_SCENARIO", "ok")
 mode=sys.argv[1]
 with (root/"helper-calls.jsonl").open("a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")
 if mode == "--version":
-    print("henge-agent 4" if scenario == "version_invalid" else "henge-agent 5"); sys.exit(0)
+    print("henge-agent 4" if scenario == "version_invalid" else "henge-agent 6"); sys.exit(0)
 if mode == "--app-pid":
     if not state["app_running"]: sys.exit(1)
     print(999); sys.exit(0)

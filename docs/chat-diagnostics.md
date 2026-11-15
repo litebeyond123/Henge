@@ -9,8 +9,7 @@ Chat fix.
 
 1. Install the new Henge test build and start the existing Mac.
 2. Open Terminal in the Mac and leave its input focused. In Henge's running-Mac
-   Details, Sharing, tap **Type the Update Helper Command** (or **Type the Set Up
-   Command** if sharing has not been installed). Return to Terminal and press
+   Details, Sharing, tap **Type Install / Repair Command**. Return to Terminal and press
    Return. Allow the helper's local-network access if macOS asks.
 3. After reproducing the Chat error, tap **Collect Chat diagnostics** in Henge.
    Henge waits asynchronously for at most 15 seconds, then produces its one host
@@ -37,14 +36,18 @@ Info.plist/signature metadata of `/Applications/ChatGPT.app` or
 does not enumerate the rest of the home folder. Signature verification covers
 the main bundle and has a short deadline; a timeout is not called a bad signature.
 
-A read-only `log show --last 15m --style json --info --debug` query uses a fixed
-predicate for ChatGPT and DeviceCheck system services. Debug is included because
-`DeviceCheck is not supported.` can be a debug-level record. The raw query result
-exists only in bounded memory. The output contains fixed error categories,
-counts and normalized times; no raw event message or arbitrary exception text
-is retained. Invalid, timed-out or oversized log output is explicitly marked.
-An empty result means no recognized error was observed in that query, not that
-ChatGPT or DeviceCheck works.
+A read-only `log show --last 15m --style ndjson --info --debug` query uses a fixed
+predicate for ChatGPT, the installed client's bounded executable/bundle metadata,
+and DeviceCheck system services. `DCDevice` is also included in the message
+predicate. Debug is included because `DeviceCheck is not supported.` can be a
+debug-level record; the option cannot recover records that the logging system
+did not retain. Raw events exist only in bounded memory. The output contains
+fixed error categories, counts and normalized times; no raw event message or
+arbitrary exception text is retained. Complete events read before a timeout or
+output limit are classified and kept; unfinished lines are not treated as events.
+`log_counts_status` distinguishes complete, partial and unavailable counts. An
+incomplete query with no recognized error remains `logs_unavailable`, and a
+complete empty query does not establish that ChatGPT or DeviceCheck works.
 
 `source_scope=mixed_chatgpt_device_services` is explicit. Matches from ChatGPT,
 system device services and unknown sources have separate counters. A daemon's
@@ -82,13 +85,22 @@ If saving fails, the old input is removed when possible and a fixed
 writer can read `GuestChatDiagnosticsPersistence.status` from any queue; a
 failed write is never reported as a successful fresh import.
 
-The command budget is 10 seconds for metadata and the log query, with a 2 MiB
-log-output ceiling enforced while reading. Child processes are killed at the
-deadline/output ceiling without an unbounded `waitUntilExit`. Collection can
+The total collection budget is 10 seconds, with the log query prioritized for
+up to 8 seconds and a 2 MiB log-output ceiling enforced while reading. System
+metadata uses local APIs instead of spawning four commands. Signature display
+and verification follow the query with independent short budgets within the
+remaining time. Each phase reports its own status and elapsed milliseconds;
+log-command metadata distinguishes not started, timeout, output limit and
+process/read failure. Child processes are killed at the deadline/output ceiling
+without an unbounded `waitUntilExit`. Collection can
 still be unavailable because of log access restrictions, guest clock skew,
 network permissions, a stopped VM, or an old helper. These states are reported,
 and host diagnostics remain available. A prior captured summary, when retained
-during another request, is explicitly labelled stale.
+during another request, is explicitly labelled stale. Every accepted snapshot
+also adds one fixed result receipt to the current run log, including source and
+error-category counts. This preserves earlier observations when a later snapshot
+replaces the current JSON with an incomplete result. Snapshot counts are not
+cumulative totals and overlapping windows must not be added together.
 
 ## Validation
 
@@ -105,7 +117,10 @@ sh -n ios/Henge/Resources/guest-chat-diagnostics.command
 The Objective-C tests execute the production error classifier and request
 parser with synthetic secret-bearing messages and the observed DeviceCheck
 wording. They also execute the actual bounded child-process reader against
-normal, empty, timed-out and oversized output. The Foundation Swift tests execute
+normal, empty, timed-out and oversized output, including complete events before
+interruption and incomplete trailing lines. A separate macOS integration gate
+writes a UUID-scoped synthetic error and reads only that event through the real
+unified-log command and production classifier. The Foundation Swift tests execute
 the actual host allowlist and file I/O against wrong requests/sessions, expiry,
 invalid scalar types, injected fields, oversized files and symlinks. These tests
 do not establish that a real VM can produce a valid DeviceCheck token or that

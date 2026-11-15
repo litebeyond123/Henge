@@ -31,6 +31,7 @@ import Foundation
         let valid = GuestChatDiagnosticsSchema.canonicalReport(encoded(report), request: request, now: now)
         precondition(valid?["client_version"] as? String == "26.1111.21308")
         precondition(valid?["error_devicecheck_unsupported_count"] as? Int == 1)
+        precondition(valid?["log_counts_status"] as? String == "complete")
         // Even if a time supplied to the validator makes a probe appear fresh,
         // its explicit collect:false can never authorize a collected result.
         var probeReport = report
@@ -54,12 +55,118 @@ import Foundation
         precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
         bad = report; bad["log_status"] = "timed_out"
         precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+
+        // A complete event read before a timeout is evidence, even though its
+        // counter is only a lower bound for the requested 15-minute window.
+        var partial = report
+        partial["collection_status"] = "partial"
+        partial["log_status"] = "timed_out"
+        partial["log_counts_status"] = "partial"
+        partial["log_command_status"] = "timed_out"
+        partial["log_command_started"] = true
+        partial["log_command_elapsed_ms"] = 8000
+        partial["log_command_termination_signal"] = 9
+        partial["collection_elapsed_ms"] = 9000
+        partial["metadata_status"] = "complete"
+        partial["metadata_elapsed_ms"] = 10
+        partial["signature_display_status"] = "complete"
+        partial["signature_display_elapsed_ms"] = 25
+        partial["signature_verify_status"] = "timed_out"
+        partial["signature_verify_elapsed_ms"] = 750
+        partial["client_signature_check"] = "timed_out"
+        partial["client_executable"] = "Codex"
+        let acceptedPartial = GuestChatDiagnosticsSchema.canonicalReport(encoded(partial), request: request, now: now)!
+        precondition(acceptedPartial["classification"] as? String == "devicecheck_unavailable_observed")
+        precondition(acceptedPartial["log_command_termination_signal"] as? Int == 9)
+        precondition(acceptedPartial["client_executable"] as? String == "Codex")
+        precondition(GuestChatDiagnosticsSchema.collectionMessage(acceptedPartial).contains("Partial Mac error summary"))
+        let receipt = GuestChatDiagnosticsSchema.collectionReceipt(acceptedPartial)
+        precondition(receipt.contains("result=partial") && receipt.contains("error_devicecheck_unsupported_count=1"))
+        precondition(receipt.contains("system_devicecheck_matched_event_count=0"))
+        for (key, value) in [("log_counts_status", "complete" as Any), ("log_counts_status", "bogus"),
+                             ("log_counts_status", true), ("classification", "no_known_error_observed"),
+                             ("log_command_status", "not_run_budget"), ("log_command_started", 1),
+                             ("log_command_started", false), ("log_command_elapsed_ms", true),
+                             ("log_command_elapsed_ms", 30001), ("log_command_elapsed_ms", -1),
+                             ("log_command_elapsed_ms", 1.5), ("log_command_exit_code", 0),
+                             ("log_command_termination_signal", 0), ("log_command_termination_signal", 32),
+                             ("metadata_status", "arbitrary text"), ("signature_verify_status", "not_verified")] {
+            bad = partial; bad[key] = value
+            precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil,
+                         "accepted inconsistent field: \(key)=\(value)")
+        }
+        // A parser error after valid events also preserves only partial evidence,
+        // even when the child command itself completed successfully.
+        var damaged = partial
+        damaged["log_status"] = "unavailable"
+        damaged["log_command_status"] = "complete"
+        damaged["log_command_termination_signal"] = nil
+        damaged["log_command_exit_code"] = 0
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(damaged), request: request, now: now) != nil)
+        bad = damaged; bad["log_command_exit_code"] = 7
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+        bad = damaged; bad["log_command_exit_code"] = nil; bad["log_command_termination_signal"] = 9
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+
+        var noMatches = partial
+        noMatches["matched_event_count"] = 0
+        noMatches["chatgpt_matched_event_count"] = 0
+        noMatches["classification"] = "logs_unavailable"
+        for key in GuestChatDiagnosticsSchema.countKeys { noMatches[key] = 0 }
+        let acceptedNoMatches = GuestChatDiagnosticsSchema.canonicalReport(encoded(noMatches), request: request, now: now)!
+        precondition(GuestChatDiagnosticsSchema.collectionMessage(acceptedNoMatches).contains("incomplete result"))
+        bad = noMatches; bad["classification"] = "no_known_error_observed"
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+        bad = noMatches; bad["log_event_count"] = 0
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+
+        // Reproduce the old helper's timed-out/default-zero summary without
+        // allowing it to become a complete or healthy result.
+        var legacyTimeout = report
+        legacyTimeout["collection_status"] = "partial"
+        legacyTimeout["log_status"] = "timed_out"
+        legacyTimeout["classification"] = "logs_unavailable"
+        legacyTimeout["log_event_count"] = 0
+        legacyTimeout["matched_event_count"] = 0
+        legacyTimeout["chatgpt_matched_event_count"] = 0
+        for key in GuestChatDiagnosticsSchema.countKeys { legacyTimeout[key] = 0 }
+        let acceptedLegacy = GuestChatDiagnosticsSchema.canonicalReport(encoded(legacyTimeout), request: request, now: now)!
+        precondition(acceptedLegacy["log_counts_status"] as? String == "unavailable")
+        precondition(acceptedLegacy["log_command_elapsed_ms"] == nil)
+        precondition(GuestChatDiagnosticsSchema.collectionMessage(acceptedLegacy).contains("could not be determined"))
+        var notRun = legacyTimeout
+        notRun["log_counts_status"] = "unavailable"
+        notRun["log_status"] = "not_run_budget"
+        notRun["log_command_status"] = "not_run_budget"
+        notRun["log_command_started"] = false
+        notRun["log_command_elapsed_ms"] = 0
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(notRun), request: request, now: now) != nil)
+        bad = notRun; bad["log_command_started"] = true
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+        var emptyComplete = legacyTimeout
+        emptyComplete["collection_status"] = "complete"
+        emptyComplete["log_status"] = "complete"
+        emptyComplete["classification"] = "no_known_error_observed"
+        let acceptedEmpty = GuestChatDiagnosticsSchema.canonicalReport(encoded(emptyComplete), request: request, now: now)!
+        precondition(GuestChatDiagnosticsSchema.collectionMessage(acceptedEmpty).contains("still needs verification"))
+        var completeWithSignatureTimeout = report
+        completeWithSignatureTimeout["metadata_status"] = "partial"
+        completeWithSignatureTimeout["signature_verify_status"] = "timed_out"
+        completeWithSignatureTimeout["signature_verify_elapsed_ms"] = 750
+        completeWithSignatureTimeout["client_signature_check"] = "timed_out"
+        let acceptedSignatureTimeout = GuestChatDiagnosticsSchema.canonicalReport(encoded(completeWithSignatureTimeout), request: request, now: now)!
+        precondition(acceptedSignatureTimeout["log_counts_status"] as? String == "complete")
+        precondition(acceptedSignatureTimeout["classification"] as? String == "devicecheck_unavailable_observed")
+        bad = report; bad["classification"] = "network_error_observed"
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now) == nil)
+
         let secret = "PRIVATE_CHAT_COOKIE_TOKEN_EMAIL"
         bad = report; bad["messages"] = [["content": secret]]; bad["env"] = ["TOKEN": secret]
         bad["client_build"] = secret; bad["client_team_identifier"] = "user@example.invalid"
         let safe = GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: request, now: now)!
         precondition(!String(data: encoded(safe), encoding: .utf8)!.contains(secret))
         precondition(safe["messages"] == nil && safe["env"] == nil && safe["client_build"] == nil && safe["client_team_identifier"] == nil)
+        precondition(!GuestChatDiagnosticsSchema.collectionReceipt(bad).contains(secret))
         precondition(GuestChatDiagnosticsSchema.canonicalReport(Data(repeating: 32, count: 16385), request: request, now: now) == nil)
         let heartbeat: [String: Any] = ["schema_version": 1, "collector_version": 1,
             "vm_session_id": request.sessionID.uuidString, "seen_utc": GuestChatDiagnosticsSchema.utc(now)]

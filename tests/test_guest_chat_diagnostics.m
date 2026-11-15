@@ -79,7 +79,61 @@ int main(void) {
         assert(!output && [status isEqual:@"timed_out"] && NSProcessInfo.processInfo.systemUptime - start < 2);
         output = HengeChatDiagnosticsTestCommand(@"/usr/bin/yes", @[@"bounded"], 2, 100, &status);
         assert(!output && [status isEqual:@"output_limit"]);
-        puts("PASS: guest request bounds, error allowlist, privacy, child-output cap and deadline");
+        // The production prefilter must include the same DCDevice form the classifier recognizes,
+        // and the executable discovered in the installed app's Info.plist.
+        NSString *predicateText = HengeChatDiagnosticsLogPredicate(@"CodexFixture", @"com.openai.codex.fixture");
+        NSPredicate *predicate = [NSPredicate predicateWithFormat:predicateText];
+        NSDictionary *event = @{@"process": @"CodexFixture", @"subsystem": @"com.openai.codex.fixture",
+            @"eventMessage": [@"[DCDevice] supported=false " stringByAppendingString:secret],
+            @"timestamp": @"2026-11-15 22:00:00.000000+0800"};
+        assert([predicate evaluateWithObject:event]);
+        assert(![predicate evaluateWithObject:@{@"process": @"UnrelatedFixture", @"subsystem": @"com.example.unrelated",
+                                               @"eventMessage": @"[DCDevice] supported=false"}]);
+        NSString *line = [[NSString alloc] initWithData:json(event) encoding:NSUTF8StringEncoding];
+        NSString *ndjson = [line stringByAppendingString:@"\n{\"finished\":true}\n"];
+        NSDictionary *parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/printf", @[@"%s", ndjson], 2,
+                                                                 @"CodexFixture", @"com.openai.codex.fixture");
+        assert([parsed[@"log_counts_status"] isEqual:@"complete"]);
+        assert([parsed[@"log_command_status"] isEqual:@"complete"] && [parsed[@"log_command_started"] boolValue]);
+        assert([parsed[@"log_command_exit_code"] isEqual:@0]);
+        assert([parsed[@"log_event_count"] isEqual:@1] && [parsed[@"chatgpt_matched_event_count"] isEqual:@1]);
+        assert([parsed[@"error_devicecheck_unsupported_count"] isEqual:@1]);
+        assert([parsed[@"first_match_utc"] isEqual:@"2026-11-15T14:00:00Z"]);
+        assert(![[[NSString alloc] initWithData:json(parsed) encoding:NSUTF8StringEncoding] containsString:secret]);
+
+        // The same production runner sees a complete event before its child stalls. Preserve that
+        // evidence as a lower bound instead of discarding all output and manufacturing a zero.
+        NSString *delayed = [NSString stringWithFormat:@"printf '%%s\\n' '%@'; exec /bin/sleep 5", line];
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/bin/sh", @[@"-c", delayed], 0.75,
+                                                    @"CodexFixture", @"com.openai.codex.fixture");
+        assert([parsed[@"log_command_status"] isEqual:@"timed_out"] && [parsed[@"log_command_started"] boolValue]);
+        assert([parsed[@"log_counts_status"] isEqual:@"partial"] && [parsed[@"log_status"] isEqual:@"timed_out"]);
+        assert([parsed[@"classification"] isEqual:@"devicecheck_unavailable_observed"]);
+        assert([parsed[@"error_devicecheck_unsupported_count"] isEqual:@1]);
+
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/printf", @[@"%s", @"{\"eventMessage\":\"devicecheck_unsupported_device"], 2,
+                                                    @"ChatGPT", nil);
+        assert([parsed[@"log_counts_status"] isEqual:@"unavailable"]);
+        assert([parsed[@"classification"] isEqual:@"logs_unavailable"]);
+        assert([parsed[@"log_event_count"] isEqual:@0]); // An unterminated JSON fragment is not an event.
+        NSString *oversized = [@"{\"eventMessage\":\"devicecheck_unsupported_device " stringByPaddingToLength:70000 withString:@"x" startingAtIndex:0];
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/printf", @[@"%s", oversized], 2, @"ChatGPT", nil);
+        assert([parsed[@"log_command_status"] isEqual:@"output_limit"]);
+        assert([parsed[@"log_counts_status"] isEqual:@"unavailable"] && [parsed[@"log_event_count"] isEqual:@0]);
+
+        NSString *nonzero = [NSString stringWithFormat:@"printf '%%s\\n' '%@'; exit 7", line];
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/bin/sh", @[@"-c", nonzero], 2, @"CodexFixture", nil);
+        assert([parsed[@"log_command_status"] isEqual:@"exit_nonzero"] && [parsed[@"log_command_exit_code"] isEqual:@7]);
+        assert([parsed[@"log_counts_status"] isEqual:@"partial"] && [parsed[@"matched_event_count"] isEqual:@1]);
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/true", @[], 0, @"ChatGPT", nil);
+        assert([parsed[@"log_command_status"] isEqual:@"not_run_budget"] && ![parsed[@"log_command_started"] boolValue]);
+        assert([parsed[@"log_counts_status"] isEqual:@"unavailable"]);
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/henge-synthetic-missing-command", @[], 2, @"ChatGPT", nil);
+        assert([parsed[@"log_command_status"] isEqual:@"launch_failed"] && ![parsed[@"log_command_started"] boolValue]);
+        parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/printf", @[@"%s", @"{\"finished\":true}\n"], 2, @"ChatGPT", nil);
+        assert([parsed[@"log_counts_status"] isEqual:@"complete"] && [parsed[@"log_event_count"] isEqual:@0]);
+        assert([parsed[@"classification"] isEqual:@"no_known_error_observed"]);
+        puts("PASS: guest request bounds, fixed error categories, NDJSON partial evidence, privacy, child-output cap and independent deadline");
     }
     return 0;
 }

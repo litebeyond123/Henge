@@ -116,7 +116,7 @@ def main():
         helper = args.helper.resolve()
     if args.mode == "app" and matching_pids(helper):
         raise GateError("test_app_already_running")
-    expected_version = args.expected_version or ("henge-agent 4" if args.mode == "legacy" else "henge-agent 5")
+    expected_version = args.expected_version or ("henge-agent 4" if args.mode == "legacy" else "henge-agent 6")
     command(["/usr/bin/codesign", "--verify", "--strict", app or helper])
     if command([helper, "--version"]).stdout.strip() != expected_version:
         raise GateError("helper_version_mismatch")

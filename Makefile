@@ -66,6 +66,10 @@ $(B)/test_guest_chat_diagnostics: tests/test_guest_chat_diagnostics.m tools/gues
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -DHENGE_CHAT_DIAGNOSTICS_TEST -framework Foundation tests/test_guest_chat_diagnostics.m tools/guest-chat-diagnostics.m -o $@
 
+$(B)/test_guest_chat_diagnostics_macos_runtime: tests/test_guest_chat_diagnostics_macos_runtime.m tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h
+	@mkdir -p $(B)
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -DHENGE_CHAT_DIAGNOSTICS_TEST -framework Foundation tests/test_guest_chat_diagnostics_macos_runtime.m tools/guest-chat-diagnostics.m -o $@
+
 $(B)/test_helper_health: tests/test_helper_health.m tools/helper-health.m tools/helper-health.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework Foundation tests/test_helper_health.m tools/helper-health.m -o $@

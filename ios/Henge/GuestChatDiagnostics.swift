@@ -81,11 +81,12 @@ enum GuestChatDiagnosticsSchema {
         guard let value = value as? String, choices.contains(value) else { return nil }
         return value
     }
+    static let commandStatuses = ["complete", "timed_out", "output_limit", "not_run_budget", "launch_failed", "exit_nonzero", "read_failed"]
 
     /// Rebuild rather than redact the input. No guest-provided free text is retained.
     static func canonicalReport(_ data: Data, request: Request, now: Date = Date()) -> [String: Any]? {
         guard request.collect, data.count <= 16_384, now <= request.expires,
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any], raw.count <= 64,
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any], raw.count <= 96,
               integer(raw["schema_version"], maximum: 1) == 1,
               integer(raw["collector_version"], maximum: 1) == 1,
               (raw["request_id"] as? String).flatMap(UUID.init(uuidString:)) == request.requestID,
@@ -95,7 +96,7 @@ enum GuestChatDiagnosticsSchema {
               let collected = date(raw["collected_utc"]), collected >= request.created.addingTimeInterval(-2),
               collected <= request.expires, collected <= now.addingTimeInterval(30),
               let status = choice(raw["collection_status"], ["complete", "partial"]),
-              let logStatus = choice(raw["log_status"], ["complete", "unavailable", "timed_out", "output_limit"]),
+              let logStatus = choice(raw["log_status"], ["complete", "unavailable", "timed_out", "output_limit", "not_run_budget"]),
               let classification = choice(raw["classification"], ["devicecheck_unavailable_observed", "devicecheck_error_observed",
                   "network_error_observed", "http_error_observed", "request_error_observed", "no_known_error_observed", "logs_unavailable"]),
               let signatureKind = choice(raw["client_signature_kind"], ["unavailable", "signed", "adhoc"]),
@@ -111,14 +112,31 @@ enum GuestChatDiagnosticsSchema {
               let systemMatches = integer(raw["system_devicecheck_matched_event_count"], maximum: matched),
               let unknownMatches = integer(raw["unknown_source_matched_event_count"], maximum: matched),
               chatMatches + systemMatches + unknownMatches == matched,
-              (logStatus == "complete") == (classification != "logs_unavailable"),
               (status == "complete") == (logStatus == "complete") else { return nil }
+        // Older v1 helpers discarded all log output on timeout. Normalize their
+        // default zero counters to unavailable, while accepting the newer v1
+        // extension that preserves complete events from an interrupted query.
+        let countsStatus: String
+        if let rawCounts = raw["log_counts_status"] {
+            guard let value = choice(rawCounts, ["complete", "partial", "unavailable"]) else { return nil }
+            countsStatus = value
+        } else {
+            countsStatus = logStatus == "complete" ? "complete" : "unavailable"
+        }
+        switch countsStatus {
+        case "complete":
+            guard logStatus == "complete" else { return nil }
+        case "partial":
+            guard logStatus != "complete", events > 0 else { return nil }
+        default:
+            guard logStatus != "complete", events == 0, matched == 0 else { return nil }
+        }
         var result: [String: Any] = [
             "schema_version": 1, "collector_version": 1, "request_id": request.requestID.uuidString,
             "vm_session_id": request.sessionID.uuidString, "request_created_utc": utc(request.created),
             "request_expires_utc": utc(request.expires), "collected_utc": utc(collected), "host_received_utc": utc(now),
             "host_collection_status": "complete", "data_freshness": "completed_request_snapshot",
-            "collection_status": status, "log_status": logStatus, "classification": classification,
+            "collection_status": status, "log_status": logStatus, "log_counts_status": countsStatus, "classification": classification,
             "log_window_seconds": 900, "log_event_count": events, "matched_event_count": matched,
             "collection_elapsed_ms": elapsed, "privacy_mode": "error_categories_only", "client_found": found.boolValue,
             "architecture": architecture, "client_signature_kind": signatureKind, "client_signature_check": signatureCheck
@@ -131,11 +149,68 @@ enum GuestChatDiagnosticsSchema {
             guard let count = integer(raw[key], maximum: matched) else { return nil }
             result[key] = count
         }
+        let counts = countKeys.map { result[$0] as! Int }
+        guard counts.reduce(0, +) >= matched else { return nil }
+        let expectedClassification: String
+        if counts[0] > 0 || counts[1] > 0 { expectedClassification = "devicecheck_unavailable_observed" }
+        else if counts[2] > 0 { expectedClassification = "devicecheck_error_observed" }
+        else if counts[3...6].contains(where: { $0 > 0 }) { expectedClassification = "network_error_observed" }
+        else if counts[7...10].contains(where: { $0 > 0 }) { expectedClassification = "http_error_observed" }
+        else if counts[11] > 0 { expectedClassification = "request_error_observed" }
+        else { expectedClassification = countsStatus == "complete" ? "no_known_error_observed" : "logs_unavailable" }
+        guard classification == expectedClassification else { return nil }
+
+        // Optional bounded phase fields preserve compatibility with the prior
+        // helper. Unknown/free-text fields are never copied into the report.
+        let phaseChoices: [(String, [String])] = [
+            ("log_command_status", commandStatuses), ("metadata_status", ["complete", "partial"]),
+            ("signature_display_status", commandStatuses + ["not_found"]),
+            ("signature_verify_status", commandStatuses + ["not_found"])
+        ]
+        for (key, choices) in phaseChoices {
+            if let rawValue = raw[key] {
+                guard let value = choice(rawValue, choices) else { return nil }
+                result[key] = value
+            }
+        }
+        for key in ["log_command_elapsed_ms", "metadata_elapsed_ms", "signature_display_elapsed_ms", "signature_verify_elapsed_ms"] {
+            if let rawValue = raw[key] {
+                guard let value = integer(rawValue, maximum: 30_000) else { return nil }
+                result[key] = value
+            }
+        }
+        if let started = raw["log_command_started"] {
+            guard let value = started as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+            result["log_command_started"] = value.boolValue
+        }
+        for (key, maximum) in [("log_command_exit_code", 255), ("log_command_termination_signal", 31)] {
+            if let rawValue = raw[key] {
+                guard let value = integer(rawValue, maximum: maximum),
+                      key != "log_command_termination_signal" || value > 0 else { return nil }
+                result[key] = value
+            }
+        }
+        guard result["log_command_exit_code"] == nil || result["log_command_termination_signal"] == nil else { return nil }
+        if let command = result["log_command_status"] as? String {
+            let expectedLogStatus = ["timed_out", "output_limit", "not_run_budget"].contains(command) ? command : "unavailable"
+            guard command == "complete" ? ["complete", "unavailable"].contains(logStatus) : logStatus == expectedLogStatus else { return nil }
+            if command == "complete" {
+                guard result["log_command_termination_signal"] == nil,
+                      result["log_command_exit_code"] == nil || result["log_command_exit_code"] as? Int == 0 else { return nil }
+            }
+            if let started = result["log_command_started"] as? Bool {
+                guard started == !["not_run_budget", "launch_failed"].contains(command) else { return nil }
+            }
+            if command == "not_run_budget" || command == "launch_failed" {
+                guard events == 0, result["log_command_exit_code"] == nil, result["log_command_termination_signal"] == nil else { return nil }
+            }
+        }
         let fields: [(String, String, Int)] = [
             ("os_version", "[0-9]{1,3}(\\.[0-9]{1,6}){0,5}", 40),
             ("os_build", "[0-9]{1,3}[A-Z][0-9]{1,8}[a-z]?", 20),
             ("hardware_model", "[A-Za-z]{1,32}[0-9]{1,3},[0-9]{1,3}", 40),
             ("client_bundle_id", "[A-Za-z][A-Za-z0-9-]{0,40}(\\.[A-Za-z0-9-]{1,40}){1,5}", 128),
+            ("client_executable", "[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", 64),
             ("client_version", "[0-9]{1,12}(\\.[0-9]{1,12}){0,5}([a-z][0-9]{0,4})?", 64),
             ("client_build", "[0-9]{1,12}(\\.[0-9]{1,12}){0,5}([a-z][0-9]{0,4})?", 64),
             ("client_team_identifier", "[A-Z0-9]{10}", 10)
@@ -149,6 +224,42 @@ enum GuestChatDiagnosticsSchema {
             }
         }
         return result
+    }
+
+    /// Collection completeness is separate from the outcome of native Chat.
+    static func collectionMessage(_ report: [String: Any]?) -> String {
+        let status = report?["log_counts_status"] as? String
+        let matched = integer(report?["matched_event_count"], maximum: 50_000) ?? 0
+        if status == "complete" {
+            return matched > 0
+                ? "Mac error summary included. No raw messages or credentials are included."
+                : "The Mac log query completed without a recognized error in its window. Chat functionality still needs verification."
+        }
+        if status == "partial" {
+            return matched > 0
+                ? "Partial Mac error summary included. Errors read before the query stopped were preserved; counts cover only the collected events."
+                : "Only part of the Mac logs was collected. Chat status could not be determined from that incomplete result."
+        }
+        return "Mac metadata included; usable log results were unavailable. Error counts and Chat status could not be determined."
+    }
+
+    /// One fixed receipt per accepted request preserves earlier observations in
+    /// the combined run log even when a later snapshot is incomplete.
+    static func collectionReceipt(_ report: [String: Any]) -> String {
+        let request = (report["request_id"] as? String).flatMap(UUID.init(uuidString:))?.uuidString.prefix(8) ?? "unknown"
+        let collected = date(report["collected_utc"]).map(utc) ?? "unavailable"
+        let status = choice(report["collection_status"], ["complete", "partial"]) ?? "unavailable"
+        let availability = choice(report["log_counts_status"], ["complete", "partial", "unavailable"]) ?? "unavailable"
+        let classification = choice(report["classification"], ["devicecheck_unavailable_observed", "devicecheck_error_observed",
+            "network_error_observed", "http_error_observed", "request_error_observed", "no_known_error_observed", "logs_unavailable"]) ?? "logs_unavailable"
+        let command = choice(report["log_command_status"], commandStatuses) ?? "legacy_unreported"
+        var fields = ["result=\(status)", "request=\(request)", "collected_utc=\(collected)",
+                      "log_counts_status=\(availability)", "classification=\(classification)", "log_command_status=\(command)"]
+        for key in ["collection_elapsed_ms", "log_command_elapsed_ms", "log_event_count", "matched_event_count",
+                    "chatgpt_matched_event_count", "system_devicecheck_matched_event_count", "unknown_source_matched_event_count"] + countKeys {
+            if let value = integer(report[key], maximum: 50_000) { fields.append("\(key)=\(value)") }
+        }
+        return fields.joined(separator: " ")
     }
 
     static func ready(_ data: Data, session: UUID, now: Date = Date()) -> Bool {
@@ -393,6 +504,7 @@ import UIKit
               let data = GuestChatDiagnosticsFiles.read(directory: folder, name: "report.json", limit: 16_384),
               let value = GuestChatDiagnosticsSchema.canonicalReport(data, request: request), save(value) else { return false }
         lastSafeReport = value; imported = request.requestID
+        HengeLog.log("guest-diagnostics", GuestChatDiagnosticsSchema.collectionReceipt(value))
         NotificationCenter.default.post(name: .hengeGuestChatDiagnosticsDidUpdate, object: nil)
         return true
     }
@@ -442,9 +554,7 @@ import UIKit
             }
             _ = importAvailable()
             if imported == requested.requestID {
-                return lastSafeReport?["log_status"] as? String == "complete"
-                    ? "Mac error summary included. No raw messages or credentials are included."
-                    : "Mac metadata included; its unified log query was unavailable or reached its limit."
+                return GuestChatDiagnosticsSchema.collectionMessage(lastSafeReport)
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
