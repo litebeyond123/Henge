@@ -1060,6 +1060,13 @@ static int serve_helper_health(Conn *c, Request *r, const char *what) {
             if (value < 1) { status = 400; error = "invalid_stage"; }
             else if (!strcmp(kind, "probe")) helper_health.probe_ms = host_now_ms();
             else {
+                // Preserve startup transitions in the existing native log even if the VM exits before
+                // the next diagnostic snapshot. Repeated health pings must not flood that log.
+                if (!helper_health.agent_ms || helper_health.protocol != 4 || helper_health.pid != (int)pid ||
+                    helper_health.startup != value) {
+                    fprintf(stderr, "hengevm: helper-health protocol=4 pid=%u stage=%s\n", pid, helper_startup_names[value]);
+                    fflush(stderr); // Flush stdio only; this is not a guarantee against an immediate OS kill.
+                }
                 helper_health.agent_ms = host_now_ms();
                 helper_health.protocol = 4;
                 helper_health.pid = (int)pid;
@@ -1086,6 +1093,10 @@ static int serve_helper_health(Conn *c, Request *r, const char *what) {
                 helper_health.error = why;
                 helper_health.exit_code = (int)code;
                 helper_health.install_ms = host_now_ms();
+                // Only validated enum-table constants and numbers enter the log, never request text.
+                fprintf(stderr, "hengevm: helper-install stage=%s error=%s exit_code=%u pid=%u\n",
+                        helper_install_names[value], helper_error_names[why], code, pid);
+                fflush(stderr);
                 if (value == 5) { // A prior daemon heartbeat cannot confirm a new launch.
                     helper_health.agent_ms = 0;
                     helper_health.protocol = helper_health.pid = helper_health.startup = 0;

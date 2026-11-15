@@ -203,7 +203,7 @@ def inspect_macho(data, name, trollstore, main=False, maximum_ios="17.0"):
     return reports
 
 
-def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4004",
+def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4005",
                      kind=None, maximum_ios="17.0", husk_commit=None, run_url=None):
     package = Path(package)
     require(bool(re.fullmatch(r"[0-9a-f]{40}", expected_commit)), "Expected commit must be a full git SHA-1")
@@ -305,7 +305,7 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-version", default="0.4.0")
-    parser.add_argument("--expected-build", default="4004")
+    parser.add_argument("--expected-build", default="4005")
     parser.add_argument("--kind", choices=("ipa", "tipa"))
     parser.add_argument("--maximum-ios", default="17.0")
     parser.add_argument("--husk-commit")

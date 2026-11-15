@@ -23,7 +23,7 @@ env:
   HENGE_PACKAGE_OUTPUT_DIR: ${{ github.workspace }}/packages
   HENGE_BUILD_LOG_DIR: ${{ github.workspace }}/build-logs
   HENGE_EXPECTED_VERSION: '0.4.0'
-  HENGE_EXPECTED_BUILD: '4004'
+  HENGE_EXPECTED_BUILD: '4005'
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
@@ -198,7 +198,7 @@ jobs:
       - name: Upload validated TIPA and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4004-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4005-tipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.manifest.json
@@ -222,7 +222,7 @@ jobs:
         if: ${{ success() && inputs.include_ipa }}
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4004-ipa-${{ github.sha }}
+          name: Henge-0.4.0-4005-ipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.manifest.json
@@ -240,8 +240,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  publish-test4:
-    name: Publish the validated Test 4 prerelease
+  publish-test4-1:
+    name: Publish the validated Test 4.1 prerelease
     needs: build
     if: ${{ success() && github.repository == 'litebeyond123/Henge' && github.ref == 'refs/heads/work/0.4-ipados17-test' }}
     runs-on: ubuntu-latest
@@ -255,13 +255,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          sparse-checkout: docs/release-test4.md
+          sparse-checkout: docs/release-test4.1.md
           sparse-checkout-cone-mode: false
 
       - name: Download the validated package from this run
         uses: actions/download-artifact@v4
         with:
-          name: Henge-0.4.0-4004-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4005-tipa-${{ github.sha }}
           path: validated-package
 
       - name: Verify and name release assets
@@ -276,28 +276,28 @@ jobs:
           digest = hashlib.sha256(package.read_bytes()).hexdigest()
           assert manifest['source']['henge_commit'] == os.environ['BUILT_COMMIT'], 'Source commit mismatch'
           assert manifest['application']['version'] == '0.4.0', 'Version mismatch'
-          assert manifest['application']['build'] == '4004', 'Build mismatch'
+          assert manifest['application']['build'] == '4005', 'Build mismatch'
           assert manifest['package']['sha256'] == digest, 'Package digest mismatch'
           out = pathlib.Path('release-assets')
           out.mkdir()
-          name = 'Henge-0.4.0-test4.tipa'
+          name = 'Henge-0.4.0-test4.1.tipa'
           shutil.copyfile(package, out / name)
           manifest['package']['filename'] = name
-          (out / 'Henge-0.4.0-test4.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-          (out / 'Henge-0.4.0-test4.sha256').write_text(f'{digest}  {name}\n')
-          print(f'Validated Test 4 package: {digest}')
+          (out / 'Henge-0.4.0-test4.1.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          (out / 'Henge-0.4.0-test4.1.sha256').write_text(f'{digest}  {name}\n')
+          print(f'Validated Test 4.1 package: {digest}')
           PY
 
-      - name: Publish Test 4 as a prerelease
+      - name: Publish Test 4.1 as a prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BUILT_COMMIT: ${{ github.sha }}
         run: |
-          gh release create v0.4.0-test4 \
+          gh release create v0.4.0-test4.1 \
             --target "$BUILT_COMMIT" --prerelease --latest=false \
-            --title "Henge 0.4 Test 4 (4004)" \
-            --notes-file docs/release-test4.md \
-            release-assets/Henge-0.4.0-test4.tipa \
-            release-assets/Henge-0.4.0-test4.manifest.json \
-            release-assets/Henge-0.4.0-test4.sha256
+            --title "Henge 0.4 Test 4.1 (4005)" \
+            --notes-file docs/release-test4.1.md \
+            release-assets/Henge-0.4.0-test4.1.tipa \
+            release-assets/Henge-0.4.0-test4.1.manifest.json \
+            release-assets/Henge-0.4.0-test4.1.sha256

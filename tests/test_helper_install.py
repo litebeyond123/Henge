@@ -2,6 +2,7 @@
 """Real C health protocol plus the exact served installer in an isolated, controlled guest environment."""
 import json
 import os
+import select
 from pathlib import Path
 import subprocess
 import tempfile
@@ -64,6 +65,40 @@ class HelperInstallTests(unittest.TestCase):
         self.assertEqual(self.receipt("confirmed", pid=123)[0], 409)
         self.assertEqual(self.receipt("confirmed", pid=456)[0], 200)
         self.assertEqual(self.health()["install_stage"], "confirmed")
+
+    def test_native_log_keeps_fixed_receipts_and_changed_health_only(self):
+        self.assertEqual(self.ping()[0], 200)
+        self.assertEqual(self.ping()[0], 200)  # ordinary repeated heartbeat is silent
+        self.assertEqual(self.ping(stage="ready")[0], 200)
+        self.assertEqual(self.ping(pid=456, stage="ready")[0], 200)
+        self.assertEqual(self.ping("probe", pid=789)[0], 200)  # probe is not daemon startup
+        self.assertEqual(self.receipt("launch_requested")[0], 200)
+        self.assertEqual(self.ping(pid=456, stage="ready")[0], 200)
+        self.assertEqual(self.receipt("confirmed", pid=456)[0], 200)
+        self.assertEqual(self.receipt("failed", "bootstrap_failed", 5)[0], 200)
+        self.assertEqual(self.ping(stage="private_raw_request")[0], 400)
+        self.assertEqual(self.receipt("failed", "private_raw_error", 1)[0], 400)
+        # The production route writes before sending its HTTP response, so all accepted lines are
+        # available here. Read only the existing pipe; no retries, timing sleeps or test-only log hooks.
+        pieces = []
+        descriptor = self.server.process.stderr.fileno()
+        while select.select([descriptor], [], [], 0)[0]:
+            piece = os.read(descriptor, 65536)
+            if not piece:
+                break
+            pieces.append(piece)
+        log = b"".join(pieces).decode("utf-8")
+        lines = [line for line in log.splitlines() if line.startswith("hengevm: helper-")]
+        self.assertEqual(lines, [
+            "hengevm: helper-health protocol=4 pid=123 stage=network_ready",
+            "hengevm: helper-health protocol=4 pid=123 stage=ready",
+            "hengevm: helper-health protocol=4 pid=456 stage=ready",
+            "hengevm: helper-install stage=launch_requested error=none exit_code=0 pid=0",
+            "hengevm: helper-health protocol=4 pid=456 stage=ready",
+            "hengevm: helper-install stage=confirmed error=none exit_code=0 pid=456",
+            "hengevm: helper-install stage=failed error=bootstrap_failed exit_code=5 pid=0",
+        ])
+        self.assertNotIn("private_raw", log)
 
     def test_new_session_clears_health_and_rejects_old_receipts(self):
         self.ping()
