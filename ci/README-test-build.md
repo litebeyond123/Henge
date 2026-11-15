@@ -1,6 +1,6 @@
 # Henge 0.4 test packages
 
-The test release is version **0.4.0**, build **4001**. This build setup starts
+The test release is version **0.4.0**, build **4002**. This build setup starts
 from the successful `2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f` workflow and
 keeps its `xcode-27` runner and dependency build procedure. It does not contain
 a prebuilt 0.4 app. A successful macOS build is required to produce one.
@@ -18,13 +18,14 @@ TrollStore **Henge.tipa** first, and uploads it with a JSON manifest and SHA-256
 checksum. Select `include_ipa` only if an additional sideloading IPA is needed.
 No release is published and no PR is opened by this workflow.
 
-The original successful workflow checked out Husk's default branch. This
-workflow preserves that behavior, records the actual Husk commit and Xcode/SDK
-versions, and includes Husk's commit in the dependency cache key. It does not
-claim that a guessed dependency revision reproduces the historical run.
+Husk is pinned to `29abb512d81bf8cc08babcbe7f7007cb557208ef`, recovered from
+the successful base build's checkout log. The workflow records both source
+commits and the Xcode/SDK versions, and includes Husk's commit in the cache key.
 
-The build runs the package-validator regression tests, host-services tests and
-the Foundation-only Swift diagnostics tests before compiling the app. Logs are
+The build runs the package-validator regression tests, host-services tests,
+small-surface layout/Metal tests, and the Foundation-only Swift diagnostics
+tests before compiling the app. A missing compatible Metal device is reported
+as a native pixel-test skip, not a pass. Logs are
 uploaded even when a subsequent build or validation step fails. The log
 artifact includes source/toolchain provenance and separate Xcode logs for TIPA
 and IPA packaging.
@@ -37,10 +38,16 @@ or macOS. Its tests use small structural fixtures that cannot be installed:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ci/tests -v
 zsh -n ios/scripts/package_ipa.sh
+bash tests/run_pvg_texture_copy.sh
 ```
 
+The texture test script runs portable layout checks and, on macOS, compiles and
+runs the native Metal pixel checks when a compatible GPU is available. Exit 77
+means that the native GPU test could not run. Test 2's scope and device test
+instructions are in `docs/0.4-test2-zh-CN.md`.
+
 Validate an actual downloaded build against the full source commit used by its
-workflow. The default expected version/build are 0.4.0/4001:
+workflow. The default expected version/build are 0.4.0/4002:
 
 ```sh
 python3 ci/validate-package.py /path/to/Henge.tipa \

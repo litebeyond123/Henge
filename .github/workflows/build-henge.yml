@@ -23,7 +23,7 @@ env:
   HENGE_PACKAGE_OUTPUT_DIR: ${{ github.workspace }}/packages
   HENGE_BUILD_LOG_DIR: ${{ github.workspace }}/build-logs
   HENGE_EXPECTED_VERSION: '0.4.0'
-  HENGE_EXPECTED_BUILD: '4001'
+  HENGE_EXPECTED_BUILD: '4002'
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
@@ -82,6 +82,21 @@ jobs:
       - name: Test host services
         working-directory: Henge
         run: python3 tests/test_host_services.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/host-services-tests.log"
+
+      - name: Test small surface layouts and Metal copies
+        working-directory: Henge
+        run: |
+          if bash tests/run_pvg_texture_copy.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/texture-copy-tests.log"; then
+            printf '%s\n' 'Small surface layout and native Metal pixel tests passed.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            texture_test_status=$?
+            if [ "$texture_test_status" -eq 77 ]; then
+              printf '%s\n' '::warning::Native Metal pixel tests were skipped: no compatible Metal GPU is available. This is not a runtime pixel-test pass.'
+              printf '%s\n' 'Native Metal pixel tests: SKIPPED (no compatible GPU). See texture-copy-tests.log for compiled and portable test results.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              exit "$texture_test_status"
+            fi
+          fi
 
       - name: Test diagnostics with Foundation
         working-directory: Henge
@@ -146,7 +161,7 @@ jobs:
       - name: Upload validated TIPA and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4001-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4002-tipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.manifest.json
@@ -170,7 +185,7 @@ jobs:
         if: ${{ success() && inputs.include_ipa }}
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4001-ipa-${{ github.sha }}
+          name: Henge-0.4.0-4002-ipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.manifest.json

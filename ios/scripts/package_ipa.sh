@@ -85,6 +85,6 @@ done
 python3 "$IOS/../ci/validate-package.py" "$STAGE/package.tmp" \
     --kind "$KIND" --expected-commit "$SOURCE_COMMIT" \
     --expected-version "${HENGE_EXPECTED_VERSION:-0.4.0}" \
-    --expected-build "${HENGE_EXPECTED_BUILD:-4001}"
+    --expected-build "${HENGE_EXPECTED_BUILD:-4002}"
 mv -f "$STAGE/package.tmp" "$OUT" # atomic: a half-written IPA never sits where the good one was
 echo "==> $OUT ($(du -h "$OUT" | cut -f1))"

@@ -44,6 +44,7 @@ static int cursor_scale(void) {
 
 #include "pvg_lite.h"
 #include "metallib.h"
+#include "pvg_texture_copy.h"
 
 #if !TARGET_OS_IPHONE
 #import <CoreGraphics/CoreGraphics.h>
@@ -88,7 +89,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     HvObject *surface;
     uint64_t row;
     uint32_t first;
-    uint32_t surface_w, surface_h, fourcc; /* its own, whatever views the guest makes of it */
+    uint32_t surface_w, surface_h, fourcc, surface_planes; /* its own, whatever views the guest makes of it */
     id<MTLTexture> scanout; /* the same pixels, as the display reads them */
     /* Multi-plane surfaces cannot sit on a buffer: a real IOSurface, kept up to date from the guest's pages. */
     IOSurfaceRef iosurface;
@@ -109,6 +110,13 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     BOOL host_valid, guest_stale;
     /* What this one is made from, kept for as long as it lives. */
     HvObject *parent;
+    /* A valid guest row can be too tightly packed for a host buffer-backed
+       texture. These copies bridge it with GPU blits, retaining their exact
+       source buffer (and its pages) until all users finish. */
+    HvObject *surface_copy;
+    id<MTLBuffer> copy_source;
+    uint64_t copy_offset, copy_row, copy_span;
+    uint32_t texture_parent_ref;
     /* A multi-plane surface's key in the replay's planar table, while it counts as one of its users. */
     NSString *planar_key;
 }
@@ -140,6 +148,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSString *, id> *planar;
     NSMutableDictionary<NSString *, NSNumber *> *planar_uses; /* mappings using each: the entry goes with the last one */
     NSMutableDictionary<NSString *, NSMutableData *> *planar_hashes; /* and what its planes held when last copied */
+    NSMapTable<NSData *, HvObject *> *surface_copies; /* exact guest page/layout key, weak owners */
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
@@ -212,36 +221,18 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 }
 @end
 
-/* Bytes a pixel takes in the uncompressed formats a surface gets viewed as; 0 for one not listed. */
-static NSUInteger pixel_bytes(MTLPixelFormat f) {
-    switch (f) {
-    case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: case MTLPixelFormatR8Snorm:
-    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: return 1;
-    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float:
-    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
-    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm: case MTLPixelFormatBGR5A1Unorm: return 2;
-    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float: case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm:
-    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
-    case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
-    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
-    case MTLPixelFormatBGR10A2Unorm: return 4;
-    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
-    case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float: return 8;
-    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float: return 16;
-    default: return 0;
-    }
-}
-
 /* Metal aborts the app, rather than failing, on a linear texture whose rows don't hold its width or don't fit the buffer.
    A view the guest makes in another format, or a surface read with the wrong description, can ask for one. */
 static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, uint64_t offset, uint64_t row, NSUInteger length) {
-    NSUInteger bpp = pixel_bytes(t.pixelFormat);
+    NSUInteger bpp = hv_pvg_pixel_bytes(t.pixelFormat);
     if (!bpp) return YES; /* not checked: as before */
     NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
-    BOOL ok = row >= t.width * bpp && (!align || (row % align == 0 && offset % align == 0)) && offset + row * t.height <= length;
+    BOOL ok = hv_pvg_texture_span_fits(t.width, t.height, bpp, offset, row, length) &&
+              t.height <= (length - offset) / row && /* preserve the direct path's full-row requirement */
+              (!align || (row % align == 0 && offset % align == 0));
     if (!ok) {
         static int told;
-        if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: a %lux%lu format %lu texture can't sit on rows of %llu bytes at %llu in %lu: left empty\n",
+        if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: a %lux%lu format %lu texture can't sit on rows of %llu bytes at %llu in %lu: direct mapping unavailable\n",
                                 (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, offset, (unsigned long)length);
     }
     return ok;
@@ -691,6 +682,47 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (!o->object) [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height]];
 }
 
+/* Only small single-plane mapped surfaces use a copy. Ordinary linear textures
+   may alias guest buffers within one exec and must not use this path. Every
+   compatible view/mapping of the same guest pages shares one canonical texture. */
+- (void)makeSurfaceTextureCopy:(HvObject *)o surface:(HvObject *)surface descriptor:(MTLTextureDescriptor *)t {
+    id<MTLBuffer> buffer = surface->object;
+    MTLPixelFormat format = hv_pvg_surface_copy_format(surface->fourcc);
+    if (surface->surface_planes > 1 || !surface->pages || surface->length > (128 << 14) || !format || !buffer ||
+        !hv_pvg_surface_copy_compatible(t, format, surface->surface_w, surface->surface_h,
+                                       surface->first, surface->row, buffer.length)) return;
+    HvObject *copy = surface->surface_copy;
+    if (!copy) {
+        NSData *key = hv_pvg_surface_copy_key(surface->pages, surface->length >> 14,
+                                             surface->first, surface->row, surface->surface_w, surface->surface_h, format);
+        copy = [surface_copies objectForKey:key];
+        if (!copy) {
+            MTLTextureDescriptor *canonical = [t copy];
+            canonical.pixelFormat = format;
+            id<MTLTexture> texture = hv_pvg_texture_copy_create(device, canonical, buffer, surface->first, surface->row);
+            if (!texture) return;
+            copy = [HvObject new];
+            copy->object = texture;
+            copy->copy_source = buffer;
+            copy->copy_offset = surface->first, copy->copy_row = surface->row;
+            copy->copy_span = (t.height - 1) * surface->row + t.width * hv_pvg_pixel_bytes(format);
+            copy->length = surface->length;
+            copy->pages = malloc((surface->length >> 14) * sizeof *copy->pages);
+            if (!copy->pages) return;
+            memcpy(copy->pages, surface->pages, (surface->length >> 14) * sizeof *copy->pages);
+            if (!surface_copies) surface_copies = [NSMapTable strongToWeakObjectsMapTable];
+            [surface_copies setObject:copy forKey:key];
+            static int told;
+            if (told++ < 12) fprintf(stderr, "hengevm: pvg-metal: copied surface %lux%lu format %lu row %llu (host alignment %lu)\n",
+                                    (unsigned long)t.width, (unsigned long)t.height, (unsigned long)format,
+                                    surface->row, (unsigned long)[device minimumLinearTextureAlignmentForPixelFormat:format]);
+        }
+        surface->surface_copy = copy;
+    }
+    o->object = hv_pvg_texture_copy_view(copy->object, t);
+    if (o->object) o->surface_copy = copy;
+}
+
 /* A texture over a buffer: {tag 9, size, ref, buffer ref, offset, bytes per row, description}. */
 - (void)makeLinearTexture:(HvObject *)o at:(uint64_t)at size:(uint32_t)size task:(uint32_t)task {
     struct __attribute__((packed)) { uint32_t tag, size, ref, buffer; uint64_t offset, row; uint8_t d[64]; } h;
@@ -729,6 +761,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         if (!from) { [self complain:[NSString stringWithFormat:@"view of nothing (tag %u, ref %u)", h.tag, h.buffer]]; return; }
         o->parent = parent;
         o->surface = parent->surface;
+        o->surface_copy = parent->surface_copy;
+        if (o->surface_copy) o->texture_parent_ref = h.buffer;
         NSRange levels = NSMakeRange((NSUInteger)v.levels[0], (NSUInteger)v.levels[1]), slices = NSMakeRange((NSUInteger)v.slices[0], (NSUInteger)v.slices[1]);
         if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format];
         else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices];
@@ -951,6 +985,7 @@ static void sync_iosurface(HvObject *s) {
     surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
     surface->row = row;
     surface->first = first;
+    surface->alloc = alloc;
     uint64_t sw, sh;
     memcpy(&sw, desc + 0x20, 8), memcpy(&sh, desc + 0x28, 8), memcpy(&surface->fourcc, desc + 4, 4);
     if (compact) {
@@ -959,6 +994,7 @@ static void sync_iosurface(HvObject *s) {
         sw = w32 >> 8, sh = h32 >> 8;
     }
     surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
+    surface->surface_planes = planes;
     uint64_t n = surface->length >> 14;
     vm_address_t base = 0;
     const uint32_t *pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
@@ -967,13 +1003,20 @@ static void sync_iosurface(HvObject *s) {
         return nil;
     }
     surface->mapped = (uint8_t *)base;
+    /* Physical page metadata also lets a small copied surface reject an
+       overlapping direct surface. Copies themselves are limited to 128 pages.
+       Invalid/hole pages keep the original path and never enter the registry. */
+    if (planes <= 1) surface->pages = malloc(n * sizeof *surface->pages);
     for (uint64_t i = 0; i < n; i++) {
-        if (!(pages[i] & 1)) continue;
+        if (!(pages[i] & 1)) { free(surface->pages); surface->pages = NULL; continue; }
         uint8_t *src = hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000);
-        if (!src) continue;
+        if (!src) { free(surface->pages); surface->pages = NULL; continue; }
+        if (surface->pages) surface->pages[i] = pages[i] & ~1u;
         vm_address_t to = base + (i << 14);
         vm_prot_t cur, max;
-        vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+        if (vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS) {
+            free(surface->pages); surface->pages = NULL;
+        }
     }
     surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared
                                            deallocator:^(void *at, NSUInteger size) { vm_deallocate(mach_task_self(), (vm_address_t)at, size); }];
@@ -1097,12 +1140,14 @@ static void sync_iosurface(HvObject *s) {
     }
     else if (linear_texture_fits(device, t, surface->first, surface->row, ((id<MTLBuffer>)surface->object).length))
         o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
+    if (!o->object && !surface->iosurface)
+        [self makeSurfaceTextureCopy:o surface:surface descriptor:t];
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
         t.storageMode = MTLStorageModePrivate;
         o->object = [device newTextureWithDescriptor:t]; /* something to bind: it stays empty */
     }
-    if (!plane) mapped_textures[@(h.mapping)] = o->object;
+    if (!plane && o->object) mapped_textures[@(h.mapping)] = o->object;
 }
 
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task {
@@ -1113,8 +1158,11 @@ static void sync_iosurface(HvObject *s) {
     NSMutableDictionary *objs = tasks[@(task)];
     if (!objs) tasks[@(task)] = objs = [NSMutableDictionary new];
     HvObject *o = objs[@(ref)];
-    if (o && !memcmp(o->entry, e, 12)) {
-        /* macOS 14's driver names a surface before it writes the surface's description: try again a while.
+    if (o && !memcmp(o->entry, e, 12) &&
+        !(o->surface_copy && o->texture_parent_ref && [self object:o->texture_parent_ref task:task] != o->parent)) {
+        /* A copied surface's child view checks its parent first: old drivers
+           can replace a surface while a later exec references only the view.
+           macOS 14's driver names a surface before it writes the surface's description: try again a while.
            And it reuses surface ids: a texture over a surface that has since been replaced is made again. */
         BOOL replaced = o->object && (e[0] & 0xff) == OBJ_MAPPED_TEXTURE && hv_pvg_lite_old_driver(lite) &&
                         o->surface != [self currentSurface:o->on_mapping];
@@ -2096,6 +2144,48 @@ typedef struct {
     tracing = hv_pvg_trace_on() != 0;
     if (tracing) fprintf(stderr, "trace: exec task %u, %u resources, %u buffers\n", task, nres, nbuf);
     double t_begin = now_seconds();
+    /* Build and validate the copy set before paging or changing host_valid.
+       An unsupported alias must not discard an upload already marked valid. */
+    NSMutableSet<HvObject *> *copies = nil, *copy_writes = nil;
+    for (uint32_t i = 0; i < nres; i++) {
+        HvObject *o = [self object:res[i * 2] task:task];
+        if (!o) continue;
+        if (o->mapped) refresh_pages(self, task, o);
+        if (!o->surface_copy) continue;
+        HvObject *copy = o->surface_copy;
+        if (!copies) copies = [NSMutableSet new];
+        [copies addObject:copy];
+        if (res[i * 2 + 1] & 2) {
+            if (!copy_writes) copy_writes = [NSMutableSet new];
+            [copy_writes addObject:copy];
+        }
+    }
+    if (copies.count) {
+        for (uint32_t i = 0; i < nres; i++) {
+            HvObject *o = [self object:res[i * 2] task:task];
+            if (!o) continue;
+            HvObject *surface = o->surface;
+            for (HvObject *copy in copies) {
+                if (o->surface_copy == copy) continue; /* canonical/view/exact mapping alias */
+                BOOL overlap = NO;
+                if (surface && surface->pages && surface->first < surface->length)
+                    overlap = hv_pvg_copy_spans_overlap(copy->pages, copy->length >> 14, copy->copy_offset, copy->copy_span,
+                                                        surface->pages, surface->length >> 14, surface->first,
+                                                        MIN(surface->alloc, surface->length - surface->first));
+                /* A guest buffer explicitly aliasing the same physical pixels
+                   would need per-encoder synchronization, which is not provided. */
+                for (HvObject *b = o; b && !overlap; b = b->parent) {
+                    if (b->plain_buffer && b->pages)
+                        overlap = hv_pvg_copy_span_overlaps_buffer(copy->pages, copy->length >> 14, copy->copy_offset, copy->copy_span,
+                                                                  b->pages, b->length >> 14);
+                }
+                if (overlap) {
+                    [self complain:@"incompatible copied surface alias: exec skipped before paging"];
+                    return NO;
+                }
+            }
+        }
+    }
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = nil;
     BOOL sync_after = NO;
@@ -2118,6 +2208,11 @@ typedef struct {
             o->host_valid = YES;
         }
         if (res[i * 2 + 1] & 4) sync_after = YES;
+    }
+    /* Upload after any existing paging, without a CPU wait. */
+    for (HvObject *copy in copies) {
+        if (!blit) blit = [cb blitCommandEncoder];
+        hv_pvg_texture_copy_encode(blit, copy->object, copy->copy_source, copy->copy_offset, copy->copy_row, NO);
     }
     [blit endEncoding];
     /* Bit 1: this exec writes it, so the guest's copy is out of date from here on. Never
@@ -2193,6 +2288,12 @@ typedef struct {
         if (!more && e) { [e endEncoding]; e = nil; }
     }
     if (e) [e endEncoding];
+    if (copy_writes.count) {
+        id<MTLBlitCommandEncoder> back = [cb blitCommandEncoder];
+        for (HvObject *copy in copy_writes)
+            hv_pvg_texture_copy_encode(back, copy->object, copy->copy_source, copy->copy_offset, copy->copy_row, YES);
+        [back endEncoding];
+    }
     if (sync_after) { /* the guest wants these back as soon as this is done */
         id<MTLBlitCommandEncoder> back = nil;
         for (uint32_t i = 0; i < nres; i++) {

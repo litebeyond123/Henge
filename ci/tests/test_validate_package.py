@@ -70,7 +70,7 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4001",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4002",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }
