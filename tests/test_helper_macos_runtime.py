@@ -8,7 +8,7 @@ A temporary loopback alias reproduces the transport address, NOT macOS LAN priva
 import argparse
 import ctypes
 import datetime
-import http.client
+from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,8 +48,8 @@ def first_line(process, seconds):
     return value.strip()
 
 
-def http(method, path, session=None):
-    connection = http.client.HTTPConnection(ADDRESS, 80, timeout=5)
+def request_http(method, path, session=None):
+    connection = HTTPConnection(ADDRESS, 80, timeout=5)
     try:
         headers = {"Connection": "close", "Content-Length": "0"}
         if session:
@@ -75,8 +76,13 @@ def process_path(pid):
 
 def matching_pids(executable):
     # Read only PID numbers for this CI user; verify each executable path before retaining/signalling it.
-    listing = command(["/bin/ps", "-u", str(os.getuid()), "-o", "pid="], check=False).stdout
-    return {int(value) for value in listing.split() if value.isdecimal() and process_path(int(value)) == executable}
+    listing = command(["/bin/ps", "-A", "-o", "pid=", "-o", "uid="]).stdout
+    candidates = []
+    for line in listing.splitlines():
+        values = line.split()
+        if len(values) == 2 and all(value.isdecimal() for value in values) and int(values[1]) == os.getuid():
+            candidates.append(int(values[0]))
+    return {pid for pid in candidates if process_path(pid) == executable}
 
 
 def interrupted(signum, _frame):
@@ -168,10 +174,10 @@ def main():
         if not proxy_ready.get("ready") or not isinstance(proxy_ready.get("pid"), int):
             raise GateError(f"test_port_unavailable:{proxy_ready.get('errno')}")
         proxy_pid = proxy_ready["pid"]
-        health = http("GET", "/.henge/helper/health")
+        health = request_http("GET", "/.henge/helper/health")
         if health.get("session") != session or health.get("agent_seen_s") != -1:
             raise GateError("production_health_initial_state_wrong")
-        http("POST", "/.henge/helper/install-status?stage=launch_requested&error=none&code=0&pid=0", session)
+        request_http("POST", "/.henge/helper/install-status?stage=launch_requested&error=none&code=0&pid=0", session)
         stdout_path, stderr_path = directory / "helper.stdout", directory / "helper.stderr"
         if args.mode == "legacy":
             plist = {"Label": label, "ProgramArguments": [str(helper)], "RunAtLoad": True, "KeepAlive": True,
@@ -189,7 +195,7 @@ def main():
         previous_pid = None
         collector_seen = False
         while time.monotonic() - started < args.timeout:
-            health = http("GET", "/.henge/helper/health")
+            health = request_http("GET", "/.henge/helper/health")
             pid = health.get("helper_pid")
             actual_pid = None
             if args.mode == "app":
@@ -211,6 +217,7 @@ def main():
                     summary["last_launchd_exit_code"] = int(exit_code.group(1))
             elif isinstance(pid, int) and pid > 0 and process_path(pid) == helper:
                 actual_pid = app_pid = pid
+                launched_app_pids.add(pid)
             connected = (health.get("session") == session and health.get("helper_protocol") == 4 and
                          isinstance(pid, int) and pid > 0 and pid == actual_pid and
                          isinstance(health.get("agent_seen_s"), int) and 0 <= health["agent_seen_s"] < 30 and
@@ -229,8 +236,8 @@ def main():
                     (args.mode == "legacy" or marker)):
                     if command([helper, "--health-check", str(pid)], check=False).returncode:
                         raise GateError("real_helper_pid_health_check_failed")
-                    http("POST", f"/.henge/helper/install-status?stage=confirmed&error=none&code=0&pid={pid}", session)
-                    if http("GET", "/.henge/helper/health").get("install_stage") != "confirmed":
+                    request_http("POST", f"/.henge/helper/install-status?stage=confirmed&error=none&code=0&pid={pid}", session)
+                    if request_http("GET", "/.henge/helper/health").get("install_stage") != "confirmed":
                         raise GateError("production_install_confirmation_failed")
                     summary.update(status="passed", actual_pid=pid, executable_identity_verified=True,
                                    collector_heartbeat_verified=True, install_receipt_verified=True,
@@ -245,6 +252,9 @@ def main():
                            last_startup_stage=health.get("startup_stage"), collector_heartbeat_verified=collector_seen)
             raise GateError("real_runtime_health_deadline_exceeded")
     except BaseException as error:
+        if not isinstance(error, GateError):
+            # Standard traceback omits locals; never dump environment, request headers or bodies.
+            traceback.print_exc()
         failure = f"{type(error).__name__}:{error}" if isinstance(error, GateError) else type(error).__name__
         summary["failure"] = failure
     finally:
@@ -286,10 +296,14 @@ def main():
                 except subprocess.TimeoutExpired:
                     cleanup_errors.append("proxy_stop_failed")
         stats = directory / "proxy-stats.json"
+        if proxy_pid and proxy and proxy.returncode != 0:
+            cleanup_errors.append("proxy_exit_failed")
         if stats.exists():
             summary["proxy"] = json.loads(stats.read_text())
             if summary["proxy"].get("report_requests_blocked"):
                 cleanup_errors.append("unexpected_collection_attempt")
+        elif proxy_pid:
+            cleanup_errors.append("proxy_stats_missing")
         if driver:
             try:
                 driver.stdin.write("quit\n")

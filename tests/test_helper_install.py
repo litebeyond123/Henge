@@ -165,6 +165,7 @@ if mode == "--app-pid":
     print(999); sys.exit(0)
 if mode == "--quit-app":
     state["app_running"]=False; p.write_text(json.dumps(state)); sys.exit(0)
+if mode == "--startup-status": print('{"pid":999,"startup":"running","network":"waiting","login":"requires_approval"}'); sys.exit(0)
 if mode == "--unregister-login": sys.exit(0)
 if mode == "--login-status": print("requires_approval"); sys.exit(0)
 if mode == "--health-check":
@@ -180,7 +181,7 @@ sys.exit(2)
             old = app / "Contents/MacOS/henge-agent"; old.write_text(payload); old.chmod(0o755)
             (app / "Contents/marker").write_text("old")
         commands = self.directory / "bin"; commands.mkdir()
-        for name in ("curl", "codesign", "launchctl", "open", "sleep", "mv", "cp"):
+        for name in ("curl", "codesign", "launchctl", "open", "sleep", "mv", "cp", "rm"):
             target=commands/name; target.write_bytes((ROOT / "tests/helper_install_stub.py").read_bytes()); target.chmod(0o755)
         script=self.directory/"install.sh"; script.write_bytes(self.script())
         environment=dict(os.environ, HOME=str(home), PATH=str(commands)+os.pathsep+os.environ["PATH"],
@@ -213,9 +214,11 @@ sys.exit(2)
     def test_download_failure_preserves_running_helper(self): self.assert_preserved("download_failed", "download_failed")
     def test_invalid_gzip_preserves_running_helper(self): self.assert_preserved("gzip_invalid", "gzip_invalid")
     def test_archive_traversal_rejected_before_extraction(self): self.assert_preserved("archive_traversal", "gzip_invalid")
+    def test_archive_symlink_rejected_before_extraction(self): self.assert_preserved("archive_symlink", "gzip_invalid")
+    def test_archive_hardlink_rejected_before_extraction(self): self.assert_preserved("archive_hardlink", "gzip_invalid")
     def test_signature_failure_preserves_running_helper(self): self.assert_preserved("signature_invalid", "signature_invalid")
     def test_wrong_version_preserves_running_helper(self): self.assert_preserved("version_invalid", "version_invalid")
-    def test_bootout_failure_is_explicit(self): self.assert_preserved("bootout_failed", "bootout_failed")
+    def test_bootout_failure_is_explicit(self): self.assert_preserved("bootout_failed", "bootout_failed", True)
     def test_app_launch_failure_restores_legacy_job(self): self.assert_preserved("bootstrap_failed", "bootstrap_failed", True)
     def test_absent_app_after_full_window_restores_prior_agent(self):
         state=self.assert_preserved("health_unconfirmed", "health_unconfirmed", True)
@@ -238,6 +241,12 @@ sys.exit(2)
     def test_failed_app_replacement_restores_previous_app_and_running_state(self):
         result, receipts, _, _, app, launch=self.install("bootstrap_failed", previous_app=True)
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((app/"Contents/marker").read_text(), "old")
+        self.assertTrue(launch["app_running"] and launch["loaded"])
+        self.assertEqual(receipts[-1]["stage"], "rolled_back")
+    def test_signal_after_removal_restores_previous_app_from_complete_backup(self):
+        result, receipts, _, _, app, launch=self.install("interrupt_replacement", previous_app=True)
+        self.assertEqual(result.returncode, 130, result.stderr+result.stdout)
         self.assertEqual((app/"Contents/marker").read_text(), "old")
         self.assertTrue(launch["app_running"] and launch["loaded"])
         self.assertEqual(receipts[-1]["stage"], "rolled_back")

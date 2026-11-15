@@ -105,6 +105,11 @@ gzip -t "$HENGE_HELPER_TMP/helper.tar.gz" || fail gzip_invalid "$?"
 tar -tzf "$HENGE_HELPER_TMP/helper.tar.gz" > "$HENGE_HELPER_TMP/archive.list" || fail gzip_invalid "$?"
 awk 'BEGIN { valid=1; count=0 } { count++; if ($0 !~ /^Henge Helper[.]app(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/) valid=0 } END { exit !(valid && count>0) }' \
     "$HENGE_HELPER_TMP/archive.list" || fail gzip_invalid 1
+# An in-tree symlink or hard link could still redirect a later extraction outside the staging directory.
+# The shipped app needs only regular files and directories; reject all other archive entry types.
+tar -tvzf "$HENGE_HELPER_TMP/helper.tar.gz" > "$HENGE_HELPER_TMP/archive.types" || fail gzip_invalid "$?"
+awk 'BEGIN { valid=1; count=0 } { count++; if (substr($0,1,1)!="-" && substr($0,1,1)!="d") valid=0 } END { exit !(valid && count>0) }' \
+    "$HENGE_HELPER_TMP/archive.types" || fail gzip_invalid 1
 tar -xzf "$HENGE_HELPER_TMP/helper.tar.gz" -C "$HENGE_HELPER_TMP" || fail gzip_invalid "$?"
 HENGE_STAGED_APP="$HENGE_HELPER_TMP/Henge Helper.app"
 HENGE_STAGED_BINARY="$HENGE_STAGED_APP/Contents/MacOS/henge-agent"
@@ -118,6 +123,9 @@ receipt verified none 0 || fail connection_failed 1
 
 if [ -e "$HENGE_HELPER_APP" ]; then
     [ -d "$HENGE_HELPER_APP" ] && [ ! -L "$HENGE_HELPER_APP" ] && [ -x "$HENGE_HELPER_BINARY" ] || fail replace_failed 1
+    # Complete the backup while the original app and startup state are untouched.
+    # A signal during this copy can safely discard the partial backup, never the original.
+    cp -Rp "$HENGE_HELPER_APP" "$HENGE_HELPER_TMP/previous.app" || fail replace_failed "$?"
     HENGE_HELPER_HAD_APP=1
     if app_pid; then HENGE_HELPER_APP_WAS_RUNNING=1; fi
 fi
@@ -127,6 +135,7 @@ if [ -f "$HENGE_HELPER_PLIST" ]; then
 fi
 if launchctl print "$HENGE_HELPER_JOB" >/dev/null 2>&1; then
     HENGE_HELPER_WAS_LOADED=1
+    HENGE_HELPER_MUTATED=1
     launchctl bootout "$HENGE_HELPER_JOB" || fail bootout_failed "$?"
 fi
 HENGE_HELPER_MUTATED=1
@@ -134,10 +143,10 @@ if [ "$HENGE_HELPER_HAD_APP" -eq 1 ]; then
     "$HENGE_HELPER_BINARY" --quit-app || fail bootout_failed "$?"
 fi
 receipt replacing none 0 || fail connection_failed 1
-if [ "$HENGE_HELPER_HAD_APP" -eq 1 ]; then
-    mv "$HENGE_HELPER_APP" "$HENGE_HELPER_TMP/previous.app" || fail replace_failed "$?"
-fi
+# Mark the transaction before the first destructive operation, so a signal between any two
+# commands restores the already complete backup. The only prior copy is never moved into staging.
 HENGE_HELPER_APP_CHANGED=1
+rm -rf "$HENGE_HELPER_APP" || fail replace_failed "$?"
 mv "$HENGE_STAGED_APP" "$HENGE_HELPER_APP" || fail replace_failed "$?"
 # Keep the old bare binary for recovery, but remove its job to prevent two helpers at next login.
 rm -f "$HENGE_HELPER_PLIST" || fail replace_failed "$?"
@@ -174,6 +183,8 @@ if [ "$HENGE_HELPER_CONNECTED" -eq 0 ]; then
             *) echo 'Automatic login startup status is unavailable; check the Henge Helper window.' ;;
         esac
         echo 'Henge will update the connection status automatically after the app connects.'
+        echo 'Current fixed startup status:'
+        "$HENGE_HELPER_BINARY" --startup-status || echo 'Startup status is currently unavailable.'
         exit 0
     fi
     fail health_unconfirmed 1
