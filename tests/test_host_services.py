@@ -84,16 +84,24 @@ class Server:
             sock.settimeout(6)
             sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
             pieces = []
+            ended = "peer EOF"
             while True:
                 try:
                     data = sock.recv(4096)
-                except ConnectionResetError:
-                    # The server deliberately closes rejected body-bearing control requests.
+                except ConnectionResetError as error:
+                    # Some rejected body-bearing requests close with reset. Only a complete HTTP
+                    # response below is accepted; an empty/truncated response must remain a failure.
+                    ended = f"connection reset (errno {error.errno})"
                     break
                 if not data:
                     break
                 pieces.append(data)
-        head, data = b"".join(pieces).split(b"\r\n\r\n", 1)
+        raw = b"".join(pieces)
+        head, separator, data = raw.partition(b"\r\n\r\n")
+        if not separator:
+            raise AssertionError(
+                f"Incomplete HTTP response for {method} {path}: {len(raw)} bytes, {ended}, "
+                f"driver exit={self.process.poll()}, prefix={raw[:120]!r}")
         status = int(head.split()[1])
         for line in head.split(b"\r\n")[1:]:
             if line.lower().startswith(b"content-length:"):

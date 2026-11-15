@@ -80,10 +80,16 @@ jobs:
         run: python3 -m unittest discover -s ci/tests -v 2>&1 | tee "$HENGE_BUILD_LOG_DIR/validator-tests.log"
 
       - name: Test host services
+        # The Apple runner supports the actual Unix listener. Keep the
+        # socketpair/courier alternative for restricted local test environments.
+        env:
+          HENGE_TEST_LISTENER: '1'
         working-directory: Henge
         run: python3 tests/test_host_services.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/host-services-tests.log"
 
       - name: Test helper installation and independent health
+        env:
+          HENGE_TEST_LISTENER: '1'
         working-directory: Henge
         run: |
           python3 tests/test_helper_install.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-install-tests.log"
