@@ -14,11 +14,12 @@ enum Sharing {
     static let unlightenCommand = "curl -s http://10.0.2.4/.henge/unlighten | sh"
 
     /// Before a Mac starts.
-    static func prepare() {
+    @MainActor static func prepare() {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         // A Unix socket's path can't be long, so the short temporary folder.
         let socket = (NSTemporaryDirectory() as NSString).appendingPathComponent("s.sock")
         henge_vm_share(folder.path, socket, Bundle.main.path(forResource: "henge-agent", ofType: "gz"))
+        HostServices.shared.begin()
     }
 
     /// The helper asks the server for news at most 25 s apart.
@@ -29,8 +30,10 @@ enum Sharing {
 
     /// What is copied on the Mac is copied here too. The other way needs the system's paste button: iOS
     /// asks for permission whenever an app reads the clipboard on its own.
-    static func followMacClipboard() async {
+    @MainActor static func followMacClipboard() async {
+        defer { HostServices.shared.end() }
         while !Task.isCancelled {
+            HostServices.shared.poll()
             if let text = henge_share_take_clipboard() {
                 UIPasteboard.general.string = String(cString: text)
                 free(text)

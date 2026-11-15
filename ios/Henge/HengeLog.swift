@@ -55,6 +55,10 @@ enum HengeLog {
             .appendingPathComponent("henge.log")
     }
 
+    static var previousLogURL: URL {
+        logFileURL.deletingLastPathComponent().appendingPathComponent("henge-prev.log")
+    }
+
     static func recentLines(_ n: Int = 400) -> [String] {
         ringLock.lock(); defer { ringLock.unlock() }
         return Array(ring.suffix(n))
@@ -78,15 +82,24 @@ enum HengeLog {
         // ...but the previous run is kept as henge-prev.log, because when a game took Henge down with it, that run's log is
         // the crash report (CrashReport.swift).
         let url = logFileURL
-        let prev = url.deletingLastPathComponent().appendingPathComponent("henge-prev.log")
-        try? FileManager.default.removeItem(at: prev)
-        try? FileManager.default.moveItem(at: url, to: prev)
-        logFD = open(url.path, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        let rotated = rotate(url, to: previousLogURL)
+        logFD = open(url.path, O_CREAT | O_WRONLY | (rotated ? O_TRUNC : O_APPEND), 0o644)
 
         redirectStdio()
         installCrashHandlers()
         logBanner()
+        if !rotated { log("boot", "WARNING: log rotation failed; preserving and appending to henge.log") }
         replayPreviousNativeLog()
+        Diagnostics.start()
+    }
+
+    /// Do not erase a surviving previous run when the current file is absent.
+    @discardableResult
+    static func rotate(_ current: URL, to previous: URL) -> Bool {
+        // Same-directory rename replaces the destination atomically. Removing
+        // the previous file first could lose both runs if the move then fails.
+        if rename(current.path, previous.path) == 0 { return true }
+        return errno == ENOENT
     }
 
     /// Put the last run's native output into this run's log.
@@ -97,10 +110,15 @@ enum HengeLog {
     /// could retrieve. Replaying it here puts it in henge.log, which is the file
     /// people already know how to send.
     private static func replayPreviousNativeLog() {
-        guard let data = try? Data(contentsOf: previousNativeLogURL),
-              !data.isEmpty,
-              let text = String(data: data.suffix(8 * 1024), encoding: .utf8)
-        else { return }
+        // Read the tail directly. Loading a whole native log just to keep its
+        // final 8 KiB can itself exhaust memory after a long or verbose run.
+        guard let file = try? FileHandle(forReadingFrom: previousNativeLogURL) else { return }
+        defer { try? file.close() }
+        guard let size = try? file.seekToEnd(), size > 0 else { return }
+        do { try file.seek(toOffset: size > 8192 ? size - 8192 : 0) }
+        catch { return }
+        guard let data = try? file.read(upToCount: 8192), !data.isEmpty else { return }
+        let text = String(decoding: data, as: UTF8.self)
 
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(40)
         guard !lines.isEmpty else { return }
@@ -122,6 +140,9 @@ enum HengeLog {
 
     /// Force everything out to disk.
     static func flushNow() {
+        fflush(stdout)
+        fflush(stderr)
+        if pipeWriteFD >= 0 { fsync(pipeWriteFD) }
         if logFD >= 0 { fsync(logFD) }
     }
 
@@ -148,15 +169,18 @@ enum HengeLog {
                                            in: .userDomainMask)[0]
         let cURL = dir.appendingPathComponent("henge-native.log")
         let prevURL = dir.appendingPathComponent("henge-native-prev.log")
-        try? FileManager.default.removeItem(at: prevURL)
-        try? FileManager.default.moveItem(at: cURL, to: prevURL)
+        let rotated = rotate(cURL, to: prevURL)
 
-        pipeWriteFD = open(cURL.path, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        pipeWriteFD = open(cURL.path, O_CREAT | O_WRONLY | (rotated ? O_TRUNC : O_APPEND), 0o644)
         pipeReadFD = open(cURL.path, O_RDONLY)
         guard pipeWriteFD >= 0, pipeReadFD >= 0 else {
             log("boot", "WARNING: could not open henge-native.log (errno \(errno)); "
                       + "C-side stderr will not be captured")
             return
+        }
+        if !rotated {
+            _ = lseek(pipeReadFD, 0, SEEK_END)
+            log("boot", "WARNING: native log rotation failed; preserving and appending to henge-native.log")
         }
         log("boot", "native stderr -> henge-native.log (mirrored here)")
 
@@ -203,7 +227,8 @@ enum HengeLog {
         t.start()
     }
 
-    /// Turn "the app vanished with no crash log" into a labelled last line.
+    /// Label catchable fatal signals. SIGKILL (including a jetsam kill) cannot
+    /// be caught here; an abruptly ending log alone does not establish why.
     ///
     /// Deliberately does NOT touch SIGTRAP or SIGBUS: those belong to the JIT trap
     /// guard in henge-ios-jit.c, which needs to step over an unserviced brk rather

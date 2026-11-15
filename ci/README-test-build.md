@@ -1,0 +1,77 @@
+# Henge 0.4 test packages
+
+The test release is version **0.4.0**, build **4001**. This build setup starts
+from the successful `2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f` workflow and
+keeps its `xcode-27` runner and dependency build procedure. It does not contain
+a prebuilt 0.4 app. A successful macOS build is required to produce one.
+
+## Build on an authorized GitHub repository
+
+Commit the complete test source, including the version change, host-services
+tests and diagnostics tests, on a branch in a repository you control. Use
+**Actions → Build Henge 0.4 test packages → Run workflow**, and select that
+branch. The existing workflow file must also be present on the default branch
+for GitHub to offer manual dispatch.
+
+The workflow checks out the selected commit SHA, builds and validates a
+TrollStore **Henge.tipa** first, and uploads it with a JSON manifest and SHA-256
+checksum. Select `include_ipa` only if an additional sideloading IPA is needed.
+No release is published and no PR is opened by this workflow.
+
+The original successful workflow checked out Husk's default branch. This
+workflow preserves that behavior, records the actual Husk commit and Xcode/SDK
+versions, and includes Husk's commit in the dependency cache key. It does not
+claim that a guessed dependency revision reproduces the historical run.
+
+The build runs the package-validator regression tests, host-services tests and
+the Foundation-only Swift diagnostics tests before compiling the app. Logs are
+uploaded even when a subsequent build or validation step fails. The log
+artifact includes source/toolchain provenance and separate Xcode logs for TIPA
+and IPA packaging.
+
+## Local checks
+
+The package validator uses only Python 3's standard library and runs on Linux
+or macOS. Its tests use small structural fixtures that cannot be installed:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ci/tests -v
+zsh -n ios/scripts/package_ipa.sh
+```
+
+Validate an actual downloaded build against the full source commit used by its
+workflow. The default expected version/build are 0.4.0/4001:
+
+```sh
+python3 ci/validate-package.py /path/to/Henge.tipa \
+  --expected-commit FULL_40_CHARACTER_GIT_COMMIT \
+  --manifest /path/to/Henge.tipa.manifest.json \
+  --sha256-file /path/to/Henge.tipa.sha256
+```
+
+The validator checks the ZIP, required resources, build/version/commit stamps,
+the main executable's arm64 architecture and iOS minimum of at most 17.0, and
+embedded code signatures. For a TIPA it rejects the banned TrollStore
+entitlements in both XML and DER entitlement slots, including nested Mach-O
+executables. The newer, guarded JIT helper may target a newer iOS; the iOS 17
+check applies to the main executable and its app Info.plist.
+
+This portable validator inspects signature structure. The macOS packager also
+runs `codesign --verify --deep --strict` to verify the signed bundle itself.
+Neither check establishes that the app runs correctly on a physical iPad.
+
+## Local macOS packaging
+
+Prepare the dependencies using the main README and use Xcode 27 or later.
+Commit all source changes first so the package's commit stamp describes the
+actual source. Then run:
+
+```sh
+zsh ios/scripts/package_ipa.sh --trollstore
+```
+
+`HENGE_PACKAGE_OUTPUT_DIR` can redirect the output from `~/Desktop`, and
+`HENGE_BUILD_LOG_DIR` can collect separate Xcode logs. The packager removes the
+previous output package and reports before attempting a new build, verifies
+the staged archive, and publishes the new package only after every check
+passes. A failed build cannot leave an older package at the advertised path.

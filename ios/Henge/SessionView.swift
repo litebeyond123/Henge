@@ -18,6 +18,7 @@ struct SessionView: View {
     @State private var framesOut: UInt64 = 0
     @State private var framesIn: UInt64 = 0
     @State private var log: [String] = []
+    @State private var inputIssueMarkers = 0
     @State private var started = Date()
     @State private var thermalState = ProcessInfo.processInfo.thermalState
     @AppStorage("henge.cpus") private var cpus = 4
@@ -507,13 +508,11 @@ struct SessionView: View {
                 }
                 Section("Sharing") {
                     LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
-                    if !helperRunning {
-                        Button("Type the Set Up Command") {
-                            showDetails = false
-                            Task {
-                                try? await Task.sleep(nanoseconds: 600_000_000)
-                                await Sharing.typeSetUpCommand()
-                            }
+                    Button(helperRunning ? "Type the Update Helper Command" : "Type the Set Up Command") {
+                        showDetails = false
+                        Task {
+                            try? await Task.sleep(nanoseconds: 600_000_000)
+                            await Sharing.typeSetUpCommand()
                         }
                     }
                     Text(helperRunning
@@ -521,6 +520,7 @@ struct SessionView: View {
                          : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                HostServicesSection()
                 Section("Lighter macOS") {
                     Button("Type the Lighter macOS Command") {
                         showDetails = false
@@ -538,6 +538,19 @@ struct SessionView: View {
                     }
                     Text("Less drawing for the emulated CPUs: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper go. Open Terminal on the Mac, tap the button and press Return, then log out and back in. Also turn on Reduce Motion and Reduce Transparency in the Mac's System Settings, Accessibility. Undo puts it back, apart from the wallpaper. Needs the Mac's keyboard layout to be U.S.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("Diagnostics") {
+                    Button {
+                        Diagnostics.markInputIssue(softwareKeyboardVisible: typing, externalDisplay: display.isExternal,
+                                                   zoomed: zoomed, helperRunning: helperRunning)
+                        inputIssueMarkers += 1
+                    } label: {
+                        Label(inputIssueMarkers == 0 ? "Mark missing input candidates" : "Input issue marked (\(inputIssueMarkers))",
+                              systemImage: "flag")
+                    }
+                    Text("Tap when the Mac's input candidates are missing, then export diagnostics. Records a timestamp and input/display state; it does not record what you type.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    DiagnosticsExportButton()
                 }
                 Section("Log") {
                     VStack(alignment: .leading, spacing: 1) {
@@ -585,7 +598,7 @@ struct SessionView: View {
         UIApplication.shared.isIdleTimerDisabled = true
         HardwareMouse.shared.start()
         let ram = GuestMemory.prepare(mac)
-        HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
+        HengeLog.log("session", "allocation headroom \(henge_available_memory() >> 20) MiB (not free physical RAM)")
         guard ram >= 1024 else {
             error = "There is not room for this Mac's memory: it needs a few GB of free storage."
             return
@@ -594,6 +607,8 @@ struct SessionView: View {
         JITBootstrap.releaseLingeringDebugger()
         Sharing.prepare()
         EngineTuning.apply()
+        Diagnostics.recordSession(ramMB: ram, requestedRAMMB: mac.ramMB, cpus: cpus,
+                                  width: mac.screen.width, height: mac.screen.height, retina: mac.isRetina)
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         if mac.isRetina {
             henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
@@ -664,7 +679,9 @@ struct SessionView: View {
                 showWallpaperTip = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10) { showWallpaperTip = false }
             }
-            if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report
+            // Diagnostics samples memory on a utility queue every 30 seconds,
+            // including while this UI task is busy. iPadOS .ips reports remain
+            // necessary to establish a jetsam or watchdog termination.
             if tick % 60 == 0 { MacPreview.save(for: mac) }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }

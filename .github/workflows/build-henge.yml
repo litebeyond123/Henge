@@ -1,120 +1,189 @@
-# .github/workflows/build-henge.yml
-#
-# Builds a Henge.ipa from your fork's main branch on a GitHub-hosted macOS
-# runner, no Mac needed. Free on a PUBLIC repo: public repos get unlimited
-# minutes on hosted runners, including macOS. On a private repo, macOS minutes
-# bill at 10x, so the free tier's ~2000 min/month is only ~200 macOS minutes.
-#
-# The IPA comes out unsigned with ad-hoc signing (package_ipa.sh's normal
-# output). SideStore/AltStore re-signs it with your certificate on install
-# and keeps the entitlements it can; increased-memory-limit only survives if
-# your certificate carries it, and Henge falls back to file-backed guest RAM
-# without it.
+name: Build Henge 0.4 test packages
 
-name: Build Henge IPA
-
-# Manual only (Actions tab > Build Henge IPA > Run workflow): pushes to main don't build an IPA.
+# Pushing the dedicated test branch starts its build. Manual dispatch remains
+# available. Each job checks out the triggering SHA rather than a moving branch.
 on:
-  workflow_dispatch: {}
+  push:
+    branches:
+      - work/0.4-ipados17-test
+  workflow_dispatch:
+    inputs:
+      include_ipa:
+        description: Also build an IPA for a sideloader (TIPA is always built)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 env:
   HUSK: ${{ github.workspace }}/Husk
-  # The Makefile takes its slirp headers from IOS_DEPS, not HUSK:
-  #   IOS_DEPS ?= $(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot
-  # (HUSK is only read by ios/scripts/fetch_deps.sh.)
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+  HENGE_PACKAGE_OUTPUT_DIR: ${{ github.workspace }}/packages
+  HENGE_BUILD_LOG_DIR: ${{ github.workspace }}/build-logs
+  HENGE_EXPECTED_VERSION: '0.4.0'
+  HENGE_EXPECTED_BUILD: '4001'
+  PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
   build:
-    # Xcode 27 image (arm64, GA since Oct 2026). Plain `xcode-27` is a standard
-    # runner, so it's free on public repos; `xcode-27-xlarge` is a paid larger
-    # runner. Table: https://github.com/actions/runner-images#available-images
+    # Preserve the runner used by the successful 2ed42fcf61f2 build.
     runs-on: xcode-27
     timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Check out Henge (this fork)
+      - name: Prepare output directories
+        run: mkdir -p "$HENGE_PACKAGE_OUTPUT_DIR" "$HENGE_BUILD_LOG_DIR"
+
+      - name: Check out the selected Henge commit
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           path: Henge
 
-      # fetch_deps.sh copies prebuilt pieces out of a BUILT Husk checkout:
-      # StikJIT.xcframework (vendored in Husk's repo, comes with checkout),
-      # libhusk_rppairing.a (scripts/build_rppairing_ios.sh) and the
-      # libslirp/glib/intl/pcre2 static libs (scripts/build_ios.sh).
+      # Exact Husk checkout recovered from the successful 2ed42fcf61f2 job log.
       - name: Check out Husk
         uses: actions/checkout@v4
         with:
           repository: Leviidev/Husk
+          ref: 29abb512d81bf8cc08babcbe7f7007cb557208ef
           path: Husk
 
-      - name: Cache Husk's sources and prebuilt iOS pieces
+      - name: Record source and toolchain provenance
+        id: source
+        run: |
+          HENGE_SOURCE_COMMIT=$(git -C Henge rev-parse HEAD)
+          HENGE_HUSK_COMMIT=$(git -C Husk rev-parse HEAD)
+          printf 'HENGE_SOURCE_COMMIT=%s\nHENGE_HUSK_COMMIT=%s\n' "$HENGE_SOURCE_COMMIT" "$HENGE_HUSK_COMMIT" >> "$GITHUB_ENV"
+          printf 'husk_sha=%s\n' "$HENGE_HUSK_COMMIT" >> "$GITHUB_OUTPUT"
+          export HENGE_SOURCE_COMMIT HENGE_HUSK_COMMIT
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          data = {
+              "henge_commit": os.environ["HENGE_SOURCE_COMMIT"],
+              "husk_commit": os.environ["HENGE_HUSK_COMMIT"],
+              "selected_ref": os.environ["GITHUB_REF"],
+              "run_url": f'{os.environ["GITHUB_SERVER_URL"]}/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{os.environ["GITHUB_RUN_ID"]}',
+              "xcode": subprocess.check_output(["xcodebuild", "-version"], text=True).strip(),
+              "iphoneos_sdk": subprocess.check_output(["xcrun", "--sdk", "iphoneos", "--show-sdk-version"], text=True).strip(),
+          }
+          pathlib.Path(os.environ["HENGE_BUILD_LOG_DIR"], "provenance.json").write_text(json.dumps(data, indent=2) + "\n")
+          print(json.dumps(data, indent=2))
+          PY
+
+      - name: Check the package validator
+        working-directory: Henge
+        run: python3 -m unittest discover -s ci/tests -v 2>&1 | tee "$HENGE_BUILD_LOG_DIR/validator-tests.log"
+
+      - name: Test host services
+        working-directory: Henge
+        run: python3 tests/test_host_services.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/host-services-tests.log"
+
+      - name: Test diagnostics with Foundation
+        working-directory: Henge
+        run: |
+          xcrun --sdk macosx swiftc -swift-version 5 ios/Henge/Diagnostics.swift tests/test_diagnostics.swift \
+            -o "$RUNNER_TEMP/henge-test-diagnostics" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/diagnostics-compile.log"
+          "$RUNNER_TEMP/henge-test-diagnostics" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/diagnostics-tests.log"
+
+      - name: Cache Husk's sources and iOS libraries
         uses: actions/cache@v4
         with:
           path: |
             Husk/third_party/build
             Husk/build
-          key: husk-ios-arm64-${{ hashFiles('Husk/scripts/build_ios.sh', 'Husk/scripts/fetch_sources.sh') }}
+          key: husk-ios-arm64-${{ runner.os }}-${{ steps.source.outputs.husk_sha }}-${{ hashFiles('Husk/scripts/build_ios.sh', 'Husk/scripts/fetch_sources.sh') }}
 
       - name: Install build tools
         run: |
-          set -euxo pipefail
+          exec > >(tee "$HENGE_BUILD_LOG_DIR/build-tools.log") 2>&1
           brew install xcodegen meson ninja pkg-config
-          # Runner images ship rustup; add the iOS target if it's missing.
           rustup target add aarch64-apple-ios || {
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             rustup target add aarch64-apple-ios
           }
 
-      # build_ios.sh builds from third_party/build/<name>; the sources are
-      # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
       - name: Fetch Husk's third-party sources
         working-directory: Husk
-        run: bash scripts/fetch_sources.sh
+        run: bash scripts/fetch_sources.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/fetch-sources.log"
 
-      # Henge only needs these three sysroot pieces: libffi (a glib dep),
-      # glib (whose meson subprojects also produce libpcre2-8 and libintl),
-      # and libslirp (the guest network). Skip Husk's pixman/libucontext/qemu
-      # stages entirely: that's the Android emulator, minutes instead of an
-      # hour-plus.
       - name: Build the iOS libraries Henge needs
         working-directory: Husk
-        run: bash scripts/build_ios.sh libffi glib libslirp
+        run: bash scripts/build_ios.sh libffi glib libslirp 2>&1 | tee "$HENGE_BUILD_LOG_DIR/ios-libraries.log"
 
       - name: Build Husk's on-device pairing library
         working-directory: Husk
-        run: bash scripts/build_rppairing_ios.sh
+        run: bash scripts/build_rppairing_ios.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/pairing-library.log"
 
-      - name: Copy prebuilt deps into Henge
+      - name: Copy dependencies into Henge
         working-directory: Henge
-        run: zsh ios/scripts/fetch_deps.sh
+        run: zsh ios/scripts/fetch_deps.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/copy-dependencies.log"
 
-      - name: Build the restore stack (libirecovery, usbmuxd, idevicerestore)
+      - name: Build the restore stack
         working-directory: Henge
-        run: zsh tools/build_ios_restore.sh
+        run: zsh tools/build_ios_restore.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/restore-stack.log"
 
       - name: Build the engine
         working-directory: Henge
-        run: make ios-lib
+        run: make ios-lib 2>&1 | tee "$HENGE_BUILD_LOG_DIR/engine.log"
 
-      - name: Package Henge.ipa
+      - name: Package and validate Henge.tipa
         working-directory: Henge
-        run: zsh ios/scripts/package_ipa.sh
+        run: |
+          zsh ios/scripts/package_ipa.sh --trollstore 2>&1 | tee "$HENGE_BUILD_LOG_DIR/package-tipa.log"
+          python3 ci/validate-package.py "$HENGE_PACKAGE_OUTPUT_DIR/Henge.tipa" \
+            --expected-commit "$HENGE_SOURCE_COMMIT" --husk-commit "$HENGE_HUSK_COMMIT" \
+            --expected-version "$HENGE_EXPECTED_VERSION" --expected-build "$HENGE_EXPECTED_BUILD" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --manifest "$HENGE_PACKAGE_OUTPUT_DIR/Henge.tipa.manifest.json" \
+            --sha256-file "$HENGE_PACKAGE_OUTPUT_DIR/Henge.tipa.sha256" \
+            2>&1 | tee "$HENGE_BUILD_LOG_DIR/validate-tipa.log"
 
-      - name: Upload Henge.ipa
+      - name: Upload validated TIPA and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-ipa-${{ github.sha }}
-          path: /Users/runner/Desktop/Henge.ipa
+          name: Henge-0.4.0-4001-tipa-${{ github.sha }}
+          path: |
+            ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa
+            ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.manifest.json
+            ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.sha256
           if-no-files-found: error
 
-      - name: Package Henge.tipa
+      - name: Package and validate optional Henge.ipa
+        if: ${{ inputs.include_ipa }}
         working-directory: Henge
-        run: zsh ios/scripts/package_ipa.sh --trollstore
+        run: |
+          zsh ios/scripts/package_ipa.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/package-ipa.log"
+          python3 ci/validate-package.py "$HENGE_PACKAGE_OUTPUT_DIR/Henge.ipa" \
+            --expected-commit "$HENGE_SOURCE_COMMIT" --husk-commit "$HENGE_HUSK_COMMIT" \
+            --expected-version "$HENGE_EXPECTED_VERSION" --expected-build "$HENGE_EXPECTED_BUILD" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --manifest "$HENGE_PACKAGE_OUTPUT_DIR/Henge.ipa.manifest.json" \
+            --sha256-file "$HENGE_PACKAGE_OUTPUT_DIR/Henge.ipa.sha256" \
+            2>&1 | tee "$HENGE_BUILD_LOG_DIR/validate-ipa.log"
 
-      - name: Upload Henge.tipa
+      - name: Upload validated optional IPA and manifest
+        if: ${{ success() && inputs.include_ipa }}
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-tipa-${{ github.sha }}
-          path: /Users/runner/Desktop/Henge.tipa
+          name: Henge-0.4.0-4001-ipa-${{ github.sha }}
+          path: |
+            ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa
+            ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.manifest.json
+            ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.sha256
           if-no-files-found: error
+
+      - name: Upload build logs even after failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-0.4-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.HENGE_BUILD_LOG_DIR }}/
+            Henge/ios/build/*.buildlog
+          if-no-files-found: warn
+          retention-days: 30

@@ -33,6 +33,7 @@ static uint64_t stopped_blocks, stopped_tx, stopped_rx;
 static const char *exit_description(void);
 
 static void on_exit(int reason) {
+    hv_share_host_end();
     pthread_rwlock_wrlock(&api_lock);
     state = 3;
     exit_reason = reason;
@@ -71,6 +72,7 @@ static int begin_start(char *err, size_t errlen) {
 }
 
 static int failed_start(void) {
+    hv_share_host_end();
     if (!installer_session) hv_vm_destroy();
     state = installer_session ? 2 : 0;
     pthread_rwlock_unlock(&api_lock);
@@ -196,6 +198,7 @@ static int lock_running(void) {
     return 0;
 }
 void henge_vm_stop(void) {
+    hv_share_host_end();
     if (!lock_running()) return;
     hv_vm_stop();
     state = 3;
@@ -261,6 +264,13 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
 void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
 char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
 long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
+
+void henge_host_services_begin(const char *session) { hv_share_host_begin(session); }
+void henge_host_services_end(void) { hv_share_host_end(); }
+void henge_host_services_publish(int running, int foreground, int brightness_control, double brightness, double output_volume) {
+    hv_share_host_publish(running && state == 1, foreground, brightness_control, brightness, output_volume);
+}
+int henge_host_services_process_brightness(double (*apply)(double)) { return hv_share_host_process_brightness(apply); }
 
 void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
 void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }

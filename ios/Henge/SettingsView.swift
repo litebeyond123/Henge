@@ -53,10 +53,12 @@ struct SettingsView: View {
                 .listRowBackground(Desk.card)
                 Section("Memory") {
                     LabeledContent("Extra memory", value: Entitlements.increasedMemory ? "On" : "Off")
-                    LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
-                    LabeledContent("Free for Henge", value: ByteText.string(UInt64(henge_available_memory())))
+                    LabeledContent("Allocation headroom at launch", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
+                    LabeledContent("Allocation headroom now", value: ByteText.string(UInt64(henge_available_memory())))
+                    Text("Headroom estimates how much more this process may allocate. It is not free physical RAM, and does not predict every reason iPadOS might close an app.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     Text(Entitlements.increasedMemory
-                         ? "A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead."
+                         ? "The increased-memory entitlement is present. Allocation headroom changes as Henge and iPadOS use memory."
                          : "This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
@@ -112,10 +114,11 @@ struct SettingsView: View {
                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
                     Picker("Code cache", selection: $codeCacheMB) {
+                        Text("512 MB").tag(512)
                         Text("1 GB").tag(1024)
                         Text("1.5 GB").tag(1536)
                     }
-                    Text("A bigger code cache empties less often and takes more memory; Henge picks 1.5 GB where there is room for it. Applies the next time Henge opens. If JIT stops turning on, choose 1 GB.")
+                    Text("A smaller code cache uses less memory but fills and flushes more often, which can reduce speed. Henge uses 1 GB by default on iPads with up to 8 GB of RAM; an existing choice is kept. Changes apply after Henge is closed and reopened.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text("macOS draws a frame for every refresh: 30 Hz leaves the most of the emulated CPU to apps, at the cost of choppier animation; 60 Hz is smoother. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -130,8 +133,12 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
-                Section("Log") {
-                    ShareLink(item: HengeLog.logFileURL) { Label("Share henge.log", systemImage: "square.and.arrow.up") }
+                Section("Diagnostics") {
+                    DiagnosticsExportButton()
+                    Text("Includes the current and previous launch's Henge and native logs, build information, settings and memory observations. After an unexpected close, reopen Henge and export before another relaunch replaces the previous logs.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text("Recognizable sensitive fields are filtered. Existing application logs may still contain personal information; review before sharing. No Mac disk, account store, clipboard or screenshot is collected.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
             }

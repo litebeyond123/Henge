@@ -1,5 +1,6 @@
 #!/bin/zsh
-# Builds Henge for iOS and writes ~/Desktop/Henge.ipa (or ~/Desktop/Henge.tipa with --trollstore).
+# Builds Henge for iOS and writes ~/Desktop/Henge.ipa (or Henge.tipa with --trollstore).
+# HENGE_PACKAGE_OUTPUT_DIR and HENGE_BUILD_LOG_DIR can redirect the output and logs.
 # Unsigned build, then signed ad hoc inside out with the entitlements file named by the
 # HENGE_ENTITLEMENTS environment variable (default Henge/Henge.entitlements), as Husk's
 # package_ipa.sh does: the sideloader (SideStore, AltStore, Impactor) re-signs it
@@ -8,22 +9,41 @@
 set -e
 IOS="$(cd "$(dirname "$0")/.." && pwd)"
 TROLLSTORE=false
-[ "$1" = "--trollstore" ] && TROLLSTORE=true
-OUT="$HOME/Desktop/Henge.ipa"
-[ "$TROLLSTORE" = true ] && OUT="$HOME/Desktop/Henge.tipa"
+case "${1:-}" in
+    --trollstore) TROLLSTORE=true ;;
+    '') ;;
+    *) echo "usage: $0 [--trollstore]" >&2; exit 2 ;;
+esac
+KIND=ipa
+[ "$TROLLSTORE" = true ] && KIND=tipa
+OUT_DIR="${HENGE_PACKAGE_OUTPUT_DIR:-$HOME/Desktop}"
+mkdir -p "$OUT_DIR"
+OUT="$OUT_DIR/Henge.$KIND"
+# A failure must leave no older package or report at the advertised output path.
+rm -f "$OUT" "$OUT.manifest.json" "$OUT.sha256"
+SOURCE_COMMIT=$(git -C "$IOS/.." rev-parse HEAD)
+if [ -n "$(git -C "$IOS/.." status --porcelain --untracked-files=normal)" ]; then
+    echo "==> commit the source changes before packaging; the package must match its git stamp" >&2
+    exit 1
+fi
 [ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
 cd "$IOS"
 xcodegen generate >/dev/null
 DD="$IOS/build/DerivedData"
 mkdir -p "$IOS/build"
+BUILD_LOG="$DD.buildlog"
+if [ -n "${HENGE_BUILD_LOG_DIR:-}" ]; then
+    mkdir -p "$HENGE_BUILD_LOG_DIR"
+    BUILD_LOG="$HENGE_BUILD_LOG_DIR/xcodebuild-$KIND.log"
+fi
 xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
-    -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$DD.buildlog" 2>&1 || {
+    -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$BUILD_LOG" 2>&1 || {
     # Never package what an older build left behind.
-    grep -E "error:|BUILD" "$DD.buildlog" | sort -u
+    grep -E "error:|BUILD" "$BUILD_LOG" | sort -u || true
     echo "==> the build failed; nothing packaged" >&2
     exit 1
 }
-grep -E "BUILD" "$DD.buildlog" || true
+grep -E "BUILD" "$BUILD_LOG" || true
 APP="$DD/Build/Products/Release-iphoneos/Henge.app"
 rc=0
 for f in "$APP/Henge" "$APP/henge-jit.js" "$APP/PlugIns/HengeJITHelper.appex/HengeJITHelper" \
@@ -42,7 +62,7 @@ cp "$IOS/${HENGE_ENTITLEMENTS:-Henge/Henge.entitlements}" "$ENT"
 BANNED_KEYS=("com.apple.private.cs.debugger" "dynamic-codesigning" "com.apple.private.skip-library-validation")
 if [ "$TROLLSTORE" = true ]; then for k in "${BANNED_KEYS[@]}"; do plutil -remove "$k" "$ENT" 2>/dev/null || true; done; fi
 SAPP="$STAGE/Payload/Henge.app"
-plutil -insert HengeBuildCommit -string "$(git -C "$IOS/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" "$SAPP/Info.plist"
+plutil -insert HengeBuildCommit -string "${SOURCE_COMMIT[1,12]}" "$SAPP/Info.plist"
 plutil -insert HengeBuildDate -string "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SAPP/Info.plist"
 # Apple's boot ROM is fetched on the device (BootROM.swift) and must never ship. An older build folder can still
 # hold a copy from when the app bundled it, so it goes, and nothing is packaged if any is left.
@@ -55,11 +75,16 @@ sign() { codesign --force --sign - --timestamp=none "$@"; }
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
 for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done
 sign --entitlements "$ENT" "$SAPP"
+codesign --verify --deep --strict "$SAPP"
 EMBEDDED=$(codesign -d --entitlements - "$SAPP" 2>&1 || true)
 # Every key the entitlements file asks for must be in the signature.
 for k in $(plutil -convert json -o - "$ENT" | python3 -I -c 'import json, sys; print(" ".join(json.load(sys.stdin)))'); do
     grep -q "$k" <<< "$EMBEDDED" || { echo "==> $k did not embed; refusing to package" >&2; exit 1; }
 done
 ( cd "$STAGE" && zip -qry "$STAGE/package.tmp" Payload )
+python3 "$IOS/../ci/validate-package.py" "$STAGE/package.tmp" \
+    --kind "$KIND" --expected-commit "$SOURCE_COMMIT" \
+    --expected-version "${HENGE_EXPECTED_VERSION:-0.4.0}" \
+    --expected-build "${HENGE_EXPECTED_BUILD:-4001}"
 mv -f "$STAGE/package.tmp" "$OUT" # atomic: a half-written IPA never sits where the good one was
 echo "==> $OUT ($(du -h "$OUT" | cut -f1))"

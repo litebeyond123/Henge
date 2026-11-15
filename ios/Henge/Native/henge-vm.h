@@ -60,6 +60,13 @@ void henge_share_set_clipboard(const char *text);
 char *henge_share_take_clipboard(void);
 long henge_share_agent_seen(void);
 
+/* Optional host services over the same guest-only HTTP connection. UI thread publishes/handles requests.
+   The apply callback is synchronous and must not call these services again or run an event loop. */
+void henge_host_services_begin(const char *session);
+void henge_host_services_end(void);
+void henge_host_services_publish(int running, int foreground, int brightness_control, double brightness, double output_volume);
+int henge_host_services_process_brightness(double (*apply)(double));
+
 /* The size macOS is told its screen is. Before henge_vm_boot. */
 void henge_vm_set_display(uint32_t width, uint32_t height);
 /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */

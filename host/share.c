@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <removefile.h>
 #include <stdint.h>
@@ -70,6 +71,119 @@ long hv_share_agent_seen(void) {
     return ago;
 }
 
+/* ---- optional host services ---- */
+
+#define HOST_STATE_MAX_AGE_MS 5000
+#define HOST_REQUEST_TIMEOUT_MS 2000
+#define HOST_BODY_MAX 128
+
+static pthread_mutex_t host_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t host_cond = PTHREAD_COND_INITIALIZER;
+static char host_session[37];
+static int host_running, host_foreground, host_brightness_control;
+static double host_brightness, host_volume;
+static int64_t host_updated_ms;
+static unsigned long long host_next_request;
+/* A bounded, single in-flight operation. It remains occupied until its HTTP waiter consumes the result. */
+static struct {
+    unsigned long long id;
+    int pending, status;
+    const char *error;
+    double value, actual;
+    int64_t deadline_ms;
+} host_request;
+
+static int64_t host_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int host_uuid(const char *s) {
+    if (!s || strlen(s) != 36) return 0;
+    for (int i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (s[i] != '-') return 0; }
+        else if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f') || (s[i] >= 'A' && s[i] <= 'F'))) return 0;
+    }
+    return 1;
+}
+
+static int host_fresh_locked(void) {
+    return host_session[0] && host_updated_ms && host_now_ms() - host_updated_ms <= HOST_STATE_MAX_AGE_MS;
+}
+
+static void host_finish_locked(int status, const char *error, double actual) {
+    if (!host_request.pending) return;
+    host_request.pending = 0;
+    host_request.status = status;
+    host_request.error = error;
+    host_request.actual = actual;
+    pthread_cond_broadcast(&host_cond);
+}
+
+void hv_share_host_begin(const char *session) {
+    pthread_mutex_lock(&host_mu);
+    host_finish_locked(409, "session_changed", 0);
+    host_session[0] = 0;
+    if (host_uuid(session)) memcpy(host_session, session, sizeof host_session);
+    host_running = host_foreground = host_brightness_control = 0;
+    host_updated_ms = 0;
+    pthread_mutex_unlock(&host_mu);
+}
+
+void hv_share_host_end(void) {
+    pthread_mutex_lock(&host_mu);
+    host_session[0] = 0;
+    host_running = host_foreground = host_brightness_control = 0;
+    host_updated_ms = 0;
+    host_finish_locked(409, "session_ended", 0);
+    pthread_mutex_unlock(&host_mu);
+}
+
+void hv_share_host_publish(int running, int foreground, int brightness_control, double brightness, double output_volume) {
+    pthread_mutex_lock(&host_mu);
+    if (host_session[0]) {
+        host_running = !!running;
+        host_foreground = !!foreground;
+        host_brightness_control = !!brightness_control;
+        if (isfinite(brightness) && brightness >= 0 && brightness <= 1 &&
+            isfinite(output_volume) && output_volume >= 0 && output_volume <= 1) {
+            host_brightness = brightness;
+            host_volume = output_volume;
+            host_updated_ms = host_now_ms();
+        } else host_updated_ms = 0;
+        if (!host_running || !host_foreground || !host_fresh_locked()) host_finish_locked(503, "host_inactive", 0);
+        else if (!host_brightness_control) host_finish_locked(403, "brightness_control_disabled", 0);
+    }
+    pthread_mutex_unlock(&host_mu);
+}
+
+int hv_share_host_process_brightness(double (*apply)(double)) {
+    int processed = 0;
+    pthread_mutex_lock(&host_mu);
+    if (host_request.pending) {
+        if (host_now_ms() >= host_request.deadline_ms) host_finish_locked(504, "request_expired", 0);
+        else if (!host_fresh_locked() || !host_running || !host_foreground) host_finish_locked(503, "host_inactive", 0);
+        else if (!host_brightness_control) host_finish_locked(403, "brightness_control_disabled", 0);
+        else if (apply) {
+            /* The caller is already on the UI thread. This short, synchronous callback cannot outlive the
+               session or race a timeout; neither a dispatch_sync nor a nested event loop belongs here. */
+            double actual = apply(host_request.value);
+            if (isfinite(actual) && actual >= 0 && actual <= 1) {
+                host_brightness = actual;
+                host_updated_ms = host_now_ms();
+                host_finish_locked(200, NULL, actual);
+                processed = 1;
+            } else {
+                host_finish_locked(503, "brightness_apply_failed", 0);
+                processed = -1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&host_mu);
+    return processed;
+}
+
 /* ---- connections ---- */
 
 typedef struct Conn {
@@ -90,6 +204,9 @@ typedef struct Request {
     long long range_from, range_to; /* -1: none */
     long chunk_left;
     int body_done;
+    char host_session[37];
+    char content_type[80];
+    int host_bad_headers, host_has_origin, content_length_seen, transfer_encoding_seen;
 } Request;
 
 /* A growing string for XML. */
@@ -600,7 +717,9 @@ static const char install_script[] =
     "</dict></plist>\n"
     "EOF\n"
     "launchctl bootstrap \"gui/$(id -u)\" \"$P\"\n"
-    "echo 'Henge is set up. You can close this window.'\n";
+    "echo 'Henge is set up. You can close this window.'\n"
+    "echo 'Host services: run the helper with --host-state, --host-capabilities, or --host-brightness 0.6.'\n"
+    "printf 'Helper: %s/henge-agent\\n' \"$D\"\n";
 
 /* What "curl -s http://10.0.2.4/.henge/lighten | sh" runs in macOS: less background work and drawing, for a Mac
    whose CPUs are emulated: less animation and drawing, and the system part (update checks, Time Machine) with the
@@ -707,8 +826,191 @@ static int clipboard_put(Conn *c, Request *r) {
     return respond_empty(c, r, 204, "No Content");
 }
 
+/* ---- /.henge/v1/ host services ---- */
+
+static const char host_json_headers[] = "Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\n";
+
+static const char *host_reason(int status) {
+    switch (status) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 409: return "Conflict";
+    case 411: return "Length Required";
+    case 413: return "Content Too Large";
+    case 415: return "Unsupported Media Type";
+    case 429: return "Too Many Requests";
+    case 504: return "Gateway Timeout";
+    default: return "Service Unavailable";
+    }
+}
+
+static int host_error(Conn *c, Request *r, int status, const char *error) {
+    char body[160];
+    int n = snprintf(body, sizeof body, "{\"protocol\":1,\"error\":\"%s\"}\n", error);
+    return respond(c, r, status, host_reason(status), host_json_headers, body, (size_t)n);
+}
+
+static int host_get(Conn *c, Request *r, int capabilities) {
+    char body[1400], brightness[40] = "null", volume[40] = "null";
+    pthread_mutex_lock(&host_mu);
+    int fresh = host_fresh_locked();
+    int active = fresh && host_running && host_foreground;
+    int writable = active && host_brightness_control;
+    long long age = host_updated_ms ? (long long)(host_now_ms() - host_updated_ms) : -1;
+    if (fresh) {
+        snprintf(brightness, sizeof brightness, "%.9f", host_brightness);
+        snprintf(volume, sizeof volume, "%.9f", host_volume);
+    }
+    int n;
+    if (capabilities) {
+        n = snprintf(body, sizeof body,
+                     "{\"protocol\":1,\"session\":\"%s\",\"active\":%s,\"features\":{"
+                     "\"hostState\":true,\"brightness\":{\"available\":%s,\"controlEnabled\":%s,\"scope\":\"mainScreen\",\"min\":0,\"max\":1},"
+                     "\"outputVolume\":{\"available\":%s,\"writable\":false},\"sharedFolder\":true,\"clipboard\":true,"
+                     "\"wifiControl\":false,\"bluetoothControl\":false,\"appleAccount\":false,\"deviceCheck\":false}}\n",
+                     host_session, active ? "true" : "false", fresh ? "true" : "false", writable ? "true" : "false", fresh ? "true" : "false");
+    } else {
+        n = snprintf(body, sizeof body,
+                     "{\"protocol\":1,\"session\":\"%s\",\"active\":%s,\"running\":%s,\"foreground\":%s,\"fresh\":%s,\"ageMs\":%lld,"
+                     "\"brightness\":{\"scope\":\"mainScreen\",\"value\":%s,\"controlEnabled\":%s,\"pending\":%s},"
+                     "\"outputVolume\":{\"value\":%s,\"writable\":false}}\n",
+                     host_session, active ? "true" : "false", fresh && host_running ? "true" : "false",
+                     fresh && host_foreground ? "true" : "false", fresh ? "true" : "false", age,
+                     brightness, writable ? "true" : "false", host_request.pending ? "true" : "false", volume);
+    }
+    pthread_mutex_unlock(&host_mu);
+    return respond(c, r, 200, "OK", host_json_headers, body, (size_t)n);
+}
+
+static const char *host_json_space(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+/* This operation accepts exactly one JSON number field. No duplicate/unknown fields, strings, NaN,
+   hexadecimal numbers or trailing data. A small schema-specific parser avoids a JSON dependency in the VM. */
+static int host_brightness_value(const char *body, double *value) {
+    const char *p = host_json_space(body);
+    if (*p++ != '{') return -1;
+    p = host_json_space(p);
+    if (strncmp(p, "\"value\"", 7)) return -1;
+    p = host_json_space(p + 7);
+    if (*p++ != ':') return -1;
+    p = host_json_space(p);
+    const char *number = p;
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else {
+        if (*p < '1' || *p > '9') return -1;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return -1;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (*p < '0' || *p > '9') return -1;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    char *end;
+    errno = 0;
+    double v = strtod(number, &end);
+    if (errno || end != p || !isfinite(v) || v < 0 || v > 1) return -1;
+    p = host_json_space(p);
+    if (*p++ != '}') return -1;
+    if (*host_json_space(p)) return -1;
+    *value = v;
+    return 0;
+}
+
+static int host_set_brightness(Conn *c, Request *r) {
+    if (!r->content_length_seen) return host_error(c, r, 411, "content_length_required");
+    if (r->length <= 0 || r->length > HOST_BODY_MAX) return host_error(c, r, 413, "body_size");
+    if (strcasecmp(r->content_type, "application/json") &&
+        strcasecmp(r->content_type, "application/json; charset=utf-8")) return host_error(c, r, 415, "application_json_required");
+    if (!host_uuid(r->host_session)) return host_error(c, r, 403, "session_required");
+    char body[HOST_BODY_MAX + 1];
+    size_t used = 0;
+    body_ready(c, r);
+    while (r->length > 0) {
+        ssize_t n = body_read(c, r, body + used, HOST_BODY_MAX - used);
+        if (n <= 0) return host_error(c, r, 400, "incomplete_body");
+        used += (size_t)n;
+    }
+    body[used] = 0;
+    double value;
+    if (memchr(body, 0, used) || host_brightness_value(body, &value)) return host_error(c, r, 400, "invalid_brightness");
+
+    int status = 0;
+    const char *error = NULL;
+    double actual = 0;
+    unsigned long long id = 0;
+    pthread_mutex_lock(&host_mu);
+    if (!host_session[0] || strcmp(r->host_session, host_session)) { status = 409; error = "session_changed"; }
+    else if (!host_fresh_locked() || !host_running || !host_foreground) { status = 503; error = "host_inactive"; }
+    else if (!host_brightness_control) { status = 403; error = "brightness_control_disabled"; }
+    else if (host_request.id) { status = 429; error = "request_in_progress"; }
+    else {
+        id = ++host_next_request;
+        if (!id) id = ++host_next_request;
+        host_request.id = id;
+        host_request.pending = 1;
+        host_request.value = value;
+        host_request.deadline_ms = host_now_ms() + HOST_REQUEST_TIMEOUT_MS;
+        while (host_request.pending) {
+            int64_t left = host_request.deadline_ms - host_now_ms();
+            if (left <= 0) { host_finish_locked(504, "request_expired", 0); break; }
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += left / 1000;
+            until.tv_nsec += (left % 1000) * 1000000;
+            if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+            int rc = pthread_cond_timedwait(&host_cond, &host_mu, &until);
+            if (rc && rc != ETIMEDOUT) host_finish_locked(503, "host_wait_failed", 0);
+        }
+        status = host_request.status;
+        error = host_request.error;
+        actual = host_request.actual;
+        memset(&host_request, 0, sizeof host_request);
+    }
+    pthread_mutex_unlock(&host_mu);
+    if (status != 200) return host_error(c, r, status, error);
+    char result[240];
+    int n = snprintf(result, sizeof result,
+                     "{\"protocol\":1,\"session\":\"%s\",\"requestId\":%llu,\"brightness\":%.9f}\n", r->host_session, id, actual);
+    return respond(c, r, 200, "OK", host_json_headers, result, (size_t)n);
+}
+
+static int serve_host(Conn *c, Request *r, const char *what) {
+    /* A deliberately small control protocol, with no browser-origin requests or unbounded/chunked bodies.
+       The UUID prevents requests from an old session; any process in the current guest can read it. */
+    r->close = 1;
+    struct timeval timeout = {.tv_sec = 3};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+    if (r->host_bad_headers || r->transfer_encoding_seen) return host_error(c, r, 400, "invalid_headers");
+    if (r->host_has_origin) return host_error(c, r, 403, "browser_origin_not_allowed");
+    if (!strcmp(what, "capabilities") || !strcmp(what, "state")) {
+        if (strcmp(r->method, "GET")) return host_error(c, r, 405, "get_required");
+        if (r->length) return host_error(c, r, 400, "unexpected_body");
+        return host_get(c, r, !strcmp(what, "capabilities"));
+    }
+    if (!strcmp(what, "brightness")) {
+        if (strcmp(r->method, "POST")) return host_error(c, r, 405, "post_required");
+        return host_set_brightness(c, r);
+    }
+    return host_error(c, r, 404, "unknown_service");
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
+    if (!strncmp(what, "v1/", 3)) return serve_host(c, r, what + 3);
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
@@ -775,8 +1077,21 @@ static int read_request(Conn *c, Request *r) {
         if (!eol) break;
         *eol = 0;
         const char *v;
-        if (header_is(line, "Content-Length", &v)) r->length = strtoll(v, NULL, 10);
-        else if (header_is(line, "Transfer-Encoding", &v)) r->chunked = strcasestr(v, "chunked") != NULL;
+        if (header_is(line, "Content-Length", &v)) {
+            char *end;
+            errno = 0;
+            r->length = strtoll(v, &end, 10);
+            if (r->content_length_seen++ || errno || *end || v == end || *v < '0' || *v > '9' || r->length < 0) r->host_bad_headers = 1;
+        } else if (header_is(line, "Transfer-Encoding", &v)) {
+            r->transfer_encoding_seen = 1;
+            r->chunked = strcasestr(v, "chunked") != NULL;
+        } else if (header_is(line, "X-Henge-Session", &v)) {
+            if (r->host_session[0] || !host_uuid(v)) r->host_bad_headers = 1;
+            else memcpy(r->host_session, v, sizeof r->host_session);
+        } else if (header_is(line, "Content-Type", &v)) {
+            if (r->content_type[0] || strlen(v) >= sizeof r->content_type) r->host_bad_headers = 1;
+            else strcpy(r->content_type, v);
+        } else if (header_is(line, "Origin", &v)) r->host_has_origin = 1;
         else if (header_is(line, "Expect", &v)) r->expect_continue = strcasestr(v, "100-continue") != NULL;
         else if (header_is(line, "Connection", &v)) r->close = strcasestr(v, "close") != NULL || r->close;
         else if (header_is(line, "Depth", &v)) r->depth = v[0] == '0' ? 0 : 1;

@@ -2,10 +2,15 @@
 // and keeps the shared folder mounted. It talks to host/share.c at 10.0.2.4, which only exists inside Henge.
 #import <AppKit/AppKit.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define HOST "10.0.2.4"
@@ -14,28 +19,52 @@ static int send_all(int fd, const void *p, size_t n) {
     const char *c = p;
     while (n) {
         ssize_t w = send(fd, c, n, 0);
+        if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
         c += w, n -= (size_t)w;
     }
     return 0;
 }
 
-// One request on its own connection. A plain socket: the server is ours, and URLSession refuses plain HTTP.
-static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq) {
+static double monotonicSeconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec + now.tv_nsec / 1e9;
+}
+
+// One request on its own connection. Clipboard long polls have 40 s; the small host-service requests have
+// 5 s and a 16 KB response limit. A nonblocking connect cannot hang the CLI when the host is unavailable.
+static NSData *requestWithSession(NSString *method, NSString *path, NSData *body, NSString *session,
+                                  int seconds, NSUInteger responseLimit, int *status, unsigned long *seq) {
+    *status = 0;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return nil;
-    struct timeval timeout = {.tv_sec = 40};
+    struct timeval timeout = {.tv_sec = seconds};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
     inet_pton(AF_INET, HOST, &addr.sin_addr);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) { close(fd); return nil; }
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        struct pollfd wait = {.fd = fd, .events = POLLOUT};
+        int error = 0;
+        socklen_t size = sizeof error;
+        if (errno != EINPROGRESS || poll(&wait, 1, 5000) <= 0 ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error) {
+            close(fd);
+            return nil;
+        }
+    }
+    if (fcntl(fd, F_SETFL, flags) != 0) {
         close(fd);
         return nil;
     }
-    NSString *head = [NSString stringWithFormat:@"%@ %@ HTTP/1.1\r\nHost: " HOST "\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", method, path,
-                                                (unsigned long)body.length];
+    NSString *extra = session ? [NSString stringWithFormat:@"X-Henge-Session: %@\r\nContent-Type: application/json\r\n", session] : @"";
+    NSString *head = [NSString stringWithFormat:@"%@ %@ HTTP/1.1\r\nHost: " HOST "\r\nContent-Length: %lu\r\n%@Connection: close\r\n\r\n", method, path,
+                                                (unsigned long)body.length, extra];
     const char *text = head.UTF8String;
     if (send_all(fd, text, strlen(text)) != 0 || (body.length && send_all(fd, body.bytes, body.length) != 0)) {
         close(fd);
@@ -43,9 +72,19 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
     }
     NSMutableData *all = [NSMutableData data];
     char piece[16384];
+    double deadline = monotonicSeconds() + seconds;
     for (;;) {
+        double left = deadline - monotonicSeconds();
+        if (left <= 0) { close(fd); return nil; }
+        struct pollfd wait = {.fd = fd, .events = POLLIN};
+        int ready = poll(&wait, 1, (int)ceil(left * 1000));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) { close(fd); return nil; }
         ssize_t got = recv(fd, piece, sizeof piece, 0);
-        if (got <= 0) break;
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) { close(fd); return nil; }
+        if (!got) break;
+        if (all.length + (NSUInteger)got > responseLimit + 32768) { close(fd); return nil; }
         [all appendBytes:piece length:(NSUInteger)got];
     }
     close(fd);
@@ -56,7 +95,60 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
     NSRange found = [headers rangeOfString:@"X-Henge-Seq: "];
     if (found.location != NSNotFound && seq) *seq = strtoul(headers.UTF8String + NSMaxRange(found), NULL, 10);
     NSUInteger start = NSMaxRange(end);
+    if (all.length - start > responseLimit) return nil;
     return [all subdataWithRange:NSMakeRange(start, all.length - start)];
+}
+
+static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq) {
+    return requestWithSession(method, path, body, nil, 40, 16 * 1024 * 1024, status, seq);
+}
+
+static int printHostResponse(NSData *data, int status) {
+    if (!data) {
+        fprintf(stderr, "Henge host services did not answer in time. Keep Henge in the foreground with this Mac running.\n");
+        return 1;
+    }
+    FILE *out = status == 200 ? stdout : stderr;
+    fwrite(data.bytes, 1, data.length, out);
+    if (!data.length || ((const char *)data.bytes)[data.length - 1] != '\n') fputc('\n', out);
+    return status == 200 ? 0 : 1;
+}
+
+static void hostUsage(void) {
+    fprintf(stderr, "Usage: henge-agent [--host-capabilities | --host-state | --host-brightness 0..1]\n"
+                    "Without arguments, keeps the shared folder and clipboard connected.\n"
+                    "Brightness control must be enabled in Henge > running Mac > Details > iPad services.\n");
+}
+
+static int hostCommand(int argc, const char *argv[]) {
+    int status = 0;
+    if (argc == 2 && (!strcmp(argv[1], "--host-state") || !strcmp(argv[1], "--host-capabilities"))) {
+        NSString *path = !strcmp(argv[1], "--host-state") ? @"/.henge/v1/state" : @"/.henge/v1/capabilities";
+        NSData *data = requestWithSession(@"GET", path, nil, nil, 5, 16384, &status, NULL);
+        return printHostResponse(data, status);
+    }
+    if (argc != 3 || strcmp(argv[1], "--host-brightness")) { hostUsage(); return 2; }
+    char *end;
+    errno = 0;
+    double value = strtod(argv[2], &end);
+    if (errno || end == argv[2] || *end || !isfinite(value) || value < 0 || value > 1) { hostUsage(); return 2; }
+    NSData *data = requestWithSession(@"GET", @"/.henge/v1/state", nil, nil, 5, 16384, &status, NULL);
+    if (!data || status != 200) return printHostResponse(data, status);
+    id state = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![state isKindOfClass:NSDictionary.class] || ![state[@"protocol"] isEqual:@1] ||
+        ![state[@"session"] isKindOfClass:NSString.class]) {
+        fprintf(stderr, "Henge returned an incompatible host-service response. Update Henge and this helper together.\n");
+        return 1;
+    }
+    NSString *session = state[@"session"];
+    // UUID validation also prevents a response from injecting request headers.
+    if (![[NSUUID alloc] initWithUUIDString:session] || session.length != 36) {
+        fprintf(stderr, "There is no active Henge session. Start this Mac in Henge first.\n");
+        return 1;
+    }
+    NSData *body = [NSJSONSerialization dataWithJSONObject:@{@"value": @(value)} options:0 error:NULL];
+    data = requestWithSession(@"POST", @"/.henge/v1/brightness", body, session, 5, 16384, &status, NULL);
+    return printHostResponse(data, status);
 }
 
 static NSInteger lastChange;
@@ -118,8 +210,9 @@ static void keepMounted(void) {
     [task launchAndReturnError:NULL];
 }
 
-int main(void) {
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc > 1) return hostCommand(argc, argv);
         lastChange = NSPasteboard.generalPasteboard.changeCount;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
         keepMounted();
