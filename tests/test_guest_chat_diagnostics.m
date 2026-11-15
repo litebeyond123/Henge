@@ -87,8 +87,8 @@ int main(void) {
             @"eventMessage": [@"[DCDevice] supported=false " stringByAppendingString:secret],
             @"timestamp": @"2026-11-15 22:00:00.000000+0800"};
         assert([predicate evaluateWithObject:event]);
-        assert(![predicate evaluateWithObject:@{@"process": @"UnrelatedFixture", @"subsystem": @"com.example.unrelated",
-                                               @"eventMessage": @"[DCDevice] supported=false"}]);
+        assert((![predicate evaluateWithObject:@{@"process": @"UnrelatedFixture", @"subsystem": @"com.example.unrelated",
+                                                @"eventMessage": @"[DCDevice] supported=false"}]));
         NSString *line = [[NSString alloc] initWithData:json(event) encoding:NSUTF8StringEncoding];
         NSString *ndjson = [line stringByAppendingString:@"\n{\"finished\":true}\n"];
         NSDictionary *parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/printf", @[@"%s", ndjson], 2,
