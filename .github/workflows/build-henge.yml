@@ -106,6 +106,9 @@ jobs:
           "$RUNNER_TEMP/henge-test-diagnostics" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/diagnostics-tests.log"
 
       - name: Test guest Chat diagnostics and request validation
+        # This independent parser/transport gate still reports its result when
+        # the preceding report-retention test fails. Packaging remains blocked.
+        if: ${{ !cancelled() }}
         working-directory: Henge
         run: |
           xcrun --sdk macosx swiftc -swift-version 5 ios/Henge/GuestChatDiagnostics.swift tests/test_guest_chat_diagnostics.swift \

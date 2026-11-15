@@ -1,17 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // Foundation-only: swiftc ios/Henge/Diagnostics.swift tests/test_diagnostics.swift -o /tmp/test_diagnostics
 // On macOS, UIKit-dependent collection and UI are excluded from this test build.
 @main
 struct DiagnosticsTests {
     static var failures = 0
-    static func check(_ condition: Bool, _ message: String) {
+    static func check(_ condition: Bool, _ message: String, details: @autoclosure () -> String = "") {
         print("\(condition ? "ok  " : "FAIL") \(message)")
-        if !condition { failures += 1 }
+        if !condition {
+            failures += 1
+            let detail = details()
+            if !detail.isEmpty { print("     \(detail)") }
+        }
+        // CI pipes stdout through tee. A failed top-level Swift throw traps
+        // without flushing libc's fully buffered stdout on Darwin.
+        fflush(stdout)
     }
 
-    static func main() throws {
+    static func main() {
+        do { try runChecks() }
+        catch {
+            print("diagnostics: test run failed: \(error)")
+            fflush(stdout)
+            fflush(stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+
+    static func runChecks() throws {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appendingPathComponent("henge-diagnostics-test-\(UUID().uuidString)")
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -145,8 +167,11 @@ struct DiagnosticsTests {
         for run in 1...5 { _ = try store.publish(identity: identity(run), sources: sources) }
         let history = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("Henge-diagnostics-") && $0.pathExtension == "txt" }
-        check(history.count == 3, "retention bounds app-run history, not the number of automatic snapshots")
-        check(history.contains(directory.appendingPathComponent(identity(5).filename)), "retention never removes the just-published run")
+        check(history.count == 3, "retention bounds app-run history, not the number of automatic snapshots",
+              details: "count=\(history.count), files=\(history.map(\.lastPathComponent))")
+        let expected = directory.appendingPathComponent(identity(5).filename)
+        check(history.contains(expected), "retention never removes the just-published run",
+              details: "expected=\(expected.absoluteString), base=\(String(describing: expected.baseURL)); actual=\(history.map { "\($0.absoluteString) base=\(String(describing: $0.baseURL))" }); exists=\(fm.fileExists(atPath: expected.path))")
         check(fm.fileExists(atPath: guest.path), "retention does not delete explicit guest inputs")
         check(try Data(contentsOf: attachment) == firstBytes, "history pruning cannot delete or change a share attachment")
         let orphan = directory.appendingPathComponent(".pending-abandoned.txt")
