@@ -23,7 +23,7 @@ env:
   HENGE_PACKAGE_OUTPUT_DIR: ${{ github.workspace }}/packages
   HENGE_BUILD_LOG_DIR: ${{ github.workspace }}/build-logs
   HENGE_EXPECTED_VERSION: '0.4.0'
-  HENGE_EXPECTED_BUILD: '4002'
+  HENGE_EXPECTED_BUILD: '4003'
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
@@ -105,6 +105,15 @@ jobs:
             -o "$RUNNER_TEMP/henge-test-diagnostics" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/diagnostics-compile.log"
           "$RUNNER_TEMP/henge-test-diagnostics" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/diagnostics-tests.log"
 
+      - name: Test guest Chat diagnostics and request validation
+        working-directory: Henge
+        run: |
+          xcrun --sdk macosx swiftc -swift-version 5 ios/Henge/GuestChatDiagnostics.swift tests/test_guest_chat_diagnostics.swift \
+            -o "$RUNNER_TEMP/henge-test-guest-chat" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/guest-chat-swift-compile.log"
+          "$RUNNER_TEMP/henge-test-guest-chat" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/guest-chat-swift-tests.log"
+          make build/test_guest_chat_diagnostics 2>&1 | tee "$HENGE_BUILD_LOG_DIR/guest-chat-objc-compile.log"
+          build/test_guest_chat_diagnostics 2>&1 | tee "$HENGE_BUILD_LOG_DIR/guest-chat-objc-tests.log"
+
       - name: Cache Husk's sources and iOS libraries
         uses: actions/cache@v4
         with:
@@ -161,7 +170,7 @@ jobs:
       - name: Upload validated TIPA and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4002-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4003-tipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.manifest.json
@@ -185,7 +194,7 @@ jobs:
         if: ${{ success() && inputs.include_ipa }}
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4002-ipa-${{ github.sha }}
+          name: Henge-0.4.0-4003-ipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.manifest.json
@@ -202,3 +211,65 @@ jobs:
             Henge/ios/build/*.buildlog
           if-no-files-found: warn
           retention-days: 30
+
+  publish-test3:
+    name: Publish the validated Test 3 prerelease
+    needs: build
+    if: ${{ success() && github.repository == 'litebeyond123/Henge' && github.ref == 'refs/heads/work/0.4-ipados17-test' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Read release notes from the built commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: docs/release-test3.md
+          sparse-checkout-cone-mode: false
+
+      - name: Download the validated package from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: Henge-0.4.0-4003-tipa-${{ github.sha }}
+          path: validated-package
+
+      - name: Verify and name release assets
+        env:
+          BUILT_COMMIT: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          folder = pathlib.Path('validated-package')
+          package = folder / 'Henge.tipa'
+          manifest = json.loads((folder / 'Henge.tipa.manifest.json').read_text())
+          digest = hashlib.sha256(package.read_bytes()).hexdigest()
+          assert manifest['source']['henge_commit'] == os.environ['BUILT_COMMIT'], 'Source commit mismatch'
+          assert manifest['application']['version'] == '0.4.0', 'Version mismatch'
+          assert manifest['application']['build'] == '4003', 'Build mismatch'
+          assert manifest['package']['sha256'] == digest, 'Package digest mismatch'
+          out = pathlib.Path('release-assets')
+          out.mkdir()
+          name = 'Henge-0.4.0-test3.tipa'
+          shutil.copyfile(package, out / name)
+          manifest['package']['filename'] = name
+          (out / 'Henge-0.4.0-test3.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          (out / 'Henge-0.4.0-test3.sha256').write_text(f'{digest}  {name}\n')
+          print(f'Validated Test 3 package: {digest}')
+          PY
+
+      - name: Publish Test 3 as a prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILT_COMMIT: ${{ github.sha }}
+        run: |
+          gh release create v0.4.0-test3 \
+            --target "$BUILT_COMMIT" --prerelease --latest=false \
+            --title "Henge 0.4 Test 3 (4003)" \
+            --notes-file docs/release-test3.md \
+            release-assets/Henge-0.4.0-test3.tipa \
+            release-assets/Henge-0.4.0-test3.manifest.json \
+            release-assets/Henge-0.4.0-test3.sha256

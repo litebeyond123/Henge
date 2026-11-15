@@ -135,9 +135,9 @@ struct SettingsView: View {
                 .listRowBackground(Desk.card)
                 Section("Diagnostics") {
                     DiagnosticsExportButton()
-                    Text("Includes the current and previous launch's Henge and native logs, build information, settings and memory observations. After an unexpected close, reopen Henge and export before another relaunch replaces the previous logs.")
+                    Text("Henge automatically keeps a combined report in Files > On My iPad > Henge > HengeDiagnostics. Collect once, then share or save that one report; you do not need to choose individual logs.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    Text("Recognizable sensitive fields are filtered. Existing application logs may still contain personal information; review before sharing. No Mac disk, account store, clipboard or screenshot is collected.")
+                    Text("Reports include Henge's current and previous launch and, after the Mac helper is enabled, a limited Chat diagnostic summary. Nothing is uploaded automatically. Mac checks export fixed error categories and metadata; chat databases and the keychain are not read.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)

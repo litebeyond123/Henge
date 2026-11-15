@@ -81,7 +81,97 @@ struct DiagnosticsTests {
                 check(exported.contains(crossing), "UTF-8 scalar (\(scalar.utf8.count) bytes) survives boundary \(boundary)")
             }
         }
+        try checkArchive(in: folder)
+        checkThrottle()
         print(failures == 0 ? "diagnostics: all checks passed" : "diagnostics: \(failures) failure(s)")
         if failures > 0 { throw NSError(domain: "DiagnosticsTests", code: failures) }
+    }
+
+    static func checkArchive(in folder: URL) throws {
+        let fm = FileManager.default
+        let directory = folder.appendingPathComponent("HengeDiagnostics", isDirectory: true)
+        var store = DiagnosticReportStore(directory: directory)
+        check(store.historyLimit == 8, "automatic retention defaults to eight app runs")
+        store.historyLimit = 3
+        func identity(_ index: Int) -> DiagnosticRunIdentity {
+            DiagnosticRunIdentity(metadata: [
+                "run_id": "fixture\(index)-run", "started_utc": "2026-11-15T14:00:0\(index)Z",
+                "app_version": "0.4.0", "app_build": "4003", "pid": NSNumber(value: 100 + index),
+            ])!
+        }
+        check(DiagnosticRunIdentity(metadata: ["run_id": "old", "started_utc": "unknown"]) == nil,
+              "missing previous-run identity cannot be mislabelled as current")
+        let source = folder.appendingPathComponent("archive-source.log")
+        let inputs = directory.appendingPathComponent("Inputs", isDirectory: true)
+        try fm.createDirectory(at: inputs, withIntermediateDirectories: true)
+        let guest = inputs.appendingPathComponent("guest-chat.json")
+        try Data("{\"collection_status\":\"complete\",\"token\":\"fixture-secret\"}\n".utf8).write(to: guest)
+        try Data("FIRST-SNAPSHOT\n".utf8).write(to: source)
+        let sources: [DiagnosticReportWriter.Source] = [.init(name: "current", url: source), .init(name: "guest-summary", url: guest)]
+        let first = try store.publish(identity: identity(0), sources: sources)
+        let firstBytes = try Data(contentsOf: first.latestURL)
+        check(first.latestURL.lastPathComponent == "Latest-Henge-diagnostics.txt", "one predictable Files entry identifies the combined report")
+        check(first.archiveURL.lastPathComponent.contains("2026-11-15T140000Z-v0.4.0-b4003-pid100"),
+              "history name identifies run time, version, build and PID")
+        check(first.bytes == firstBytes.count, "successful publication reports the actual byte count")
+        check(firstBytes == (try Data(contentsOf: first.archiveURL)), "Latest and the run archive contain the complete same snapshot")
+        let firstText = String(decoding: firstBytes, as: UTF8.self)
+        check(firstText.contains("PID 100") && firstText.contains("guest-summary") && !firstText.contains("fixture-secret"),
+              "automatic publication includes identity and applies filtering to explicit guest input")
+
+        let attachment = try store.attachment(from: first, in: folder.appendingPathComponent("attachments", isDirectory: true))
+        try Data("SECOND-SNAPSHOT\n".utf8).write(to: source)
+        let second = try store.publish(identity: identity(0), sources: sources)
+        check(first.archiveURL == second.archiveURL, "periodic updates replace the same run archive")
+        check(try Data(contentsOf: attachment) == firstBytes, "a presented attachment remains unchanged when automatic saving replaces Latest")
+        let secondBytes = try Data(contentsOf: second.latestURL)
+        check(String(decoding: secondBytes, as: UTF8.self).contains("SECOND-SNAPSHOT"), "Latest advances to the new complete report")
+        do {
+            _ = try store.publish(identity: identity(0)) { temporary in
+                try Data("PARTIAL-FAILED-WRITE".utf8).write(to: temporary)
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
+            check(false, "a partial write must fail")
+        } catch {
+            check(try Data(contentsOf: second.latestURL) == secondBytes, "failed partial write leaves Latest intact")
+            check(try Data(contentsOf: second.archiveURL) == secondBytes, "failed partial write leaves the run archive intact")
+        }
+        do {
+            _ = try store.publish(identity: identity(0), sources: [.init(name: "accidental-recursion", url: store.latestURL)])
+            check(false, "including a generated report must fail")
+        } catch {
+            check(try Data(contentsOf: store.latestURL) == secondBytes, "generated reports cannot recursively become report sources")
+        }
+        for run in 1...5 { _ = try store.publish(identity: identity(run), sources: sources) }
+        let history = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("Henge-diagnostics-") && $0.pathExtension == "txt" }
+        check(history.count == 3, "retention bounds app-run history, not the number of automatic snapshots")
+        check(history.contains(directory.appendingPathComponent(identity(5).filename)), "retention never removes the just-published run")
+        check(fm.fileExists(atPath: guest.path), "retention does not delete explicit guest inputs")
+        check(try Data(contentsOf: attachment) == firstBytes, "history pruning cannot delete or change a share attachment")
+        let orphan = directory.appendingPathComponent(".pending-abandoned.txt")
+        try Data("unfinished".utf8).write(to: orphan)
+        try store.removeAbandonedWrites()
+        check(!fm.fileExists(atPath: orphan.path) && fm.fileExists(atPath: store.latestURL.path), "next launch removes abandoned temporary writes and keeps the complete report")
+        let pending = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".pending-") || $0.lastPathComponent.hasPrefix(".latest-") }
+        check(pending.isEmpty, "success and failure leave no unpublished report fragments")
+    }
+
+    static func checkThrottle() {
+        var throttle = DiagnosticReportThrottle()
+        check(throttle.begin(now: 0, automatic: true), "launch can save the first report immediately")
+        check(!throttle.begin(now: 200, automatic: true) && !throttle.begin(now: 200, automatic: false),
+              "automatic and manual writes never overlap")
+        throttle.finish()
+        check(!throttle.begin(now: 100, automatic: true), "automatic snapshots are rate limited")
+        check(throttle.begin(now: 100, automatic: false), "manual collection bypasses the periodic interval")
+        throttle.finish()
+        check(!throttle.begin(now: 110, automatic: true), "manual collection also prevents an immediate redundant automatic copy")
+        check(throttle.begin(now: 220, automatic: true), "periodic capture resumes after two minutes")
+        throttle.finish()
+        check(!throttle.begin(now: 241, automatic: true, minimumInterval: 30), "rapid background transitions do not repeatedly copy logs")
+        check(throttle.begin(now: 250, automatic: true, minimumInterval: 30), "a background snapshot is eligible after the shorter interval")
+        throttle.finish()
     }
 }

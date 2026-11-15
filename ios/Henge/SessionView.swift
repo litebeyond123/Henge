@@ -540,6 +540,7 @@ struct SessionView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Diagnostics") {
+                    DiagnosticsExportButton()
                     Button {
                         Diagnostics.markInputIssue(softwareKeyboardVisible: typing, externalDisplay: display.isExternal,
                                                    zoomed: zoomed, helperRunning: helperRunning)
@@ -548,9 +549,8 @@ struct SessionView: View {
                         Label(inputIssueMarkers == 0 ? "Mark missing input candidates" : "Input issue marked (\(inputIssueMarkers))",
                               systemImage: "flag")
                     }
-                    Text("Tap when the Mac's input candidates are missing, then export diagnostics. Records a timestamp and input/display state; it does not record what you type.")
+                    Text("For a separate input issue, this marker adds the time and input/display state to the same automatic report. It does not record what you type.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    DiagnosticsExportButton()
                 }
                 Section("Log") {
                     VStack(alignment: .leading, spacing: 1) {

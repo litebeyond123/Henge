@@ -20,6 +20,7 @@ enum Sharing {
         let socket = (NSTemporaryDirectory() as NSString).appendingPathComponent("s.sock")
         henge_vm_share(folder.path, socket, Bundle.main.path(forResource: "henge-agent", ofType: "gz"))
         HostServices.shared.begin()
+        GuestChatDiagnostics.prepare()
     }
 
     /// The helper asks the server for news at most 25 s apart.

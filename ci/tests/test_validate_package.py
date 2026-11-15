@@ -70,7 +70,7 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4002",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4003",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }
@@ -79,6 +79,7 @@ def members():
         "Henge": macho({"get-task-allow": True}, der_key("get-task-allow")),
         "henge-jit.js": b"// structural test fixture\n",
         "henge-agent.gz": gzip.compress(b"structural test fixture, not a guest executable"),
+        "guest-chat-diagnostics.command": b"#!/bin/sh\n# structural test fixture\n",
         "PlugIns/HengeJITHelper.appex/Info.plist": plistlib.dumps({"CFBundleExecutable": "HengeJITHelper"}),
         # Only the main app must target iOS <= 17; the guarded helper targets 26.
         "PlugIns/HengeJITHelper.appex/HengeJITHelper": macho(minimum=0x1A0000),

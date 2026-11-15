@@ -1,6 +1,7 @@
 // Runs inside macOS on a Henge virtual Mac, as a LaunchAgent. It keeps the clipboard in step with the device,
 // and keeps the shared folder mounted. It talks to host/share.c at 10.0.2.4, which only exists inside Henge.
 #import <AppKit/AppKit.h>
+#import "guest-chat-diagnostics.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -101,6 +102,10 @@ static NSData *requestWithSession(NSString *method, NSString *path, NSData *body
 
 static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq) {
     return requestWithSession(method, path, body, nil, 40, 16 * 1024 * 1024, status, seq);
+}
+
+static NSData *chatTransport(NSString *method, NSString *path, NSData *body, NSUInteger limit, int *status) {
+    return requestWithSession(method, path, body, nil, 4, limit, status, NULL);
 }
 
 static int printHostResponse(NSData *data, int status) {
@@ -212,10 +217,15 @@ static void keepMounted(void) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "--chat-diagnostics")) return HengeChatDiagnosticsRun(chatTransport);
         if (argc > 1) return hostCommand(argc, argv);
         lastChange = NSPasteboard.generalPasteboard.changeCount;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
         keepMounted();
+        HengeChatDiagnosticsPoll(chatTransport);
+        [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *timer) {
+            (void)timer; HengeChatDiagnosticsPoll(chatTransport);
+        }];
         [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; checkClipboard(); }];
         [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) { (void)timer; keepMounted(); }];
         [NSRunLoop.mainRunLoop run];
