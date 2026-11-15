@@ -95,7 +95,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz
+          make ios-lib build/henge-agent.gz build/henge-helper.app.tar.gz
           ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:
@@ -104,6 +104,7 @@ targets:
         script: |
           set -e
           cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
+          cp "$SRCROOT/../build/henge-helper.app.tar.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-helper.app.tar.gz"
         basedOnDependencyAnalysis: false
       - name: Embed StikJIT
         # As in Husk: the helper links StikJIT; it lives in the app's Frameworks

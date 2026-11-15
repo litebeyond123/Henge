@@ -3,6 +3,7 @@
 import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import warnings
@@ -67,10 +69,28 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
     return header + commands + sign
 
 
+def guest_app_archive(binary=None, extra=None):
+    info = {"CFBundleIdentifier": "com.henge.guesthelper", "CFBundleExecutable": "henge-agent",
+            "CFBundleVersion": "5", "CFBundlePackageType": "APPL", "LSUIElement": True,
+            "LSMinimumSystemVersion": "13.0", "NSLocalNetworkUsageDescription": "Connect to Henge."}
+    files = {"Henge Helper.app/Contents/Info.plist": plistlib.dumps(info),
+             "Henge Helper.app/Contents/MacOS/henge-agent": binary if binary is not None else macho(platform=1, minimum=0x0D0000),
+             "Henge Helper.app/Contents/_CodeSignature/CodeResources": b"structural fixture"}
+    if extra:
+        files.update(extra)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return buffer.getvalue()
+
+
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4005",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4006",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }
@@ -79,6 +99,7 @@ def members():
         "Henge": macho({"get-task-allow": True}, der_key("get-task-allow")),
         "henge-jit.js": b"// structural test fixture\n",
         "henge-agent.gz": gzip.compress(b"structural test fixture, not a guest executable"),
+        "henge-helper.app.tar.gz": guest_app_archive(),
         "guest-chat-diagnostics.command": b"#!/bin/sh\n# structural test fixture\n",
         "PlugIns/HengeJITHelper.appex/Info.plist": plistlib.dumps({"CFBundleExecutable": "HengeJITHelper"}),
         # Only the main app must target iOS <= 17; the guarded helper targets 26.
@@ -110,6 +131,22 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(report["source"]["husk_commit"], "1" * 40)
         self.assertEqual(len(report["validation"]["signed_macho_files"]), 3)
         self.assertEqual(report["package"]["sha256"], hashlib.sha256(self.package.read_bytes()).hexdigest())
+        self.assertEqual(report["validation"]["guest_helper_application"]["bundle_id"], "com.henge.guesthelper")
+
+    def test_guest_app_must_be_signed_macos_code(self):
+        for binary in (macho(platform=2, minimum=0x0D0000), macho(platform=1, minimum=0x0D0000, signed=False)):
+            files = members()
+            files["henge-helper.app.tar.gz"] = guest_app_archive(binary)
+            self.write(files)
+            with self.assertRaises(validator.InvalidPackage):
+                self.validate()
+
+    def test_guest_app_archive_must_not_escape_bundle(self):
+        files = members()
+        files["henge-helper.app.tar.gz"] = guest_app_archive(extra={"Henge Helper.app/../../escaped": b"bad"})
+        self.write(files)
+        with self.assertRaisesRegex(validator.InvalidPackage, "Unsafe guest app archive path"):
+            self.validate()
 
     def test_rejects_stale_version_build_or_commit(self):
         for field, value in [("CFBundleShortVersionString", "0.3.0"),

@@ -1,86 +1,59 @@
 #!/usr/bin/env python3
-"""Controlled OS tools for executing the real installer inside a temporary test home.
-
-No network or launchd operations are performed by this harness. Actual macOS binary/signature
-validation is a separate CI gate; these tests verify transaction/error/receipt control flow.
-"""
-import gzip
-import json
-import os
+"""Controlled OS tools for the real installer. No actual launchd/network operations occur."""
+import io, json, os, plistlib, subprocess, sys, tarfile
 from pathlib import Path
-import plistlib
-import sys
-import subprocess
 from urllib.parse import parse_qs, urlparse
-
 root = Path(os.environ["HENGE_INSTALL_TEST_STATE"])
 scenario = os.environ.get("HENGE_INSTALL_TEST_SCENARIO", "ok")
-name = Path(sys.argv[0]).name
-args = sys.argv[1:]
+name, args = Path(sys.argv[0]).name, sys.argv[1:]
 with (root / "commands.jsonl").open("a") as out:
     out.write(json.dumps({"tool": name, "args": args}) + "\n")
-
+statepath = root / "launch-state.json"
+state = json.loads(statepath.read_text())
 if name == "curl":
     url = next((x for x in args if x.startswith("http://")), "")
     if "/install-status?" in url:
         receipt = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
-        with (root / "receipts.jsonl").open("a") as out:
-            out.write(json.dumps(receipt) + "\n")
-        if scenario == "receipt_failed" and receipt["stage"] == "launch_requested":
-            sys.exit(7)
+        with (root / "receipts.jsonl").open("a") as out: out.write(json.dumps(receipt) + "\n")
+        if scenario == "receipt_failed" and receipt["stage"] == "launch_requested": sys.exit(7)
         print('{"ok":true}')
-    elif url.endswith("/.henge/agent"):
-        if scenario == "download_failed":
-            sys.exit(7)
+    elif url.endswith("/.henge/helper/app"):
+        if scenario == "download_failed": sys.exit(7)
         destination = Path(args[args.index("-o") + 1])
-        data = (root / "new-agent").read_bytes()
-        destination.write_bytes(b"not gzip" if scenario == "gzip_invalid" else gzip.compress(data))
-    else:
-        sys.exit(2)
-elif name == "codesign":
-    sys.exit(4 if scenario == "signature_invalid" else 0)
-elif name == "plutil":
-    try:
-        with Path(args[-1]).open("rb") as stream:
-            value = plistlib.load(stream)
-        assert value["ProgramArguments"][0] == str(Path(os.environ["HOME"]) / "Library/Application Support/Henge/henge-agent")
-        (root / "parsed-plist.json").write_text(json.dumps(value))
-    except Exception:
-        sys.exit(2)
+        if scenario == "gzip_invalid": destination.write_bytes(b"not gzip")
+        else:
+            with tarfile.open(destination, "w:gz") as archive:
+                for entry, data, mode in (
+                    ("Henge Helper.app/Contents/MacOS/henge-agent", (root / "new-agent").read_bytes(), 0o755),
+                    ("Henge Helper.app/Contents/Info.plist", plistlib.dumps({"CFBundleIdentifier":"com.henge.helper"}), 0o644),
+                    ("Henge Helper.app/Contents/marker", b"new", 0o644)):
+                    item = tarfile.TarInfo(entry); item.size=len(data); item.mode=mode
+                    archive.addfile(item, io.BytesIO(data))
+                if scenario == "archive_traversal":
+                    item=tarfile.TarInfo("../escaped"); item.size=4
+                    archive.addfile(item, io.BytesIO(b"bad!"))
+    else: sys.exit(2)
+elif name == "codesign": sys.exit(4 if scenario == "signature_invalid" else 0)
 elif name == "launchctl":
-    path = root / "launch-state.json"
-    state = json.loads(path.read_text())
     if args[0] == "print":
-        if not state["loaded"]:
-            sys.exit(113)
+        if not state["loaded"]: sys.exit(113)
         print(f"service = {{\n\tpid = {state['pid']}\n}}")
     elif args[0] == "bootout":
-        if scenario == "bootout_failed":
-            sys.exit(5)
-        if not state["loaded"]:
-            sys.exit(113)
+        if scenario == "bootout_failed": sys.exit(5)
+        if not state["loaded"]: sys.exit(113)
         state["loaded"] = False
-    elif args[0] == "bootstrap":
-        state["bootstraps"] += 1
-        if scenario == "bootstrap_failed" and state["bootstraps"] == 1:
-            path.write_text(json.dumps(state))
-            sys.exit(5)
-        state["loaded"] = True
-        binary = Path(os.environ["HOME"]) / "Library/Application Support/Henge/henge-agent"
-        state["pid"] = 321 if binary.read_bytes().startswith(b"old helper") else 999
-    else:
-        sys.exit(2)
-    path.write_text(json.dumps(state))
-elif name == "date":
-    path = root / "clock"
-    now = int(path.read_text()) + 8 if path.exists() else 100
-    path.write_text(str(now))
-    print(100 if scenario == "health_clock_backwards" else now)
+    elif args[0] == "bootstrap": state["loaded"] = True; state["pid"] = 321; state["bootstraps"] += 1
+    else: sys.exit(2)
+    statepath.write_text(json.dumps(state))
+elif name == "open":
+    app=Path(args[args.index("-a")+1]); marker=(app/"Contents/marker").read_text()
+    if scenario == "bootstrap_failed" and marker == "new": sys.exit(5)
+    state["app_running"] = scenario not in ("health_unconfirmed", "rollback_failed") or marker == "old"
+    state["app_marker"] = marker
+    statepath.write_text(json.dumps(state))
 elif name == "sleep":
-    pass
-elif name == "mv":
-    if scenario == "rollback_failed" and any(arg.endswith("previous-agent") for arg in args):
-        sys.exit(5)
-    sys.exit(subprocess.run(["/bin/mv", *args]).returncode)
-else:
-    sys.exit(2)
+    state["slept_seconds"] += int(args[0]); statepath.write_text(json.dumps(state))
+elif name in ("mv", "cp"):
+    if scenario == "rollback_failed" and len(args) >= 2 and args[-2].endswith("previous.plist"): sys.exit(5)
+    sys.exit(subprocess.run(["/bin/"+name, *args]).returncode)
+else: sys.exit(2)

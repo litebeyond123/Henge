@@ -1,0 +1,54 @@
+name: Verify guest helper on real macOS
+on:
+  push:
+    branches: [work/helper-runtime-probe]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Record actual macOS and GUI domain
+        run: |
+          mkdir -p runtime-logs
+          sw_vers | tee runtime-logs/macos.txt
+          xcodebuild -version | tee runtime-logs/xcode.txt
+          launchctl print "gui/$(id -u)" > "$RUNNER_TEMP/henge-gui-domain.txt"
+          printf '%s\n' 'A GUI launchd domain is present.'
+      - name: Build and verify the new guest application
+        run: |
+          make build/henge-agent.gz build/henge-helper.app.tar.gz build/test_helper_health 2>&1 | tee runtime-logs/compile.log
+          build/test_helper_health 2>&1 | tee runtime-logs/health-tests.log
+          mkdir -p "$RUNNER_TEMP/henge-helper-app"
+          tar -xzf build/henge-helper.app.tar.gz -C "$RUNNER_TEMP/henge-helper-app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/henge-helper-app/Henge Helper.app"
+      - name: Exercise actual LaunchServices startup and sustained heartbeats
+        run: |
+          python3 tests/test_helper_macos_runtime.py --mode app \
+            --helper "$RUNNER_TEMP/henge-helper-app/Henge Helper.app" \
+            --output runtime-logs/helper-app-runtime.json 2>&1 | tee runtime-logs/helper-app-runtime.log
+      - name: Build the exact previous helper for comparison
+        run: |
+          mkdir -p "$RUNNER_TEMP/henge-helper-4005"
+          git archive ed8e73a519199be203d69cfe46f48141f533524c | tar -x -C "$RUNNER_TEMP/henge-helper-4005"
+          make -C "$RUNNER_TEMP/henge-helper-4005" build/henge-agent.gz 2>&1 | tee runtime-logs/compile-4005.log
+      - name: Exercise actual legacy LaunchAgent for comparison
+        run: |
+          python3 tests/test_helper_macos_runtime.py --mode legacy \
+            --helper "$RUNNER_TEMP/henge-helper-4005/build/henge-agent" \
+            --expected-version 'henge-agent 4' --output runtime-logs/helper-legacy-runtime.json \
+            2>&1 | tee runtime-logs/helper-legacy-runtime.log
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: helper-runtime-${{ github.sha }}
+          path: runtime-logs
+          if-no-files-found: error

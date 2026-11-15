@@ -6,3 +6,4 @@ NSDictionary *HengeHelperValidateHealth(NSData *data);
 BOOL HengeHelperHealthMatchesPID(NSDictionary *health, int pid);
 BOOL HengeHelperPing(HengeHelperTransport transport, NSString *stage, BOOL probe);
 BOOL HengeHelperCheckPID(HengeHelperTransport transport, int pid);
+BOOL HengeHelperConfirm(HengeHelperTransport transport);

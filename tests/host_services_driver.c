@@ -48,6 +48,7 @@ int main(int argc, char **argv) {
         line[strcspn(line, "\n")] = 0;
         if (!strncmp(line, "begin ", 6)) hv_share_host_begin(line + 6);
         else if (!strcmp(line, "end")) hv_share_host_end();
+        else if (!strncmp(line, "agent-path ", 11)) snprintf(agent_path, sizeof agent_path, "%s", line + 11);
         else if (!strncmp(line, "publish ", 8)) {
             int running, foreground, allowed;
             double brightness, volume;

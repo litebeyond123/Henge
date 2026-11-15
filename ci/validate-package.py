@@ -18,6 +18,7 @@ import plistlib
 import re
 import struct
 import sys
+import tarfile
 import tempfile
 import zipfile
 
@@ -29,7 +30,7 @@ BANNED_ENTITLEMENTS = frozenset({
 })
 APP = "Payload/Henge.app/"
 REQUIRED = (
-    "Info.plist", "Henge", "henge-jit.js", "henge-agent.gz", "guest-chat-diagnostics.command",
+    "Info.plist", "Henge", "henge-jit.js", "henge-agent.gz", "henge-helper.app.tar.gz", "guest-chat-diagnostics.command",
     "PlugIns/HengeJITHelper.appex/Info.plist",
     "PlugIns/HengeJITHelper.appex/HengeJITHelper",
     "Frameworks/StikJIT.framework/Info.plist",
@@ -203,7 +204,45 @@ def inspect_macho(data, name, trollstore, main=False, maximum_ios="17.0"):
     return reports
 
 
-def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4005",
+def inspect_guest_app(data):
+    require(len(data) <= 16 * 1024 ** 2, "Guest app archive is unexpectedly large")
+    files, total, count = {}, 0, 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            for member in archive:
+                count += 1
+                path = PurePosixPath(member.name)
+                require(count <= 32 and not path.is_absolute() and ".." not in path.parts and
+                        path.parts and path.parts[0] == "Henge Helper.app", "Unsafe guest app archive path")
+                require(member.isdir() or member.isfile(), "Guest app archive contains a link or special file")
+                require(member.name not in files, "Duplicate guest app archive entry")
+                if member.isfile():
+                    total += member.size
+                    require(0 <= member.size <= 64 * 1024 ** 2 and total <= 64 * 1024 ** 2,
+                            "Guest app archive expands beyond its size limit")
+                    files[member.name] = archive.extractfile(member).read()
+        base = "Henge Helper.app/Contents/"
+        require(all(base + name in files for name in ("Info.plist", "MacOS/henge-agent", "_CodeSignature/CodeResources")),
+                "Guest app archive is missing its bundle or signature resources")
+        info = plistlib.loads(files[base + "Info.plist"])
+        require(info.get("CFBundleIdentifier") == "com.henge.guesthelper" and
+                info.get("CFBundleExecutable") == "henge-agent" and info.get("CFBundleVersion") == "5" and
+                info.get("CFBundlePackageType") == "APPL" and info.get("LSUIElement") is True and
+                isinstance(info.get("NSLocalNetworkUsageDescription"), str) and
+                bool(info["NSLocalNetworkUsageDescription"].strip()), "Guest app identity or privacy description is invalid")
+        require(version(info.get("LSMinimumSystemVersion")) <= version("13.0"), "Guest app requires a newer macOS")
+        reports = inspect_macho(files[base + "MacOS/henge-agent"], "Henge Helper.app", False)
+        require(all(r["cpu_type"] == 0x0100000C and r["minimum_versions"] and
+                    all(v["platform"] == 1 and version(v["version"]) <= version("13.0") for v in r["minimum_versions"])
+                    for r in reports), "Guest app must be signed arm64 macOS code with a compatible deployment target")
+        return {"bundle_id": info["CFBundleIdentifier"], "build": info["CFBundleVersion"], "macho": reports}
+    except InvalidPackage:
+        raise
+    except (tarfile.TarError, ValueError, OSError, KeyError, TypeError, AttributeError) as exc:
+        raise InvalidPackage("Invalid compressed guest application") from exc
+
+
+def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4006",
                      kind=None, maximum_ios="17.0", husk_commit=None, run_url=None):
     package = Path(package)
     require(bool(re.fullmatch(r"[0-9a-f]{40}", expected_commit)), "Expected commit must be a full git SHA-1")
@@ -256,6 +295,7 @@ def validate_package(package, expected_commit, expected_version="0.4.0", expecte
             raise
         except (ValueError, OSError, EOFError, TypeError) as exc:
             raise InvalidPackage("Invalid build date or compressed guest helper") from exc
+        guest_app = inspect_guest_app(archive.read(APP + "henge-helper.app.tar.gz"))
         binaries = {}
         for entry in entries:
             if entry.is_dir() or not entry.filename.startswith(APP) or entry.file_size < 4:
@@ -284,6 +324,7 @@ def validate_package(package, expected_commit, expected_version="0.4.0", expecte
         "workflow_run_url": run_url,
         "validation": {"checked_at": datetime.now(timezone.utc).isoformat(), "maximum_main_ios": maximum_ios,
                        "trollstore_entitlements_checked": kind == "tipa", "signed_macho_files": binaries,
+                       "guest_helper_application": guest_app,
                        "scope": "ZIP, resources, version, commit, Mach-O platform and embedded entitlement structure; not a device test or cryptographic signature verification"},
     }
 
@@ -305,7 +346,7 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-version", default="0.4.0")
-    parser.add_argument("--expected-build", default="4005")
+    parser.add_argument("--expected-build", default="4006")
     parser.add_argument("--kind", choices=("ipa", "tipa"))
     parser.add_argument("--maximum-ios", default="17.0")
     parser.add_argument("--husk-commit")

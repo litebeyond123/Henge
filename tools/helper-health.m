@@ -52,3 +52,16 @@ BOOL HengeHelperCheckPID(HengeHelperTransport transport, int pid) {
     NSData *data = transport(@"GET", @"/.henge/helper/health", nil, &status);
     return status == 200 && HengeHelperHealthMatchesPID(HengeHelperValidateHealth(data), pid);
 }
+
+BOOL HengeHelperConfirm(HengeHelperTransport transport) {
+    int status = 0;
+    NSData *data = transport(@"GET", @"/.henge/helper/health", nil, &status);
+    NSDictionary *health = status == 200 ? HengeHelperValidateHealth(data) : nil;
+    if (!HengeHelperHealthMatchesPID(health, getpid())) return NO;
+    NSString *path = [NSString stringWithFormat:@"/.henge/helper/install-status?stage=confirmed&error=none&code=0&pid=%d", getpid()];
+    data = transport(@"POST", path, health[@"session"], &status);
+    if (!data || status != 200 || data.length > 4096) return NO;
+    id ack = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    return [ack isKindOfClass:NSDictionary.class] && [ack[@"ok"] isKindOfClass:NSNumber.class] &&
+        CFGetTypeID((__bridge CFTypeRef)ack[@"ok"]) == CFBooleanGetTypeID() && [ack[@"ok"] boolValue];
+}

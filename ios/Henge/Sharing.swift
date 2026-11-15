@@ -5,7 +5,7 @@ import CoreFoundation
 /// Missing/stale heartbeats never establish whether a helper is installed.
 struct HelperHealthSnapshot: Equatable {
     enum Startup: String { case unseen, network_ready, clipboard_starting, ready, clipboard_unavailable }
-    enum Install: String { case not_started, script_started, downloaded, verified, replacing, launch_requested, confirmed, failed, rolled_back }
+    enum Install: String { case not_started, script_started, downloaded, verified, replacing, launch_requested, confirmed, failed, rolled_back, awaiting_connection }
     enum InstallError: String {
         case none, download_failed, gzip_invalid, signature_invalid, version_invalid, replace_failed, plist_invalid
         case bootout_failed, bootstrap_failed, connection_failed, health_unconfirmed, rollback_failed
@@ -63,6 +63,7 @@ struct HelperHealthSnapshot: Equatable {
         case .not_started: return "No installer receipt"
         case .script_started, .downloaded, .verified, .replacing: return "Installing…"
         case .launch_requested: return "Waiting for helper startup"
+        case .awaiting_connection: return "App running; waiting for connection"
         case .confirmed: return "Installation confirmed"
         case .failed: return "Installation failed"
         case .rolled_back: return "Previous helper restored"
@@ -87,6 +88,9 @@ struct HelperHealthSnapshot: Equatable {
             case .rollback_failed: reason = "The installer could not restore the previous helper."
             }
             return "\(reason) Exit code \(installExitCode). The result is included in diagnostics."
+        }
+        if install == .awaiting_connection && !isConnected {
+            return "Henge Helper.app is running in the Mac, but its connection is not confirmed. Open its Mac window and allow Local Network access if asked. Keep it running; do not repeat installation."
         }
         if isConnected && startup == .clipboard_unavailable { return "The helper is connected. Clipboard access is unavailable; its health connection continues independently." }
         if isConnected && startup == .clipboard_starting { return "The helper is connected. Clipboard initialization is still pending." }

@@ -26,6 +26,14 @@ import Foundation
         let neverSeen = try decode(value)
         check(!neverSeen.isConnected && neverSeen.connectionTitle == "Waiting for connection")
         check(!neverSeen.connectionTitle.lowercased().contains("installed"))
+        value["install_stage"] = "awaiting_connection"
+        let awaiting = try decode(value)
+        check(awaiting.valid && !awaiting.isConnected && awaiting.install == .awaiting_connection)
+        check(awaiting.installationTitle.contains("waiting for connection"))
+        check(awaiting.detail.contains("not confirmed") && awaiting.detail.contains("do not repeat"))
+        check(awaiting.diagnostics["install_stage"] as? String == "awaiting_connection")
+        value["install_stage"] = "confirmed"; value["agent_seen_s"] = 0
+        check(try decode(value).isConnected) // An asynchronous app receipt can finish the pending installation.
         value["agent_seen_s"] = 29; value["startup_stage"] = "clipboard_unavailable"
         check(try decode(value).isConnected) // Clipboard denial does not imply the agent is absent.
         value["install_stage"] = "failed"; value["install_error"] = "bootstrap_failed"; value["install_exit_code"] = 5

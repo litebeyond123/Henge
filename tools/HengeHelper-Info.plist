@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.henge.guesthelper</string>
+    <key>CFBundleName</key><string>Henge Helper</string>
+    <key>CFBundleDisplayName</key><string>Henge Helper</string>
+    <key>CFBundleExecutable</key><string>henge-agent</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.4.0</string>
+    <key>CFBundleVersion</key><string>5</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Henge Helper connects this virtual Mac to Henge on your iPad for the shared folder, clipboard and requested diagnostic summaries.</string>
+</dict></plist>

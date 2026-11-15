@@ -111,7 +111,7 @@ static int host_uuid(const char *s) {
 /* Helper liveness is independent of clipboard access and the guest wall clock. Only fixed enums and
    numeric status are retained; no installer output, paths, command text or account data is accepted. */
 static const char *const helper_startup_names[] = {"unseen", "network_ready", "clipboard_starting", "ready", "clipboard_unavailable"};
-static const char *const helper_install_names[] = {"not_started", "script_started", "downloaded", "verified", "replacing", "launch_requested", "confirmed", "failed", "rolled_back"};
+static const char *const helper_install_names[] = {"not_started", "script_started", "downloaded", "verified", "replacing", "launch_requested", "confirmed", "failed", "rolled_back", "awaiting_connection"};
 static const char *const helper_error_names[] = {"none", "download_failed", "gzip_invalid", "signature_invalid", "version_invalid", "replace_failed", "plist_invalid", "bootout_failed", "bootstrap_failed", "connection_failed", "health_unconfirmed", "rollback_failed"};
 static struct {
     int protocol, pid, startup, install, error, exit_code;
@@ -800,6 +800,34 @@ static int serve_agent(Conn *c, Request *r) {
     return rc;
 }
 
+/* The signed app archive sits beside the legacy compressed executable in app resources. */
+static int serve_helper_app(Conn *c, Request *r) {
+    r->close = 1;
+    if (strcmp(r->method, "GET") || r->query[0] || r->length || r->host_bad_headers || r->transfer_encoding_seen)
+        return respond_empty(c, r, 400, "Bad Request");
+    char path[PATH_MAX];
+    const char *slash = strrchr(agent_path, '/');
+    size_t prefix = slash ? (size_t)(slash - agent_path + 1) : 0;
+    static const char archive[] = "henge-helper.app.tar.gz";
+    if (!agent_path[0] || prefix + sizeof archive > sizeof path)
+        return respond_empty(c, r, 404, "Not Found");
+    memcpy(path, agent_path, prefix);
+    memcpy(path + prefix, archive, sizeof archive);
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 32 * 1024 * 1024) {
+        if (fd >= 0) close(fd);
+        return respond_empty(c, r, 404, "Not Found");
+    }
+    char *data = malloc((size_t)st.st_size);
+    ssize_t got = data ? pread(fd, data, (size_t)st.st_size, 0) : -1;
+    close(fd);
+    int rc = got == st.st_size ? respond(c, r, 200, "OK", "Content-Type: application/gzip\r\nCache-Control: no-store\r\n", data, (size_t)got)
+                               : respond_empty(c, r, 500, "Internal Server Error");
+    free(data);
+    return rc;
+}
+
 /* GET ?since=N waits up to 25 s for a newer clipboard than N. */
 static int clipboard_get(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
@@ -1083,12 +1111,17 @@ static int serve_helper_health(Conn *c, Request *r, const char *what) {
         } else {
             int value = helper_enum(stage, helper_install_names, sizeof helper_install_names / sizeof *helper_install_names);
             int why = helper_enum(reason, helper_error_names, sizeof helper_error_names / sizeof *helper_error_names);
-            if (value < 1 || why < 0 || (value < 7 && (why || code)) || (value >= 7 && !why)) {
+            if (value < 1 || why < 0 || ((value < 7 || value == 9) && (why || code)) ||
+                ((value == 7 || value == 8) && !why) || (value == 9 && !pid)) {
                 status = 400; error = "invalid_receipt";
             } else if (value == 6 && (!pid || (int)pid != helper_health.pid || helper_health.protocol != 4 ||
                        !helper_health.agent_ms || host_now_ms() - helper_health.agent_ms >= 30000)) {
                 status = 409; error = "health_unconfirmed";
             } else {
+                // The app can confirm concurrently with the installer finishing its wait. Never
+                // downgrade that same live PID from confirmed to awaiting_connection.
+                if (value == 9 && (int)pid == helper_health.pid && helper_health.protocol == 4 &&
+                    helper_health.agent_ms && host_now_ms() - helper_health.agent_ms < 30000) value = 6;
                 helper_health.install = value;
                 helper_health.error = why;
                 helper_health.exit_code = (int)code;
@@ -1127,6 +1160,7 @@ static int serve_install(Conn *c, Request *r) {
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strncmp(what, "v1/", 3)) return serve_host(c, r, what + 3);
+    if (!strcmp(what, "helper/app")) return serve_helper_app(c, r);
     if (!strncmp(what, "helper/", 7)) return serve_helper_health(c, r, what + 7);
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) return serve_install(c, r);
     if ((!strcmp(what, "lighten") || !strcmp(what, "unlighten")) && !strcmp(r->method, "GET")) {

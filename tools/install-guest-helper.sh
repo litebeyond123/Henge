@@ -1,16 +1,20 @@
 #!/bin/sh
 # Served with a validated HENGE_INSTALL_SESSION prefix by the current Henge VM session.
-# Installation receipts contain only fixed categories and numeric exit codes.
+# Receipts contain fixed categories and numeric exit codes, never command output or user paths.
 umask 077
-HENGE_HELPER_DIR="$HOME/Library/Application Support/Henge"
+HENGE_LEGACY_DIR="$HOME/Library/Application Support/Henge"
 HENGE_HELPER_PLIST="$HOME/Library/LaunchAgents/com.henge.agent.plist"
 HENGE_HELPER_JOB="gui/$(id -u)/com.henge.agent"
 HENGE_HELPER_DOMAIN="gui/$(id -u)"
+HENGE_HELPER_APP="$HOME/Applications/Henge Helper.app"
+HENGE_HELPER_BINARY="$HENGE_HELPER_APP/Contents/MacOS/henge-agent"
 HENGE_HELPER_TMP=
 HENGE_HELPER_MUTATED=0
 HENGE_HELPER_WAS_LOADED=0
-HENGE_HELPER_HAD_BINARY=0
 HENGE_HELPER_HAD_PLIST=0
+HENGE_HELPER_APP_CHANGED=0
+HENGE_HELPER_HAD_APP=0
+HENGE_HELPER_APP_WAS_RUNNING=0
 HENGE_HELPER_KEEP_BACKUP=0
 
 receipt() {
@@ -24,30 +28,45 @@ cleanup() {
     [ "$HENGE_HELPER_KEEP_BACKUP" -eq 1 ] || [ -z "$HENGE_HELPER_TMP" ] || rm -rf "$HENGE_HELPER_TMP"
 }
 
-# Restore exactly the prior files and, if it was loaded, the prior LaunchAgent.
+app_pid() {
+    HENGE_HELPER_PID=$("$HENGE_HELPER_BINARY" --app-pid 2>/dev/null) || HENGE_HELPER_PID=
+    case "$HENGE_HELPER_PID" in ''|*[!0-9]*|0) return 1 ;; esac
+    return 0
+}
+
 rollback() {
     HENGE_HELPER_ROLLBACK_OK=1
-    if launchctl print "$HENGE_HELPER_JOB" >/dev/null 2>&1; then
-        launchctl bootout "$HENGE_HELPER_JOB" >/dev/null 2>&1 || HENGE_HELPER_ROLLBACK_OK=0
+    if [ "$HENGE_HELPER_APP_CHANGED" -eq 1 ]; then
+        if [ -x "$HENGE_HELPER_BINARY" ]; then
+            "$HENGE_HELPER_BINARY" --quit-app >/dev/null 2>&1 || HENGE_HELPER_ROLLBACK_OK=0
+            if [ "$HENGE_HELPER_HAD_APP" -eq 0 ] && [ "$HENGE_HELPER_ROLLBACK_OK" -eq 1 ]; then
+                "$HENGE_HELPER_BINARY" --unregister-login >/dev/null 2>&1 || HENGE_HELPER_ROLLBACK_OK=0
+            fi
+        fi
+        if [ "$HENGE_HELPER_ROLLBACK_OK" -eq 1 ]; then
+            rm -rf "$HENGE_HELPER_APP" || HENGE_HELPER_ROLLBACK_OK=0
+            if [ "$HENGE_HELPER_HAD_APP" -eq 1 ]; then
+                mv "$HENGE_HELPER_TMP/previous.app" "$HENGE_HELPER_APP" || HENGE_HELPER_ROLLBACK_OK=0
+            fi
+        fi
     fi
-    if [ "$HENGE_HELPER_HAD_BINARY" -eq 1 ]; then
-        mv -f "$HENGE_HELPER_TMP/previous-agent" "$HENGE_HELPER_DIR/henge-agent" || HENGE_HELPER_ROLLBACK_OK=0
-    else
-        rm -f "$HENGE_HELPER_DIR/henge-agent" || HENGE_HELPER_ROLLBACK_OK=0
-    fi
+    # Do not restart an old helper while the replacement could still be alive.
+    [ "$HENGE_HELPER_ROLLBACK_OK" -eq 1 ] || return 1
     if [ "$HENGE_HELPER_HAD_PLIST" -eq 1 ]; then
-        mv -f "$HENGE_HELPER_TMP/previous.plist" "$HENGE_HELPER_PLIST" || HENGE_HELPER_ROLLBACK_OK=0
-    else
-        rm -f "$HENGE_HELPER_PLIST" || HENGE_HELPER_ROLLBACK_OK=0
+        cp -p "$HENGE_HELPER_TMP/previous.plist" "$HENGE_HELPER_PLIST" || HENGE_HELPER_ROLLBACK_OK=0
     fi
     if [ "$HENGE_HELPER_WAS_LOADED" -eq 1 ] && [ "$HENGE_HELPER_ROLLBACK_OK" -eq 1 ]; then
-        launchctl bootstrap "$HENGE_HELPER_DOMAIN" "$HENGE_HELPER_PLIST" || HENGE_HELPER_ROLLBACK_OK=0
+        if ! launchctl print "$HENGE_HELPER_JOB" >/dev/null 2>&1; then
+            launchctl bootstrap "$HENGE_HELPER_DOMAIN" "$HENGE_HELPER_PLIST" || HENGE_HELPER_ROLLBACK_OK=0
+        fi
+    fi
+    if [ "$HENGE_HELPER_APP_WAS_RUNNING" -eq 1 ] && [ "$HENGE_HELPER_ROLLBACK_OK" -eq 1 ]; then
+        open -a "$HENGE_HELPER_APP" --args --install || HENGE_HELPER_ROLLBACK_OK=0
     fi
     [ "$HENGE_HELPER_ROLLBACK_OK" -eq 1 ]
 }
 
 fail() {
-    # Rollback consumes its saved files once; repeated terminal signals must not re-enter it.
     trap '' HUP INT TERM
     HENGE_HELPER_FAILURE=$1
     HENGE_HELPER_CODE=$2
@@ -57,7 +76,7 @@ fail() {
     if [ "$HENGE_HELPER_MUTATED" -eq 1 ]; then
         if rollback; then
             receipt rolled_back "$HENGE_HELPER_FAILURE" "$HENGE_HELPER_CODE" || :
-            echo 'Repair did not complete. The previous helper files were restored.'
+            echo 'Repair did not complete. The previous helper files and startup state were restored.'
         else
             HENGE_HELPER_KEEP_BACKUP=1
             receipt failed rollback_failed "$HENGE_HELPER_CODE" || :
@@ -66,7 +85,7 @@ fail() {
         fi
     fi
     printf 'Henge helper repair failed: %s (exit %s).\n' "$HENGE_HELPER_FAILURE" "$HENGE_HELPER_CODE"
-    echo 'Return to Henge and save the unified diagnostics report; the fixed installation status is included.'
+    echo 'Return to Henge and save the unified diagnostics report; installation status is included.'
     exit "$HENGE_HELPER_CODE"
 }
 
@@ -74,41 +93,33 @@ trap cleanup EXIT
 trap 'fail connection_failed 130' HUP INT TERM
 [ -n "${HENGE_INSTALL_SESSION:-}" ] || fail connection_failed 1
 receipt script_started none 0 || fail connection_failed 1
-mkdir -p "$HENGE_HELPER_DIR" "$HOME/Library/LaunchAgents" || fail replace_failed "$?"
-HENGE_HELPER_TMP=$(mktemp -d "$HENGE_HELPER_DIR/.install.XXXXXX") || fail replace_failed "$?"
+mkdir -p "$HOME/Applications" || fail replace_failed "$?"
+HENGE_HELPER_TMP=$(mktemp -d "$HOME/Applications/.henge-install.XXXXXX") || fail replace_failed "$?"
 
-echo 'Downloading and checking the helper before changing the installed copy...'
-curl --fail --silent --show-error --connect-timeout 3 --max-time 20 \
-    http://10.0.2.4/.henge/agent -o "$HENGE_HELPER_TMP/agent.gz" || fail download_failed "$?"
+echo 'Downloading and checking Henge Helper.app before changing the installed copy...'
+curl --fail --silent --show-error --connect-timeout 3 --max-time 30 \
+    http://10.0.2.4/.henge/helper/app -o "$HENGE_HELPER_TMP/helper.tar.gz" || fail download_failed "$?"
 receipt downloaded none 0 || fail connection_failed 1
-gzip -t "$HENGE_HELPER_TMP/agent.gz" || fail gzip_invalid "$?"
-gzip -dc "$HENGE_HELPER_TMP/agent.gz" > "$HENGE_HELPER_TMP/henge-agent" || fail gzip_invalid "$?"
-chmod 755 "$HENGE_HELPER_TMP/henge-agent" || fail replace_failed "$?"
-codesign --verify --strict "$HENGE_HELPER_TMP/henge-agent" || fail signature_invalid "$?"
-HENGE_HELPER_VERSION=$("$HENGE_HELPER_TMP/henge-agent" --version) || fail version_invalid "$?"
-[ "$HENGE_HELPER_VERSION" = 'henge-agent 4' ] || fail version_invalid 1
-# This foreground probe is distinct from launchd liveness; it cannot mark the daemon online.
-"$HENGE_HELPER_TMP/henge-agent" --connection-check || fail connection_failed "$?"
+gzip -t "$HENGE_HELPER_TMP/helper.tar.gz" || fail gzip_invalid "$?"
+# Only the named app and its descendants belong in this archive. Reject traversal before extraction.
+tar -tzf "$HENGE_HELPER_TMP/helper.tar.gz" > "$HENGE_HELPER_TMP/archive.list" || fail gzip_invalid "$?"
+awk 'BEGIN { valid=1; count=0 } { count++; if ($0 !~ /^Henge Helper[.]app(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/) valid=0 } END { exit !(valid && count>0) }' \
+    "$HENGE_HELPER_TMP/archive.list" || fail gzip_invalid 1
+tar -xzf "$HENGE_HELPER_TMP/helper.tar.gz" -C "$HENGE_HELPER_TMP" || fail gzip_invalid "$?"
+HENGE_STAGED_APP="$HENGE_HELPER_TMP/Henge Helper.app"
+HENGE_STAGED_BINARY="$HENGE_STAGED_APP/Contents/MacOS/henge-agent"
+[ -d "$HENGE_STAGED_APP" ] && [ ! -L "$HENGE_STAGED_APP" ] && [ -x "$HENGE_STAGED_BINARY" ] || fail gzip_invalid 1
+codesign --verify --deep --strict "$HENGE_STAGED_APP" || fail signature_invalid "$?"
+HENGE_HELPER_VERSION=$("$HENGE_STAGED_BINARY" --version) || fail version_invalid "$?"
+[ "$HENGE_HELPER_VERSION" = 'henge-agent 5' ] || fail version_invalid 1
+# A Terminal probe cannot prove a LaunchServices app has local-network permission.
+# Start the verified application below and confirm its own PID/health instead.
 receipt verified none 0 || fail connection_failed 1
 
-# Escape the path for XML; spaces and '&' in a home directory must not break the LaunchAgent.
-HENGE_HELPER_XML_PATH=$(printf '%s' "$HENGE_HELPER_DIR/henge-agent" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")
-cat > "$HENGE_HELPER_TMP/new.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.henge.agent</string>
-<key>ProgramArguments</key><array><string>$HENGE_HELPER_XML_PATH</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>LimitLoadToSessionType</key><string>Aqua</string>
-<key>ProcessType</key><string>Background</string>
-</dict></plist>
-EOF
-[ "$?" -eq 0 ] || fail plist_invalid 1
-plutil -lint "$HENGE_HELPER_TMP/new.plist" >/dev/null || fail plist_invalid "$?"
-if [ -f "$HENGE_HELPER_DIR/henge-agent" ]; then
-    cp -p "$HENGE_HELPER_DIR/henge-agent" "$HENGE_HELPER_TMP/previous-agent" || fail replace_failed "$?"
-    HENGE_HELPER_HAD_BINARY=1
+if [ -e "$HENGE_HELPER_APP" ]; then
+    [ -d "$HENGE_HELPER_APP" ] && [ ! -L "$HENGE_HELPER_APP" ] && [ -x "$HENGE_HELPER_BINARY" ] || fail replace_failed 1
+    HENGE_HELPER_HAD_APP=1
+    if app_pid; then HENGE_HELPER_APP_WAS_RUNNING=1; fi
 fi
 if [ -f "$HENGE_HELPER_PLIST" ]; then
     cp -p "$HENGE_HELPER_PLIST" "$HENGE_HELPER_TMP/previous.plist" || fail replace_failed "$?"
@@ -116,40 +127,58 @@ if [ -f "$HENGE_HELPER_PLIST" ]; then
 fi
 if launchctl print "$HENGE_HELPER_JOB" >/dev/null 2>&1; then
     HENGE_HELPER_WAS_LOADED=1
-    HENGE_HELPER_MUTATED=1
-    launchctl bootout "$HENGE_HELPER_JOB"
-    HENGE_HELPER_BOOTOUT_RC=$?
-    if [ "$HENGE_HELPER_BOOTOUT_RC" -ne 0 ]; then
-        HENGE_HELPER_MUTATED=0
-        fail bootout_failed "$HENGE_HELPER_BOOTOUT_RC"
-    fi
+    launchctl bootout "$HENGE_HELPER_JOB" || fail bootout_failed "$?"
 fi
-# From this point an interrupted/failed repair restores the saved files and prior job.
 HENGE_HELPER_MUTATED=1
+if [ "$HENGE_HELPER_HAD_APP" -eq 1 ]; then
+    "$HENGE_HELPER_BINARY" --quit-app || fail bootout_failed "$?"
+fi
 receipt replacing none 0 || fail connection_failed 1
-mv -f "$HENGE_HELPER_TMP/henge-agent" "$HENGE_HELPER_DIR/henge-agent" || fail replace_failed "$?"
-mv -f "$HENGE_HELPER_TMP/new.plist" "$HENGE_HELPER_PLIST" || fail replace_failed "$?"
-# The host clears old daemon liveness here. A foreground --version/probe cannot satisfy confirmation.
+if [ "$HENGE_HELPER_HAD_APP" -eq 1 ]; then
+    mv "$HENGE_HELPER_APP" "$HENGE_HELPER_TMP/previous.app" || fail replace_failed "$?"
+fi
+HENGE_HELPER_APP_CHANGED=1
+mv "$HENGE_STAGED_APP" "$HENGE_HELPER_APP" || fail replace_failed "$?"
+# Keep the old bare binary for recovery, but remove its job to prevent two helpers at next login.
+rm -f "$HENGE_HELPER_PLIST" || fail replace_failed "$?"
 receipt launch_requested none 0 || fail connection_failed 1
-launchctl bootstrap "$HENGE_HELPER_DOMAIN" "$HENGE_HELPER_PLIST" || fail bootstrap_failed "$?"
+open -a "$HENGE_HELPER_APP" --args --install || fail bootstrap_failed "$?"
 
-echo 'Waiting briefly for the new helper to connect to Henge (20-second retry window)...'
-HENGE_HELPER_DEADLINE=$(( $(date +%s) + 20 ))
+echo 'Henge Helper is opening. Allow its Local Network request in the Mac if asked.'
+echo 'Waiting at least 60 seconds for its own connection; the Mac app shows any permission or login-item action.'
 HENGE_HELPER_CONNECTED=0
 HENGE_HELPER_ATTEMPTS=0
-while [ "$HENGE_HELPER_ATTEMPTS" -lt 10 ] && [ "$(date +%s)" -lt "$HENGE_HELPER_DEADLINE" ]; do
+# Each failed attempt sleeps one second. No wall-clock jump or fast failed check shortens this window.
+# All helper CLI and HTTP operations are separately bounded. Sixty retries also bound a stalled clock.
+while [ "$HENGE_HELPER_ATTEMPTS" -lt 60 ]; do
     HENGE_HELPER_ATTEMPTS=$(( HENGE_HELPER_ATTEMPTS + 1 ))
-    HENGE_HELPER_PID=$(launchctl print "$HENGE_HELPER_JOB" 2>/dev/null | awk '/^[[:space:]]*pid = [0-9]+/ { print $3; exit }')
-    case "$HENGE_HELPER_PID" in
-        ''|*[!0-9]*) ;;
-        *) if "$HENGE_HELPER_DIR/henge-agent" --health-check "$HENGE_HELPER_PID"; then
-               if receipt confirmed none 0 "$HENGE_HELPER_PID"; then HENGE_HELPER_CONNECTED=1; HENGE_HELPER_MUTATED=0; break; fi
-           fi ;;
-    esac
+    if app_pid && "$HENGE_HELPER_BINARY" --health-check "$HENGE_HELPER_PID"; then
+        if receipt confirmed none 0 "$HENGE_HELPER_PID"; then HENGE_HELPER_CONNECTED=1; break; fi
+    fi
     sleep 1
 done
-[ "$HENGE_HELPER_CONNECTED" -eq 1 ] || fail health_unconfirmed 1
+if [ "$HENGE_HELPER_CONNECTED" -eq 0 ]; then
+    if app_pid; then
+        # A running app may be waiting for an interactive permission prompt. Keep it available.
+        HENGE_HELPER_MUTATED=0
+        if ! receipt awaiting_connection none 0 "$HENGE_HELPER_PID"; then
+            echo 'The installation status could not reach Henge. The running Mac app is being kept for reconnection.'
+        fi
+        echo 'Henge Helper.app is installed and running, but its connection is NOT confirmed yet.'
+        echo 'Leave the Mac app open and allow its Local Network request. Do not repeat installation.'
+        HENGE_LOGIN_STATUS=$("$HENGE_HELPER_BINARY" --login-status 2>/dev/null) || HENGE_LOGIN_STATUS=unavailable
+        case "$HENGE_LOGIN_STATUS" in
+            requires_approval) echo 'Login startup needs approval in Mac System Settings > General > Login Items.' ;;
+            not_registered) echo 'Automatic login startup is not registered; check the Henge Helper window.' ;;
+            enabled) echo 'Automatic login startup is enabled.' ;;
+            *) echo 'Automatic login startup status is unavailable; check the Henge Helper window.' ;;
+        esac
+        echo 'Henge will update the connection status automatically after the app connects.'
+        exit 0
+    fi
+    fail health_unconfirmed 1
+fi
 HENGE_HELPER_MUTATED=0
-echo 'The installed helper is running and has connected to Henge.'
+echo 'Henge Helper.app is running and its connection is confirmed.'
 echo 'Return to Henge and use Collect Chat diagnostics. Clipboard readiness is shown separately.'
-echo 'This confirms the helper connection; it does not change DeviceCheck support or fix native Chat authentication.'
+echo 'This confirms the helper connection; it does not change DeviceCheck support or native Chat authentication.'

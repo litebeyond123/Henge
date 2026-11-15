@@ -141,106 +141,135 @@ class HelperInstallTests(unittest.TestCase):
         self.assertEqual(script, expected, "Regenerate host/helper-install-script.inc after editing installer source")
         return script
 
-    def install(self, scenario="ok"):
-        state = self.directory / "state"
-        state.mkdir()
+    def install(self, scenario="ok", previous_app=False):
+        state = self.directory / "state"; state.mkdir()
         home = self.directory / "test home & apostrophe'"
-        directory = home / "Library/Application Support/Henge"
-        directory.mkdir(parents=True)
-        plist = home / "Library/LaunchAgents/com.henge.agent.plist"
-        plist.parent.mkdir(parents=True)
-        binary = directory / "henge-agent"
-        binary.write_bytes(b"old helper intact\n")
-        binary.chmod(0o755)
+        directory = home / "Library/Application Support/Henge"; directory.mkdir(parents=True)
+        plist = home / "Library/LaunchAgents/com.henge.agent.plist"; plist.parent.mkdir(parents=True)
+        binary = directory / "henge-agent"; binary.write_bytes(b"old helper intact\n"); binary.chmod(0o755)
         plist.write_bytes(b"old plist intact\n")
-        (state / "launch-state.json").write_text(json.dumps({"loaded": True, "pid": 321, "bootstraps": 0}))
+        (state / "launch-state.json").write_text(json.dumps({"loaded": True, "pid": 321, "bootstraps": 0,
+            "app_running": previous_app, "app_marker": "old", "slept_seconds": 0, "health_checks": 0}))
         payload = '''#!/usr/bin/env python3
-import os, sys
-scenario = os.environ.get("HENGE_INSTALL_TEST_SCENARIO", "ok")
-if sys.argv[1] == "--version":
-    print("henge-agent 3" if scenario == "version_invalid" else "henge-agent 4")
-    sys.exit(0)
-if sys.argv[1] == "--connection-check":
-    sys.exit(1 if scenario == "probe_failed" else 0)
-if sys.argv[1] == "--health-check":
-    sys.exit(0 if scenario not in ("health_unconfirmed", "health_clock_backwards", "rollback_failed") and sys.argv[2] == "999" else 1)
+import json, os, sys
+from pathlib import Path
+root=Path(os.environ["HENGE_INSTALL_TEST_STATE"])
+p=root/"launch-state.json"; state=json.loads(p.read_text())
+scenario=os.environ.get("HENGE_INSTALL_TEST_SCENARIO", "ok")
+mode=sys.argv[1]
+with (root/"helper-calls.jsonl").open("a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")
+if mode == "--version":
+    print("henge-agent 4" if scenario == "version_invalid" else "henge-agent 5"); sys.exit(0)
+if mode == "--app-pid":
+    if not state["app_running"]: sys.exit(1)
+    print(999); sys.exit(0)
+if mode == "--quit-app":
+    state["app_running"]=False; p.write_text(json.dumps(state)); sys.exit(0)
+if mode == "--unregister-login": sys.exit(0)
+if mode == "--login-status": print("requires_approval"); sys.exit(0)
+if mode == "--health-check":
+    state["health_checks"]+=1; p.write_text(json.dumps(state))
+    success=scenario != "awaiting_connection" and (scenario != "late_connection" or state["slept_seconds"]>=15)
+    sys.exit(0 if success and sys.argv[2] == "999" else 1)
 sys.exit(2)
 '''
         (state / "new-agent").write_text(payload)
-        commands = self.directory / "bin"
-        commands.mkdir()
-        for name in ("curl", "codesign", "plutil", "launchctl", "date", "sleep", "mv"):
-            target = commands / name
-            target.write_bytes((ROOT / "tests/helper_install_stub.py").read_bytes())
-            target.chmod(0o755)
-        script = self.directory / "install.sh"
-        script.write_bytes(self.script())
-        # HOME remains the home of this isolated subprocess; no real user files or services are touched.
-        environment = dict(os.environ, HOME=str(home), PATH=str(commands) + os.pathsep + os.environ["PATH"],
-                           HENGE_INSTALL_TEST_STATE=str(state), HENGE_INSTALL_TEST_SCENARIO=scenario)
-        result = subprocess.run(["/bin/sh", str(script)], env=environment, capture_output=True, text=True, timeout=10)
-        receipts = [json.loads(line) for line in (state / "receipts.jsonl").read_text().splitlines()]
-        return result, receipts, binary, plist, json.loads((state / "launch-state.json").read_text())
+        app = home / "Applications/Henge Helper.app"
+        if previous_app:
+            (app / "Contents/MacOS").mkdir(parents=True)
+            old = app / "Contents/MacOS/henge-agent"; old.write_text(payload); old.chmod(0o755)
+            (app / "Contents/marker").write_text("old")
+        commands = self.directory / "bin"; commands.mkdir()
+        for name in ("curl", "codesign", "launchctl", "open", "sleep", "mv", "cp"):
+            target=commands/name; target.write_bytes((ROOT / "tests/helper_install_stub.py").read_bytes()); target.chmod(0o755)
+        script=self.directory/"install.sh"; script.write_bytes(self.script())
+        environment=dict(os.environ, HOME=str(home), PATH=str(commands)+os.pathsep+os.environ["PATH"],
+            HENGE_INSTALL_TEST_STATE=str(state), HENGE_INSTALL_TEST_SCENARIO=scenario)
+        result=subprocess.run(["/bin/sh", str(script)], env=environment, capture_output=True, text=True, timeout=20)
+        receipts=[json.loads(line) for line in (state/"receipts.jsonl").read_text().splitlines()]
+        return result, receipts, binary, plist, app, json.loads((state/"launch-state.json").read_text())
 
-    def test_success_requires_new_daemon_pid_and_escaped_plist(self):
-        result, receipts, binary, plist, launch = self.install()
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn(b"--health-check", binary.read_bytes())
-        self.assertIn(b"&amp;", plist.read_bytes())
-        self.assertEqual(receipts[-1], {"stage": "confirmed", "error": "none", "code": "0", "pid": "999"})
-        self.assertEqual(launch["pid"], 999)
-        self.assertIn("has connected to Henge", result.stdout)
+    def test_success_uses_real_app_pid_and_removes_legacy_job(self):
+        result, receipts, binary, plist, app, launch=self.install()
+        self.assertEqual(result.returncode, 0, result.stderr+result.stdout)
+        self.assertEqual(binary.read_bytes(), b"old helper intact\n")
+        self.assertTrue((app/"Contents/MacOS/henge-agent").is_file())
+        self.assertFalse(plist.exists()); self.assertFalse(launch["loaded"])
+        self.assertTrue(launch["app_running"])
+        self.assertEqual(receipts[-1], {"stage":"confirmed", "error":"none", "code":"0", "pid":"999"})
+        self.assertIn("connection is confirmed", result.stdout)
 
     def assert_preserved(self, scenario, expected, rolled_back=False):
-        result, receipts, binary, plist, launch = self.install(scenario)
+        result, receipts, binary, plist, app, launch=self.install(scenario)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(binary.read_bytes(), b"old helper intact\n")
         self.assertEqual(plist.read_bytes(), b"old plist intact\n")
-        self.assertEqual(launch["pid"], 321)
-        self.assertTrue(launch["loaded"])
+        self.assertTrue(launch["loaded"]); self.assertFalse(app.exists())
         self.assertEqual(receipts[-1]["stage"], "rolled_back" if rolled_back else "failed")
         self.assertEqual(receipts[-1]["error"], expected)
-        self.assertNotIn("has connected to Henge", result.stdout)
         self.assertFalse(any(x["stage"] == "confirmed" for x in receipts))
+        return launch
 
-    def test_download_failure_preserves_running_helper(self):
-        self.assert_preserved("download_failed", "download_failed")
-
-    def test_invalid_gzip_preserves_running_helper(self):
-        self.assert_preserved("gzip_invalid", "gzip_invalid")
-
-    def test_signature_failure_preserves_running_helper(self):
-        self.assert_preserved("signature_invalid", "signature_invalid")
-
-    def test_wrong_version_preserves_running_helper(self):
-        self.assert_preserved("version_invalid", "version_invalid")
-
-    def test_probe_failure_preserves_running_helper(self):
-        self.assert_preserved("probe_failed", "connection_failed")
-
-    def test_bootout_failure_is_explicit(self):
-        self.assert_preserved("bootout_failed", "bootout_failed")
-
-    def test_bootstrap_failure_restores_prior_files_and_running_agent(self):
-        self.assert_preserved("bootstrap_failed", "bootstrap_failed", True)
-
-    def test_missing_heartbeat_restores_prior_agent_without_success(self):
-        self.assert_preserved("health_unconfirmed", "health_unconfirmed", True)
-
-    def test_clock_stall_still_has_fixed_confirmation_attempt_limit(self):
-        self.assert_preserved("health_clock_backwards", "health_unconfirmed", True)
-
-    def test_failed_rollback_retains_unrestored_backup(self):
-        result, receipts, binary, _, _ = self.install("rollback_failed")
+    def test_download_failure_preserves_running_helper(self): self.assert_preserved("download_failed", "download_failed")
+    def test_invalid_gzip_preserves_running_helper(self): self.assert_preserved("gzip_invalid", "gzip_invalid")
+    def test_archive_traversal_rejected_before_extraction(self): self.assert_preserved("archive_traversal", "gzip_invalid")
+    def test_signature_failure_preserves_running_helper(self): self.assert_preserved("signature_invalid", "signature_invalid")
+    def test_wrong_version_preserves_running_helper(self): self.assert_preserved("version_invalid", "version_invalid")
+    def test_bootout_failure_is_explicit(self): self.assert_preserved("bootout_failed", "bootout_failed")
+    def test_app_launch_failure_restores_legacy_job(self): self.assert_preserved("bootstrap_failed", "bootstrap_failed", True)
+    def test_absent_app_after_full_window_restores_prior_agent(self):
+        state=self.assert_preserved("health_unconfirmed", "health_unconfirmed", True)
+        self.assertEqual(state["slept_seconds"], 60)
+    def test_connection_after_ten_seconds_is_not_rolled_back(self):
+        result, receipts, _, _, _, launch=self.install("late_connection")
+        self.assertEqual(result.returncode, 0, result.stderr+result.stdout)
+        self.assertEqual(receipts[-1]["stage"], "confirmed")
+        self.assertEqual(launch["slept_seconds"], 15)
+    def test_running_app_is_preserved_awaiting_permission_not_claimed_success(self):
+        result, receipts, _, plist, app, launch=self.install("awaiting_connection")
+        self.assertEqual(result.returncode, 0, result.stderr+result.stdout)
+        self.assertEqual(launch["slept_seconds"], 60)
+        self.assertTrue(app.exists() and launch["app_running"])
+        self.assertFalse(plist.exists() or launch["loaded"])
+        self.assertEqual(receipts[-1]["stage"], "awaiting_connection")
+        self.assertFalse(any(x["stage"] == "confirmed" for x in receipts))
+        self.assertIn("NOT confirmed", result.stdout); self.assertIn("Do not repeat", result.stdout)
+        self.assertIn("Login Items", result.stdout)
+    def test_failed_app_replacement_restores_previous_app_and_running_state(self):
+        result, receipts, _, _, app, launch=self.install("bootstrap_failed", previous_app=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((app/"Contents/marker").read_text(), "old")
+        self.assertTrue(launch["app_running"] and launch["loaded"])
+        self.assertEqual(receipts[-1]["stage"], "rolled_back")
+    def test_failed_rollback_retains_backup(self):
+        result, receipts, _, _, app, _=self.install("rollback_failed")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(receipts[-1]["error"], "rollback_failed")
-        backups = list(binary.parent.glob(".install.*/previous-agent"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_bytes(), b"old helper intact\n")
-        self.assertNotIn("has connected to Henge", result.stdout)
+        self.assertEqual(len(list(app.parent.glob(".henge-install.*/previous.plist"))), 1)
+    def test_launch_receipt_failure_restores_prior_state(self): self.assert_preserved("receipt_failed", "connection_failed", True)
 
-    def test_launch_receipt_failure_cannot_reuse_old_liveness(self):
-        self.assert_preserved("receipt_failed", "connection_failed", True)
+    def test_app_archive_endpoint_uses_legacy_resource_directory(self):
+        resource=self.directory/"resources"; resource.mkdir()
+        (resource/"henge-agent.gz").write_bytes(b"legacy-fixture")
+        archive=resource/"henge-helper.app.tar.gz"; archive.write_bytes(b"signed-app-fixture")
+        self.server.control("agent-path "+str(resource/"henge-agent.gz"))
+        self.assertEqual(self.server.request("GET", "/.henge/helper/app"), (200, b"signed-app-fixture"))
+        self.assertEqual(self.server.request("GET", "/.henge/agent"), (200, b"legacy-fixture"))
+        self.assertEqual(self.server.request("POST", "/.henge/helper/app")[0], 400)
+        archive.unlink()
+        self.assertEqual(self.server.request("GET", "/.henge/helper/app")[0], 404)
+
+    def test_awaiting_connection_is_not_confirmed_until_pid_really_connects(self):
+        self.assertEqual(self.receipt("awaiting_connection", pid=999)[0], 200)
+        self.assertEqual(self.health()["install_stage"], "awaiting_connection")
+        self.assertEqual(self.receipt("confirmed", pid=999)[0], 409)
+        self.assertEqual(self.ping(pid=999)[0], 200)
+        self.assertEqual(self.receipt("confirmed", pid=999)[0], 200)
+        self.assertEqual(self.health()["install_stage"], "confirmed")
+        self.assertEqual(self.receipt("awaiting_connection", pid=999)[0], 200)
+        self.assertEqual(self.health()["install_stage"], "confirmed") # late installer cannot downgrade a live app
+        self.assertEqual(self.receipt("awaiting_connection", pid=0)[0], 400)
+        self.assertEqual(self.receipt("awaiting_connection", "health_unconfirmed", 1, pid=999)[0], 400)
 
 
 if __name__ == "__main__":

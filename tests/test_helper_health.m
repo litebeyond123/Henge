@@ -76,6 +76,29 @@ int main(void) {
         response = json(snapshot());
         CHECK(HengeHelperCheckPID(transport, 321));
         CHECK(!HengeHelperCheckPID(transport, 999));
+        // A running app may confirm itself after the installer has stopped
+        // waiting for an OS permission prompt. A probe or someone else's PID
+        // must never create that confirmation.
+        [calls removeAllObjects];
+        CHECK(!HengeHelperConfirm(transport));
+        CHECK(calls.count == 1);
+        NSMutableDictionary *own = snapshot();
+        own[@"helper_pid"] = @(getpid());
+        response = json(own);
+        [calls removeAllObjects];
+        CHECK(HengeHelperConfirm(transport));
+        CHECK(calls.count == 2);
+        CHECK([calls[1][@"method"] isEqual:@"POST"]);
+        CHECK([calls[1][@"session"] isEqual:Session]);
+        CHECK([calls[1][@"path"] containsString:@"stage=confirmed&error=none&code=0&pid="]);
+        rejectPing = YES;
+        CHECK(!HengeHelperConfirm(transport));
+        rejectPing = NO;
+        own[@"agent_seen_s"] = @30;
+        response = json(own);
+        [calls removeAllObjects];
+        CHECK(!HengeHelperConfirm(transport));
+        CHECK(calls.count == 1);
         printf("Helper health: %d assertions passed.\n", checks);
     }
     return 0;
