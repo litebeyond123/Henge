@@ -275,6 +275,9 @@ def main():
             # rejected an already-running copy, and every PID is path-checked again before a signal.
             launched_app_pids.update(matching_pids(helper))
             if launched_app_pids:
+                live_before_quit = {pid for pid in launched_app_pids if process_path(pid) == helper}
+                if not live_before_quit:
+                    cleanup_errors.append("app_exited_before_quit_cli")
                 quit_ok = False
                 try:
                     quit_result = command([helper, "--quit-app"], check=False, timeout=12)
@@ -290,7 +293,7 @@ def main():
                 remaining = {pid for pid in launched_app_pids if process_path(pid) == helper}
                 if remaining:
                     cleanup_errors.append("app_quit_cli_did_not_exit")
-                summary["app_quit_cli_verified"] = quit_ok and not remaining
+                summary["app_quit_cli_verified"] = quit_ok and bool(live_before_quit) and not remaining
             # Cleanup is still mandatory after a failed CLI, but a signal fallback never counts as
             # a successful --quit-app test and therefore cannot make the runtime gate pass.
             for pid in launched_app_pids:
