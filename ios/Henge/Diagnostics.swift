@@ -345,15 +345,19 @@ struct DiagnosticReportStore {
 
     private func pruneHistory(keeping current: URL) throws {
         let fm = FileManager.default
-        let files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        let files = try fm.contentsOfDirectory(at: directory.resolvingSymlinksInPath(), includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
         var archives: [(URL, Date)] = []
         for url in files where url.lastPathComponent.hasPrefix("Henge-diagnostics-") && url.pathExtension == "txt" {
             let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
             if values.isRegularFile == true { archives.append((url, values.contentModificationDate ?? .distantPast)) }
         }
+        // Every candidate came from this one directory. Darwin may enumerate
+        // /var/... as /private/var/... (and URL base representations can also
+        // differ), so URL equality cannot identify the entry we just wrote.
+        let currentName = current.lastPathComponent
         archives.sort { lhs, rhs in
-            if lhs.0 == current { return rhs.0 != current }
-            if rhs.0 == current { return false }
+            if lhs.0.lastPathComponent == currentName { return rhs.0.lastPathComponent != currentName }
+            if rhs.0.lastPathComponent == currentName { return false }
             if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
             return lhs.0.lastPathComponent > rhs.0.lastPathComponent
         }

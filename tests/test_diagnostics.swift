@@ -170,10 +170,27 @@ struct DiagnosticsTests {
         check(history.count == 3, "retention bounds app-run history, not the number of automatic snapshots",
               details: "count=\(history.count), files=\(history.map(\.lastPathComponent))")
         let expected = directory.appendingPathComponent(identity(5).filename)
-        check(history.contains(expected), "retention never removes the just-published run",
+        check(history.contains { $0.lastPathComponent == expected.lastPathComponent } && fm.fileExists(atPath: expected.path),
+              "retention never removes the just-published run",
               details: "expected=\(expected.absoluteString), base=\(String(describing: expected.baseURL)); actual=\(history.map { "\($0.absoluteString) base=\(String(describing: $0.baseURL))" }); exists=\(fm.fileExists(atPath: expected.path))")
         check(fm.fileExists(atPath: guest.path), "retention does not delete explicit guest inputs")
         check(try Data(contentsOf: attachment) == firstBytes, "history pruning cannot delete or change a share attachment")
+        // Publish through a directory symlink, as Darwin's /var -> /private/var
+        // aliases can make enumeration spell the same directory differently.
+        // Future-dated old reports force retention to protect the current file
+        // explicitly, rather than accidentally keeping it due to its mtime.
+        let alias = folder.appendingPathComponent("DiagnosticsAlias", isDirectory: true)
+        try fm.createSymbolicLink(at: alias, withDestinationURL: directory)
+        for old in history { try fm.setAttributes([.modificationDate: Date().addingTimeInterval(3600)], ofItemAtPath: old.path) }
+        let aliasStore = DiagnosticReportStore(directory: alias, historyLimit: 1)
+        _ = try aliasStore.publish(identity: identity(6), sources: [.init(name: "current", url: source)])
+        let realCurrent = directory.appendingPathComponent(identity(6).filename)
+        check(fm.fileExists(atPath: realCurrent.path), "directory aliases do not defeat current-run retention even with future-dated old files")
+        let aliasHistory = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("Henge-diagnostics-") && $0.pathExtension == "txt" }
+        check(aliasHistory.count == 1 && aliasHistory.first?.lastPathComponent == realCurrent.lastPathComponent,
+              "alias publication retains exactly the requested current-run history entry",
+              details: "count=\(aliasHistory.count), names=\(aliasHistory.map(\.lastPathComponent)), limit=\(aliasStore.historyLimit)")
         let orphan = directory.appendingPathComponent(".pending-abandoned.txt")
         try Data("unfinished".utf8).write(to: orphan)
         try store.removeAbandonedWrites()
