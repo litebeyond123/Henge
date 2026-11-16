@@ -9,6 +9,7 @@
 
    Locks are accepted but not enforced: macOS only writes to a server that offers them, and there is one client. */
 #include "share.h"
+#include "device_auth.h"
 
 #include <copyfile.h>
 #include <dirent.h>
@@ -159,6 +160,7 @@ void hv_share_host_begin(const char *session) {
     host_running = host_foreground = host_brightness_control = 0;
     host_updated_ms = 0;
     pthread_mutex_unlock(&host_mu);
+    hv_device_auth_begin(session);
 }
 
 void hv_share_host_end(void) {
@@ -169,6 +171,7 @@ void hv_share_host_end(void) {
     host_updated_ms = 0;
     host_finish_locked(409, "session_ended", 0);
     pthread_mutex_unlock(&host_mu);
+    hv_device_auth_end();
 }
 
 void hv_share_host_publish(int running, int foreground, int brightness_control, double brightness, double output_volume) {
@@ -187,6 +190,7 @@ void hv_share_host_publish(int running, int foreground, int brightness_control, 
         else if (!host_brightness_control) host_finish_locked(403, "brightness_control_disabled", 0);
     }
     pthread_mutex_unlock(&host_mu);
+    hv_device_auth_publish(running, foreground);
 }
 
 int hv_share_host_process_brightness(double (*apply)(double)) {
@@ -1026,6 +1030,8 @@ static int host_set_brightness(Conn *c, Request *r) {
     return respond(c, r, 200, "OK", host_json_headers, result, (size_t)n);
 }
 
+#include "device_auth_http.inc"
+
 static int serve_host(Conn *c, Request *r, const char *what) {
     /* A deliberately small control protocol, with no browser-origin requests or unbounded/chunked bodies.
        The UUID prevents requests from an old session; any process in the current guest can read it. */
@@ -1035,6 +1041,7 @@ static int serve_host(Conn *c, Request *r, const char *what) {
     setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
     if (r->host_bad_headers || r->transfer_encoding_seen) return host_error(c, r, 400, "invalid_headers");
     if (r->host_has_origin) return host_error(c, r, 403, "browser_origin_not_allowed");
+    if (!strncmp(what, "auth/", 5)) return serve_device_auth(c, r, what + 5);
     if (!strcmp(what, "capabilities") || !strcmp(what, "state")) {
         if (strcmp(r->method, "GET")) return host_error(c, r, 405, "get_required");
         if (r->length) return host_error(c, r, 400, "unexpected_body");

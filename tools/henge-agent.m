@@ -4,6 +4,7 @@
 #import "guest-chat-diagnostics.h"
 #import "helper-health.h"
 #import "helper-app.h"
+#import "guest-auth-experiment.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -123,6 +124,11 @@ static NSData *chatTransport(NSString *method, NSString *path, NSData *body, NSU
     return requestWithSession(method, path, body, nil, 4, limit, status, NULL);
 }
 
+static NSData *authTransport(NSString *method, NSString *path, NSData *body, NSString *session,
+                             NSUInteger limit, int *status) {
+    return requestWithSession(method, path, body, session, 15, MIN(limit, 96 * 1024), status, NULL);
+}
+
 // Health is separate from clipboard long polls and diagnostic collection. A probe never marks a daemon alive.
 static NSData *helperTransport(NSString *method, NSString *path, NSString *session, int *status) {
     return requestWithSession(method, path, nil, session, 5, 4096, status, NULL);
@@ -157,6 +163,7 @@ static void startHelperHealth(void) {
                 }
                 // The collector serializes bounded work and skips expired startup requests.
                 HengeChatDiagnosticsPoll(chatTransport);
+                HengeGuestAuthExperimentPoll(authTransport);
             }
             sleep(2);
         }
@@ -281,7 +288,7 @@ static void keepMounted(void) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc == 2 && !strcmp(argv[1], "--version")) { puts("henge-agent 6"); return 0; }
+        if (argc == 2 && !strcmp(argv[1], "--version")) { puts("henge-agent 7"); return 0; }
         if (argc == 2 && !strcmp(argv[1], "--app-pid")) return HengeHelperAppPID();
         if (argc == 2 && !strcmp(argv[1], "--quit-app")) return HengeHelperQuitApp();
         if (argc == 2 && !strcmp(argv[1], "--login-status")) { puts(HengeHelperLoginStatus()); return 0; }

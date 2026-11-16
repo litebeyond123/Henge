@@ -19,6 +19,7 @@ final class HostServices: ObservableObject {
     private var activityObservers: [NSObjectProtocol] = []
 
     private init() {
+        HengeAuthInstallBridge()
         for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification,
                      UIApplication.didBecomeActiveNotification] {
             activityObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in

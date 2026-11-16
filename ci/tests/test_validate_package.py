@@ -71,10 +71,12 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
 
 def guest_app_archive(binary=None, extra=None):
     info = {"CFBundleIdentifier": "com.henge.guesthelper", "CFBundleExecutable": "henge-agent",
-            "CFBundleVersion": "6", "CFBundlePackageType": "APPL", "LSUIElement": True,
+            "CFBundleVersion": "7", "CFBundlePackageType": "APPL", "LSUIElement": True,
             "LSMinimumSystemVersion": "13.0", "NSLocalNetworkUsageDescription": "Connect to Henge."}
     files = {"Henge Helper.app/Contents/Info.plist": plistlib.dumps(info),
              "Henge Helper.app/Contents/MacOS/henge-agent": binary if binary is not None else macho(platform=1, minimum=0x0D0000),
+             "Henge Helper.app/Contents/Resources/henge-auth-launcher": macho(platform=1, minimum=0x0D0000),
+             "Henge Helper.app/Contents/Resources/henge-auth-adapter.dylib": macho(platform=1, minimum=0x0D0000, filetype=6),
              "Henge Helper.app/Contents/_CodeSignature/CodeResources": b"structural fixture"}
     if extra:
         files.update(extra)
@@ -90,13 +92,17 @@ def guest_app_archive(binary=None, extra=None):
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4007",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4008",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }
     return {
         "Info.plist": plistlib.dumps(info),
         "Henge": macho({"get-task-allow": True}, der_key("get-task-allow")),
+        "Helpers/henge-auth-signer": macho({
+            "com.apple.mobileactivationd.device-identifiers": True, "com.apple.mobileactivationd.spi": True,
+            "com.apple.security.attestation.access": True, "com.apple.private.security.no-sandbox": True,
+            "platform-application": True, "keychain-access-groups": ["2bit-identity"]}),
         "henge-jit.js": b"// structural test fixture\n",
         "henge-agent.gz": gzip.compress(b"structural test fixture, not a guest executable"),
         "henge-helper.app.tar.gz": guest_app_archive(),
@@ -129,7 +135,7 @@ class PackageTests(unittest.TestCase):
         report = self.validate(husk_commit="1" * 40)
         self.assertEqual(report["application"]["version"], "0.4.0")
         self.assertEqual(report["source"]["husk_commit"], "1" * 40)
-        self.assertEqual(len(report["validation"]["signed_macho_files"]), 3)
+        self.assertEqual(len(report["validation"]["signed_macho_files"]), 4)
         self.assertEqual(report["package"]["sha256"], hashlib.sha256(self.package.read_bytes()).hexdigest())
         self.assertEqual(report["validation"]["guest_helper_application"]["bundle_id"], "com.henge.guesthelper")
 
@@ -137,6 +143,34 @@ class PackageTests(unittest.TestCase):
         for binary in (macho(platform=2, minimum=0x0D0000), macho(platform=1, minimum=0x0D0000, signed=False)):
             files = members()
             files["henge-helper.app.tar.gz"] = guest_app_archive(binary)
+            self.write(files)
+            with self.assertRaises(validator.InvalidPackage):
+                self.validate()
+
+    def test_signer_is_required_and_privileges_stay_in_child(self):
+        files = members()
+        del files["Helpers/henge-auth-signer"]
+        self.write(files)
+        with self.assertRaisesRegex(validator.InvalidPackage, "Missing required resource"):
+            self.validate()
+        files = members()
+        files["Helpers/henge-auth-signer"] = macho({"platform-application": True})
+        self.write(files)
+        with self.assertRaisesRegex(validator.InvalidPackage, "Signer entitlements"):
+            self.validate()
+        files = members()
+        files["Henge"] = macho({"get-task-allow": True, "platform-application": True})
+        self.write(files)
+        with self.assertRaisesRegex(validator.InvalidPackage, "Signer-only entitlements"):
+            self.validate()
+
+    def test_guest_auth_adapter_must_have_right_platform_and_type(self):
+        for binary in (macho(platform=2, minimum=0x0D0000, filetype=6),
+                       macho(platform=1, minimum=0x0D0000),
+                       macho(platform=1, minimum=0x0D0000, filetype=6, signed=False)):
+            files = members()
+            files["henge-helper.app.tar.gz"] = guest_app_archive(extra={
+                "Henge Helper.app/Contents/Resources/henge-auth-adapter.dylib": binary})
             self.write(files)
             with self.assertRaises(validator.InvalidPackage):
                 self.validate()

@@ -17,6 +17,8 @@ char *hv_share_take_clipboard(void);
 long hv_share_agent_seen(void);
 /* Malloc-owned, fixed-schema helper liveness/install receipt. Ages use the host monotonic clock. */
 char *hv_share_helper_health(void);
+/* Secret-free, malloc-owned state and fixed event ring for the optional auth experiment. */
+char *hv_share_auth_state(void);
 
 /* Version 1 host services, on the same guest-only HTTP transport. A fresh UUID is supplied for each VM
    session; it separates sessions, not processes inside the same guest. No host account/radio APIs live here.

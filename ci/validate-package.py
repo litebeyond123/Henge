@@ -30,7 +30,7 @@ BANNED_ENTITLEMENTS = frozenset({
 })
 APP = "Payload/Henge.app/"
 REQUIRED = (
-    "Info.plist", "Henge", "henge-jit.js", "henge-agent.gz", "henge-helper.app.tar.gz", "guest-chat-diagnostics.command",
+    "Helpers/henge-auth-signer", "Info.plist", "Henge", "henge-jit.js", "henge-agent.gz", "henge-helper.app.tar.gz", "guest-chat-diagnostics.command",
     "PlugIns/HengeJITHelper.appex/Info.plist",
     "PlugIns/HengeJITHelper.appex/HengeJITHelper",
     "Frameworks/StikJIT.framework/Info.plist",
@@ -108,6 +108,7 @@ def signature_entitlements(data):
             "Invalid code-signature superblob")
     keys, der_values, has_entitlements, has_directory = set(), set(), False, False
     slots = set()
+    xml_values = {}
     for index in range(count):
         slot, offset = struct.unpack_from(">II", data, 12 + index * 8)
         require(slot not in slots, "Duplicate code-signature slot")
@@ -126,6 +127,7 @@ def signature_entitlements(data):
             except Exception as exc:
                 raise InvalidPackage("Cannot parse signed XML entitlements") from exc
             require(isinstance(entitlements, dict), "Signed entitlements are not a dictionary")
+            xml_values.update(entitlements)
             keys.update(entitlements)
             has_entitlements = True
         if slot == 7 or blob_magic == 0xFADE7172:
@@ -133,7 +135,7 @@ def signature_entitlements(data):
             der_values.update(der_strings(payload))
             has_entitlements = True
     require(has_directory, "Signature has no CodeDirectory")
-    return keys, der_values, has_entitlements
+    return keys, der_values, has_entitlements, xml_values
 
 
 def macho_slices(data):
@@ -187,7 +189,7 @@ def inspect_macho(data, name, trollstore, main=False, maximum_ios="17.0"):
             pos += size
         require(pos == stop, f"{name}: load-command size mismatch")
         require(signature is not None, f"{name}: executable is unsigned")
-        keys, der_values, has_entitlements = signature_entitlements(signature)
+        keys, der_values, has_entitlements, xml_values = signature_entitlements(signature)
         if trollstore:
             bad = BANNED_ENTITLEMENTS & (keys | der_values)
             require(not bad, f"{name}: banned TrollStore entitlements: {', '.join(sorted(bad))}")
@@ -200,7 +202,8 @@ def inspect_macho(data, name, trollstore, main=False, maximum_ios="17.0"):
             require(has_entitlements, f"{name}: no signed entitlements")
         reports.append({"cpu_type": cpu, "cpu_subtype": subtype,
                         "minimum_versions": [{"platform": p, "version": v} for p, v in minimum],
-                        "xml_entitlement_keys": sorted(keys), "has_entitlements": has_entitlements})
+                        "xml_entitlement_keys": sorted(keys), "has_entitlements": has_entitlements,
+                        "xml_entitlements": xml_values, "file_type": filetype})
     return reports
 
 
@@ -222,11 +225,12 @@ def inspect_guest_app(data):
                             "Guest app archive expands beyond its size limit")
                     files[member.name] = archive.extractfile(member).read()
         base = "Henge Helper.app/Contents/"
-        require(all(base + name in files for name in ("Info.plist", "MacOS/henge-agent", "_CodeSignature/CodeResources")),
+        require(all(base + name in files for name in ("Info.plist", "MacOS/henge-agent", "Resources/henge-auth-launcher",
+                        "Resources/henge-auth-adapter.dylib", "_CodeSignature/CodeResources")),
                 "Guest app archive is missing its bundle or signature resources")
         info = plistlib.loads(files[base + "Info.plist"])
         require(info.get("CFBundleIdentifier") == "com.henge.guesthelper" and
-                info.get("CFBundleExecutable") == "henge-agent" and info.get("CFBundleVersion") == "6" and
+                info.get("CFBundleExecutable") == "henge-agent" and info.get("CFBundleVersion") == "7" and
                 info.get("CFBundlePackageType") == "APPL" and info.get("LSUIElement") is True and
                 isinstance(info.get("NSLocalNetworkUsageDescription"), str) and
                 bool(info["NSLocalNetworkUsageDescription"].strip()), "Guest app identity or privacy description is invalid")
@@ -235,14 +239,22 @@ def inspect_guest_app(data):
         require(all(r["cpu_type"] == 0x0100000C and r["minimum_versions"] and
                     all(v["platform"] == 1 and version(v["version"]) <= version("13.0") for v in r["minimum_versions"])
                     for r in reports), "Guest app must be signed arm64 macOS code with a compatible deployment target")
-        return {"bundle_id": info["CFBundleIdentifier"], "build": info["CFBundleVersion"], "macho": reports}
+        resources = {}
+        for name, filetype in (("henge-auth-launcher", 2), ("henge-auth-adapter.dylib", 6)):
+            nested = inspect_macho(files[base + "Resources/" + name], name, False)
+            require(all(r["cpu_type"] == 0x0100000C and r["file_type"] == filetype and r["minimum_versions"] and
+                        all(v["platform"] == 1 and version(v["version"]) <= version("13.0") for v in r["minimum_versions"])
+                        for r in nested), "Guest authentication resources must be signed compatible arm64 macOS code")
+            resources[name] = nested
+        return {"bundle_id": info["CFBundleIdentifier"], "build": info["CFBundleVersion"], "macho": reports,
+                "authentication_resources": resources}
     except InvalidPackage:
         raise
     except (tarfile.TarError, ValueError, OSError, KeyError, TypeError, AttributeError) as exc:
         raise InvalidPackage("Invalid compressed guest application") from exc
 
 
-def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4007",
+def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4008",
                      kind=None, maximum_ios="17.0", husk_commit=None, run_url=None):
     package = Path(package)
     require(bool(re.fullmatch(r"[0-9a-f]{40}", expected_commit)), "Expected commit must be a full git SHA-1")
@@ -305,9 +317,17 @@ def validate_package(package, expected_commit, expected_version="0.4.0", expecte
             if magic in MACH_MAGICS:
                 relative = entry.filename[len(APP):]
                 binaries[relative] = inspect_macho(archive.read(entry), relative, kind == "tipa",
-                                                  main=relative == "Henge", maximum_ios=maximum_ios)
-        for name in ("Henge", "PlugIns/HengeJITHelper.appex/HengeJITHelper", "Frameworks/StikJIT.framework/StikJIT"):
+                                                  main=relative in ("Henge", "Helpers/henge-auth-signer"), maximum_ios=maximum_ios)
+        for name in ("Henge", "Helpers/henge-auth-signer", "PlugIns/HengeJITHelper.appex/HengeJITHelper", "Frameworks/StikJIT.framework/StikJIT"):
             require(name in binaries, f"Required executable is not Mach-O: {name}")
+        signer_keys = {"com.apple.mobileactivationd.device-identifiers", "com.apple.mobileactivationd.spi",
+                       "com.apple.security.attestation.access", "com.apple.private.security.no-sandbox", "platform-application"}
+        for part in binaries["Helpers/henge-auth-signer"]:
+            values = part["xml_entitlements"]
+            require(all(values.get(key) is True for key in signer_keys) and
+                    values.get("keychain-access-groups") == ["2bit-identity"], "Signer entitlements are missing or incorrect")
+        for part in binaries["Henge"]:
+            require(not (signer_keys & set(part["xml_entitlement_keys"])), "Signer-only entitlements must not be added to Henge")
     digest = hashlib.sha256()
     with package.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 ** 2), b""):
@@ -346,7 +366,7 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-version", default="0.4.0")
-    parser.add_argument("--expected-build", default="4007")
+    parser.add_argument("--expected-build", default="4008")
     parser.add_argument("--kind", choices=("ipa", "tipa"))
     parser.add_argument("--maximum-ios", default="17.0")
     parser.add_argument("--husk-commit")

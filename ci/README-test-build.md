@@ -1,6 +1,6 @@
 # Henge 0.4 test packages
 
-The test release is version **0.4.0**, build **4007**. This build setup starts
+The test release is version **0.4.0**, build **4008**. This build setup starts
 from the successful `2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f` workflow and
 keeps its `xcode-27` runner and dependency build procedure. It does not contain
 a prebuilt 0.4 app. A successful macOS build is required to produce one.
@@ -18,7 +18,7 @@ TrollStore **Henge.tipa** first, and uploads it with a JSON manifest and SHA-256
 checksum. Select `include_ipa` only if an additional sideloading IPA is needed.
 On `litebeyond123/Henge`, a successful push build of
 `work/0.4-ipados17-test` also publishes the validated package as the
-`v0.4.0-test6` prerelease. The publication job checks the package digest,
+`v0.4.0-test7` prerelease. The publication job checks the package digest,
 version, build and full source commit against this run's manifest before
 uploading it. That separate job alone has repository write permission.
 Other repositories and branches only receive build artifacts. The workflow
@@ -32,12 +32,20 @@ The build runs the package-validator regression tests, host-services tests,
 small-surface layout/Metal tests, Foundation-only Swift diagnostics tests,
 helper install/rollback and health/status checks, reduced-load resource policy
 checks, and the Swift/Objective-C guest Chat summary protocol tests before compiling the
-app. Test 6 also requires a real macOS unified-log roundtrip using a bounded,
+app. The retained diagnostics gate requires a real macOS unified-log roundtrip using a bounded,
 UUID-scoped synthetic event; no raw runtime log output is published. A missing compatible Metal device is reported
 as a native pixel-test skip, not a pass. Logs are
 uploaded even when a subsequent build or validation step fails. The log
 artifact includes source/toolchain provenance and separate Xcode logs for TIPA
 and IPA packaging.
+
+Test 7 adds the bounded authentication queue, fixed-schema HTTP transport,
+synthetic Objective-C DeviceCheck/BAA backend tests, isolated signer process
+cleanup checks, and a real DYLD load into an owned synthetic macOS fixture.
+These tests do not use an Apple account or generate real attestation material.
+The package validator requires the signed iOS signer and both signed macOS
+adapter resources. Signer-only entitlements must remain absent from Henge's
+main executable. Usage and limitations are in `docs/release-test7.md`.
 
 ## Local checks
 
@@ -61,7 +69,7 @@ installer receipts and helper startup transitions immediately in the native log;
 see `docs/release-test4.1.md`.
 
 Validate an actual downloaded build against the full source commit used by its
-workflow. The default expected version/build are 0.4.0/4007:
+workflow. The default expected version/build are 0.4.0/4008:
 
 ```sh
 python3 ci/validate-package.py /path/to/Henge.tipa \

@@ -146,7 +146,7 @@ class HostServicesTests(unittest.TestCase):
         if sys.platform != "darwin":
             compat = ROOT / "tests/share_posix_compat"
             command += ["-D_GNU_SOURCE", "-I" + str(compat), "-include", str(compat / "compat.h")]
-        command += [str(ROOT / "tests/host_services_driver.c"), "-o", str(cls.executable)]
+        command += [str(ROOT / "tests/host_services_driver.c"), str(ROOT / "host/device_auth.c"), "-o", str(cls.executable)]
         subprocess.run(command, check=True)
 
     @classmethod

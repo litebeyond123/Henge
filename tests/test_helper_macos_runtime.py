@@ -116,7 +116,7 @@ def main():
         helper = args.helper.resolve()
     if args.mode == "app" and matching_pids(helper):
         raise GateError("test_app_already_running")
-    expected_version = args.expected_version or ("henge-agent 4" if args.mode == "legacy" else "henge-agent 6")
+    expected_version = args.expected_version or ("henge-agent 4" if args.mode == "legacy" else "henge-agent 7")
     command(["/usr/bin/codesign", "--verify", "--strict", app or helper])
     if command([helper, "--version"]).stdout.strip() != expected_version:
         raise GateError("helper_version_mismatch")
@@ -160,7 +160,7 @@ def main():
         (inputs / "request.json").write_text(json.dumps(request))
         executable = directory / "server"
         command(["/usr/bin/xcrun", "--sdk", "macosx", "clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
-                 ROOT / "tests/helper_runtime_driver.c", "-o", executable], timeout=60)
+                 ROOT / "tests/helper_runtime_driver.c", ROOT / "host/device_auth.c", "-o", executable], timeout=60)
         unix_socket = directory / "s.sock"
         driver = subprocess.Popen([str(executable), str(shared), str(unix_socket), session],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

@@ -19,6 +19,7 @@ settings:
     SWIFT_OPTIMIZATION_LEVEL: "-O"
     GCC_OPTIMIZATION_LEVEL: "2"
     CLANG_C_LANGUAGE_STANDARD: c11
+    CLANG_ENABLE_OBJC_ARC: YES
 
 targets:
   Henge:
@@ -31,6 +32,7 @@ targets:
           - "Info.plist"
           - "Henge.entitlements"
           - "Henge.personal.entitlements"
+          - "Native/HengeAuthSigner.entitlements"
           - "AppIcon.icon/**"
           - "AppIcon.icon"
       - path: Henge/Resources
@@ -87,6 +89,8 @@ targets:
           - "AVFAudio"
           - "-framework"
           - "CoreFoundation"
+          - "-framework"
+          - "Security"
     dependencies:
       # Built-in StikJIT's debugger process. Embedded into PlugIns/.
       - target: HengeJITHelper
@@ -95,7 +99,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz build/henge-helper.app.tar.gz
+          make ios-lib build/henge-agent.gz build/henge-helper.app.tar.gz build/ios/henge-auth-signer
           ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:
@@ -103,6 +107,8 @@ targets:
         # What runs inside macOS for the clipboard and shared folder (tools/henge-agent.m).
         script: |
           set -e
+          mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/Helpers"
+          cp "$SRCROOT/../build/ios/henge-auth-signer" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/Helpers/henge-auth-signer"
           cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
           cp "$SRCROOT/../build/henge-helper.app.tar.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-helper.app.tar.gz"
         basedOnDependencyAnalysis: false

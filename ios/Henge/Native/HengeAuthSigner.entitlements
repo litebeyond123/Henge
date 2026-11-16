@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Restricted to the one-shot signer executable, never Henge's VM/UI process.
+         These are the actual signer keys observed in the supplied deb. An entitlement
+         being embedded does not establish that iPadOS authorizes the service. -->
+    <key>com.apple.mobileactivationd.device-identifiers</key><true/>
+    <key>com.apple.mobileactivationd.spi</key><true/>
+    <key>com.apple.security.attestation.access</key><true/>
+    <key>keychain-access-groups</key><array><string>2bit-identity</string></array>
+    <key>com.apple.private.security.no-sandbox</key><true/>
+    <key>platform-application</key><true/>
+</dict>
+</plist>

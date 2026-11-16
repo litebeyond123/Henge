@@ -47,7 +47,7 @@ grep -E "BUILD" "$BUILD_LOG" || true
 APP="$DD/Build/Products/Release-iphoneos/Henge.app"
 rc=0
 for f in "$APP/Henge" "$APP/henge-jit.js" "$APP/PlugIns/HengeJITHelper.appex/HengeJITHelper" \
-         "$APP/Frameworks/StikJIT.framework/StikJIT" "$APP/Frameworks/StikJIT.framework/Info.plist"; do
+         "$APP/Helpers/henge-auth-signer" "$APP/Frameworks/StikJIT.framework/StikJIT" "$APP/Frameworks/StikJIT.framework/Info.plist"; do
     if [ -f "$f" ]; then printf "  ok       %s\n" "${f#$APP/}"; else echo "  MISSING  ${f#$APP/}" >&2; rc=1; fi
 done
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
@@ -74,6 +74,8 @@ fi
 sign() { codesign --force --sign - --timestamp=none "$@"; }
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
 for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done
+sign --entitlements "$IOS/Henge/Native/HengeAuthSigner.entitlements" "$SAPP/Helpers/henge-auth-signer"
+codesign --verify --strict "$SAPP/Helpers/henge-auth-signer"
 sign --entitlements "$ENT" "$SAPP"
 codesign --verify --deep --strict "$SAPP"
 EMBEDDED=$(codesign -d --entitlements - "$SAPP" 2>&1 || true)
@@ -85,6 +87,6 @@ done
 python3 "$IOS/../ci/validate-package.py" "$STAGE/package.tmp" \
     --kind "$KIND" --expected-commit "$SOURCE_COMMIT" \
     --expected-version "${HENGE_EXPECTED_VERSION:-0.4.0}" \
-    --expected-build "${HENGE_EXPECTED_BUILD:-4006}"
+    --expected-build "${HENGE_EXPECTED_BUILD:-4008}"
 mv -f "$STAGE/package.tmp" "$OUT" # atomic: a half-written IPA never sits where the good one was
 echo "==> $OUT ($(du -h "$OUT" | cut -f1))"

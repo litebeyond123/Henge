@@ -2,3 +2,6 @@
 #include "Native/henge-vm.h"
 #include "Native/HuskRPPairing.h"
 #include "hvsparse.h"
+#include "share.h"
+#include "device_auth.h"
+#include "Native/HengeAuthBridge.h"

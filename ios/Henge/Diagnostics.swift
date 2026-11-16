@@ -582,6 +582,8 @@ enum Diagnostics {
         run["memory_warning_count"] = memoryWarnings
         run["helper_health"] = Sharing.helperHealth.diagnostics
         run["clipboard_recently_seen"] = Sharing.helperRunning
+        run["device_auth_experiment"] = DeviceAuthSnapshot.state()
+        run["device_auth_backend"] = DeviceAuthSnapshot.backend()
         let footprint = result == KERN_SUCCESS ? String(info.phys_footprint) : "unavailable"
         let resident = result == KERN_SUCCESS ? String(info.resident_size) : "unavailable"
         HengeLog.log("diagnostics", "event=\(event) elapsed_s=\(Int(elapsed)) phys_bytes=\(footprint) resident_bytes=\(resident) allocation_headroom_bytes=\(headroom) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) memory_warnings=\(memoryWarnings)")
