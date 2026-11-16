@@ -339,7 +339,7 @@ int main(int argc, const char *argv[]) {
             return closedWindowFixture([NSString stringWithUTF8String:argv[2]], YES);
         NSDictionary *info = NSBundle.mainBundle.infoDictionary;
         NSString *scenario = info[@"HengeFixtureScenario"];
-        if ([@[@"hardened_filtered", @"early_exit", @"error_ready", @"loaded_then_exit"] containsObject:scenario ?: @""])
+        if ([@[@"hardened_policy_observation", @"early_exit", @"error_ready", @"loaded_then_exit"] containsObject:scenario ?: @""])
             return launchOutcomeFixture(scenario, info[@"HengeFixtureResultPath"]);
         return injectedFixture();
     }

@@ -28,9 +28,9 @@ MARKERS = (b"SYNTHETIC_TOKEN_DO_NOT_LOG", b"SYNTHETIC_SIGNATURE_DO_NOT_LOG",
            b"SYNTHETIC_COOKIE_DO_NOT_LOG")
 
 
-def command(arguments: list[str], *, env: dict[str, str], timeout: int = 90, expected: int = 0):
+def command(arguments: list[str], *, env: dict[str, str], timeout: int = 90, expected: int | None = 0):
     result = subprocess.run(arguments, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    if result.returncode != expected:
+    if expected is not None and result.returncode != expected:
         sys.stdout.buffer.write(result.stdout)
         sys.stderr.buffer.write(result.stderr)
         sys.stdout.flush()
@@ -191,10 +191,10 @@ def main() -> int:
         routed = {"public_success", "unsupported", "token_error", "empty_token", "mismatched_response",
                   "session_revoked", "baa_success", "baa_bad_input", "closed_window_restart"}
         held = {"closed_window_restart", "quit_refused", "quit_cancelled"}
-        outcomes = {"hardened_filtered", "early_exit", "error_ready", "loaded_then_exit"}
+        outcomes = {"hardened_policy_observation", "early_exit", "error_ready", "loaded_then_exit"}
         scenarios = ["public_success", "unsupported", "token_error", "empty_token", "mismatched_response",
                      "session_revoked", "baa_success", "baa_bad_input", "identity_mismatch",
-                     "hardened_filtered", "closed_window_restart", "quit_refused", "quit_cancelled",
+                     "hardened_policy_observation", "closed_window_restart", "quit_refused", "quit_cancelled",
                      "early_exit", "error_ready", "loaded_then_exit"]
         for scenario in scenarios:
             case = folder / scenario
@@ -209,7 +209,7 @@ def main() -> int:
                     "HengeFixtureScenario": scenario, "HengeFixtureResultPath": str(result_path)}
             (application / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
             entitlements = {"com.apple.security.cs.disable-library-validation": True}
-            if scenario != "hardened_filtered":
+            if scenario != "hardened_policy_observation":
                 entitlements["com.apple.security.cs.allow-dyld-environment-variables"] = True
             entitlements_path = case / "fixture-entitlements.plist"
             entitlements_path.write_bytes(plistlib.dumps(entitlements))
@@ -256,8 +256,15 @@ def main() -> int:
                         raise AssertionError("owned fixture did not confirm its closed window and exact main PID")
                 invocation = [str(case_launcher), "--session", service.session, "--launch-id", service.launch_id,
                               "--mode", service.mode]
-                run = command(invocation, env=child_env, timeout=50, expected=0 if scenario in routed else 1)
-                if scenario in routed or scenario in outcomes - {"hardened_filtered"}:
+                # The real OS, not the static predictor, decides whether this
+                # self-owned ad-hoc signed app loads the adapter. Verify either
+                # result against its actual fixed handshake/backend evidence.
+                expected = None if scenario == "hardened_policy_observation" else (0 if scenario in routed else 1)
+                run = command(invocation, env=child_env, timeout=50, expected=expected)
+                if scenario == "hardened_policy_observation" and run.returncode not in {0, 1}:
+                    raise AssertionError(f"hardened fixture launcher failed unexpectedly ({run.returncode})")
+                if (scenario in routed or scenario in outcomes - {"hardened_policy_observation"} or
+                        scenario == "hardened_policy_observation" and run.returncode == 0):
                     deadline = time.monotonic() + 12
                     while not result_path.exists() and time.monotonic() < deadline:
                         time.sleep(0.05)
@@ -296,8 +303,8 @@ def main() -> int:
                 else:
                     observations = {"target_process_running" if scenario in held else "target_process_not_running",
                                     "policy_runtime_on", "policy_library_exception_on",
-                                    "policy_dyld_env_not_allowed" if scenario == "hardened_filtered" else "policy_dyld_env_allowed",
-                                    "policy_predicts_restriction" if scenario == "hardened_filtered" else "policy_predicts_permission"}
+                                    "policy_dyld_env_not_allowed" if scenario == "hardened_policy_observation" else "policy_dyld_env_allowed",
+                                    "policy_predicts_restriction" if scenario == "hardened_policy_observation" else "policy_predicts_permission"}
                     if not observations <= stages or not observations <= server_stages:
                         raise AssertionError(f"{scenario}: verified preflight facts were not delivered to host")
                     if len(stages & {"policy_library_flag_on", "policy_library_flag_off"}) != 1 or "policy_flags_unavailable" in stages:
@@ -316,11 +323,26 @@ def main() -> int:
                     if scenario == "closed_window_restart" and not {"quit_requested", "quit_completed"} <= stages:
                         raise AssertionError("closed-window process was not normally quit before the cold launch")
                 elif scenario in outcomes:
-                    if "launch_started" not in stages or service.operations:
-                        raise AssertionError(f"{scenario}: did not perform one OS launch with zero backend calls")
-                    if scenario == "hardened_filtered":
-                        if "adapter_loaded" in stages or "adapter_ready" in stages or not stages & {"target_exited_before_adapter", "adapter_not_loaded"}:
-                            raise AssertionError("actual hardened launch did not produce a no-handshake outcome")
+                    if "launch_started" not in stages:
+                        raise AssertionError(f"{scenario}: did not perform one actual OS launch")
+                    if scenario == "hardened_policy_observation":
+                        ready = [event for event in events if event["stage"] == "adapter_ready"]
+                        if run.returncode == 0:
+                            if ("adapter_loaded" not in stages or not ready or not service.operations["probe"] or
+                                    any(type(event["errorCode"]) is not int or event["errorCode"] != 0 or event["errorDomain"] != "" for event in ready)):
+                                raise AssertionError("allowed hardened launch lacked actual successful readiness/probe evidence")
+                            if set(service.operations) != {"probe"}:
+                                raise AssertionError("policy-observation fixture unexpectedly generated authentication material")
+                        elif ("adapter_loaded" in stages or ready or service.operations or
+                              not stages & {"target_exited_before_adapter", "adapter_not_loaded"}):
+                            raise AssertionError("hardened launch failure lacked a consistent no-handshake outcome")
+                        print("hardened OS observation " + json.dumps({
+                            "static_prediction": "restriction", "launcher_exit": run.returncode,
+                            "adapter_loaded": "adapter_loaded" in stages, "adapter_ready": bool(ready),
+                            "probe_calls": service.operations["probe"],
+                        }, sort_keys=True), flush=True)
+                    elif service.operations:
+                        raise AssertionError(f"{scenario}: failed-handshake fixture unexpectedly called a backend")
                     elif scenario == "early_exit":
                         if "target_exited_before_adapter" not in stages or "adapter_loaded" in stages:
                             raise AssertionError("intentional target exit was not distinct from adapter initialization")
