@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import struct
 import subprocess
@@ -69,9 +70,9 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
     return header + commands + sign
 
 
-def guest_app_archive(binary=None, extra=None):
+def guest_app_archive(binary=None, extra=None, build="8"):
     info = {"CFBundleIdentifier": "com.henge.guesthelper", "CFBundleExecutable": "henge-agent",
-            "CFBundleVersion": "7", "CFBundlePackageType": "APPL", "LSUIElement": True,
+            "CFBundleVersion": build, "CFBundlePackageType": "APPL", "LSUIElement": True,
             "LSMinimumSystemVersion": "13.0", "NSLocalNetworkUsageDescription": "Connect to Henge."}
     files = {"Henge Helper.app/Contents/Info.plist": plistlib.dumps(info),
              "Henge Helper.app/Contents/MacOS/henge-agent": binary if binary is not None else macho(platform=1, minimum=0x0D0000),
@@ -145,6 +146,20 @@ class PackageTests(unittest.TestCase):
             files["henge-helper.app.tar.gz"] = guest_app_archive(binary)
             self.write(files)
             with self.assertRaises(validator.InvalidPackage):
+                self.validate()
+
+    def test_guest_build_tracks_actual_runtime_and_rejects_stale_archive(self):
+        header = (ROOT / "tools/helper-version.h").read_text()
+        runtime = re.search(r"^#define HENGE_HELPER_VERSION ([0-9]+)$", header, re.M)
+        self.assertIsNotNone(runtime)
+        self.assertEqual(validator.EXPECTED_HELPER_BUILD, runtime.group(1))
+        bundle = plistlib.loads((ROOT / "tools/HengeHelper-Info.plist").read_bytes())
+        self.assertEqual(bundle["CFBundleVersion"], validator.EXPECTED_HELPER_BUILD)
+        for stale in ("7", "9", 8):
+            files = members()
+            files["henge-helper.app.tar.gz"] = guest_app_archive(build=stale)
+            self.write(files)
+            with self.assertRaisesRegex(validator.InvalidPackage, "Guest app build mismatch"):
                 self.validate()
 
     def test_signer_is_required_and_privileges_stay_in_child(self):

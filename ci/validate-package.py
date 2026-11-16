@@ -29,6 +29,7 @@ BANNED_ENTITLEMENTS = frozenset({
     "com.apple.private.skip-library-validation",
 })
 APP = "Payload/Henge.app/"
+EXPECTED_HELPER_BUILD = "8"
 REQUIRED = (
     "Helpers/henge-auth-signer", "Info.plist", "Henge", "henge-jit.js", "henge-agent.gz", "henge-helper.app.tar.gz", "guest-chat-diagnostics.command",
     "PlugIns/HengeJITHelper.appex/Info.plist",
@@ -229,8 +230,10 @@ def inspect_guest_app(data):
                         "Resources/henge-auth-adapter.dylib", "_CodeSignature/CodeResources")),
                 "Guest app archive is missing its bundle or signature resources")
         info = plistlib.loads(files[base + "Info.plist"])
+        require(info.get("CFBundleVersion") == EXPECTED_HELPER_BUILD,
+                f"Guest app build mismatch: expected {EXPECTED_HELPER_BUILD}")
         require(info.get("CFBundleIdentifier") == "com.henge.guesthelper" and
-                info.get("CFBundleExecutable") == "henge-agent" and info.get("CFBundleVersion") == "7" and
+                info.get("CFBundleExecutable") == "henge-agent" and
                 info.get("CFBundlePackageType") == "APPL" and info.get("LSUIElement") is True and
                 isinstance(info.get("NSLocalNetworkUsageDescription"), str) and
                 bool(info["NSLocalNetworkUsageDescription"].strip()), "Guest app identity or privacy description is invalid")
