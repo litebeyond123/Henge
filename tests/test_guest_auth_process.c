@@ -1,9 +1,11 @@
 #include "guest-auth-process.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static unsigned checks;
@@ -80,17 +82,44 @@ static void comparisonTests(void) {
     printf("PASS: %u pure process-identity checks\n", checks);
 }
 
+static void canonicalPathTests(void) {
+    char directory[] = "/tmp/henge-path-tests.XXXXXX";
+    require(mkdtemp(directory) != NULL, "owned path directory");
+    char file[4096], alias[4096], missing[4096], notDirectory[4096];
+    require(snprintf(file, sizeof(file), "%s/file", directory) < (int)sizeof(file), "owned file path bounded");
+    require(snprintf(alias, sizeof(alias), "%s/alias", directory) < (int)sizeof(alias), "owned alias path bounded");
+    require(snprintf(missing, sizeof(missing), "%s/missing", directory) < (int)sizeof(missing), "missing path bounded");
+    require(snprintf(notDirectory, sizeof(notDirectory), "%s/child", file) < (int)sizeof(notDirectory), "non-directory path bounded");
+    int fd = open(file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    require(fd >= 0 && close(fd) == 0, "owned canonical target created");
+    require(symlink(file, alias) == 0, "owned alias created");
+    char direct[HENGE_AUTH_PROCESS_PATH_CAPACITY], resolved[HENGE_AUTH_PROCESS_PATH_CAPACITY];
+    require(HengeAuthProcessCanonicalizePath(file, direct) == 0, "canonicalize existing absolute target");
+    require(HengeAuthProcessCanonicalizePath(alias, resolved) == 0, "canonicalize existing absolute alias");
+    require(!strcmp(direct, resolved), "same target aliases have one canonical identity");
+    strcpy(resolved, alias);
+    require(HengeAuthProcessCanonicalizePath(resolved, resolved) == 0 && !strcmp(direct, resolved), "in-place canonicalization is safe");
+    require(HengeAuthProcessCanonicalizePath(missing, resolved) == ENOENT && !resolved[0], "missing target fails with empty output and ENOENT");
+    require(HengeAuthProcessCanonicalizePath(notDirectory, resolved) == ENOTDIR && !resolved[0], "non-directory fails with real errno");
+    require(HengeAuthProcessCanonicalizePath("relative/path", resolved) == EINVAL && !resolved[0], "relative path rejected");
+    require(HengeAuthProcessCanonicalizePath(NULL, resolved) == EINVAL && !resolved[0], "null input rejected");
+    require(HengeAuthProcessCanonicalizePath(file, NULL) == EINVAL, "null output rejected");
+    require(unlink(file) == 0, "remove owned target");
+    require(HengeAuthProcessCanonicalizePath(alias, resolved) == ENOENT && !resolved[0], "dangling alias never supplies trusted path");
+    require(unlink(alias) == 0 && rmdir(directory) == 0, "owned path test cleanup");
+    printf("PASS: %u comparison and POSIX path checks\n", checks);
+}
+
 #if defined(__APPLE__)
-#include <fcntl.h>
 #include <libproc.h>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 
 extern char **environ;
+extern int HengeTestFoundationResolvedPath(const char *path, char *output, size_t capacity);
 typedef struct { pid_t pid; int input; int output; int reaped; } OwnedChild;
 static OwnedChild children[2] = {{.input = -1, .output = -1}, {.input = -1, .output = -1}};
 static double now(void) {
@@ -155,12 +184,27 @@ static void kernelTests(const char *executable, const char *unrelated, const cha
     require(original.pid == children[0].pid && original.start_seconds > 0 && original.start_microseconds < 1000000, "kernel birth captured");
     require(original.uid == geteuid() && original.real_uid == getuid(), "kernel ownership captured");
     stateIs(HengeAuthProcessCheck(&original, &observation), HENGE_AUTH_PROCESS_ALIVE, "owned identity remains live");
+    /* The runner deliberately builds in /var/tmp. Both names must identify the
+     * same owned process, not merely return equal strings in a mock. */
+    require(!strncmp(executable, "/var/tmp/", 9) && !strncmp(canonical, "/private/var/tmp/", 17), "owned fixture exercises var and private-var aliases");
+    HengeAuthProcessIdentity aliased;
+    stateIs(HengeAuthProcessCapture(children[0].pid, executable, geteuid(), &aliased, &observation), HENGE_AUTH_PROCESS_ALIVE, "capture owned process through var alias");
+    require(!strcmp(aliased.executable_path, original.executable_path) &&
+        aliased.start_seconds == original.start_seconds && aliased.start_microseconds == original.start_microseconds,
+        "alias preserves canonical executable and kernel lifetime");
+    char foundationPath[HENGE_AUTH_PROCESS_PATH_CAPACITY];
+    require(HengeTestFoundationResolvedPath(executable, foundationPath, sizeof(foundationPath)) == 0, "read actual Foundation path standardization");
+    stateIs(HengeAuthProcessCapture(children[0].pid, foundationPath, geteuid(), &aliased, &observation), HENGE_AUTH_PROCESS_ALIVE, "Foundation path resolves to same owned process");
     stateIs(HengeAuthProcessCapture(children[0].pid, unrelatedCanonical, geteuid(), &rejected, &observation), HENGE_AUTH_PROCESS_REPLACED, "real executable path mismatch");
     require(rejected.pid == 0, "mismatch never fills trusted identity");
     stateIs(HengeAuthProcessCapture(children[0].pid, canonical, geteuid() + 1, &rejected, &observation), HENGE_AUTH_PROCESS_UNAVAILABLE, "other UID request fails closed");
     size_t count = 0;
     stateIs(HengeAuthProcessListMatching(canonical, geteuid(), identities, 8, &count, &observation), HENGE_AUTH_PROCESS_ALIVE, "fresh kernel census");
     require(hasPID(identities, count, getpid()) && hasPID(identities, count, children[0].pid), "census includes parent and owned child");
+    stateIs(HengeAuthProcessListMatching(executable, geteuid(), identities, 8, &count, &observation), HENGE_AUTH_PROCESS_ALIVE, "census accepts var alias");
+    require(hasPID(identities, count, children[0].pid), "alias census retains exact owned target");
+    stateIs(HengeAuthProcessListMatching(foundationPath, geteuid(), identities, 8, &count, &observation), HENGE_AUTH_PROCESS_ALIVE, "census accepts actual Foundation path");
+    require(hasPID(identities, count, children[0].pid), "Foundation census retains exact owned target");
     stateIs(HengeAuthProcessListMatching(canonical, geteuid(), identities, 1, &count, &observation), HENGE_AUTH_PROCESS_UNAVAILABLE, "truncated matching capacity is unknown");
     require(count == 0 && observation.error_number == EOVERFLOW, "truncation cannot report absence");
     stateIs(HengeAuthProcessListMatching(unrelatedCanonical, geteuid(), identities, 8, &count, &observation), HENGE_AUTH_PROCESS_EXITED, "complete census of unused fixture absent");
@@ -216,6 +260,7 @@ int main(int argc, char **argv) {
         }
     }
     comparisonTests();
+    canonicalPathTests();
 #if defined(__APPLE__)
     require(argc == 3, "owned fixture path arguments");
     kernelTests(argv[0], argv[1], argv[2]);

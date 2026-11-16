@@ -37,9 +37,18 @@ typedef struct {
     int identity_available, zombie;
 } HengeAuthProcessObservation;
 
+/* One path representation for the kernel reader and AppKit callers. Returns 0
+ * and an absolute POSIX realpath on success, or errno with an empty output.
+ * The caller supplies HENGE_AUTH_PROCESS_PATH_CAPACITY bytes. No path is logged.
+ * This resolves filesystem aliases; it does not validate an app's identity. */
+int HengeAuthProcessCanonicalizePath(const char *absolutePath,
+    char output[HENGE_AUTH_PROCESS_PATH_CAPACITY]);
+
 /* The caller first validates the original app's complete signature and exact
- * executable path. Only ALIVE fills outIdentity. Unknown never means absent. */
-HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedCanonicalExe,
+ * executable path. Absolute aliases are canonicalized before exact comparison;
+ * only ALIVE fills outIdentity, always with its canonical executable path.
+ * Unknown never means absent. */
+HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedExecutablePath,
     uid_t expectedUID, HengeAuthProcessIdentity *outIdentity, HengeAuthProcessObservation *observation);
 HengeAuthProcessState HengeAuthProcessCheck(const HengeAuthProcessIdentity *identity,
     HengeAuthProcessObservation *observation);
@@ -50,7 +59,7 @@ HengeAuthProcessState HengeAuthProcessCheck(const HengeAuthProcessIdentity *iden
  * Results are a snapshot, not a process handle: recheck immediately before
  * requesting termination of the original NSRunningApplication. This module
  * never sends a signal and never chooses a replacement instance to terminate. */
-HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedCanonicalExe,
+HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedExecutablePath,
     uid_t expectedUID, HengeAuthProcessIdentity *outIdentities, size_t capacity,
     size_t *count, HengeAuthProcessObservation *observation);
 

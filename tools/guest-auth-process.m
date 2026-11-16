@@ -18,6 +18,22 @@ static int validPath(const char *path) {
         strnlen(path, HENGE_AUTH_PROCESS_PATH_CAPACITY) < HENGE_AUTH_PROCESS_PATH_CAPACITY;
 }
 
+int HengeAuthProcessCanonicalizePath(const char *absolutePath,
+    char output[HENGE_AUTH_PROCESS_PATH_CAPACITY]) {
+    if (!output) return EINVAL;
+    if (!validPath(absolutePath)) { output[0] = '\0'; return EINVAL; }
+    errno = 0;
+    char *canonical = realpath(absolutePath, NULL);
+    if (!canonical) { int error = errno ?: EIO; output[0] = '\0'; return error; }
+    size_t length = strlen(canonical);
+    if (length >= HENGE_AUTH_PROCESS_PATH_CAPACITY) {
+        free(canonical); output[0] = '\0'; return ENAMETOOLONG;
+    }
+    memcpy(output, canonical, length + 1);
+    free(canonical);
+    return 0;
+}
+
 static int validNumbers(const HengeAuthProcessIdentity *identity) {
     return identity && identity->pid > 0 && identity->start_seconds > 0 &&
         identity->start_microseconds < 1000000;
@@ -121,24 +137,20 @@ static void readSample(pid_t pid, uid_t expectedUID, const char *candidatePath,
     int pathError = errno;
     int pathValid = length > 0 && (size_t)length < sizeof(path) &&
         path[0] == '/' && strnlen(path, sizeof(path)) == (size_t)length;
-    char *canonical = NULL;
+    char canonical[HENGE_AUTH_PROCESS_PATH_CAPACITY] = {0};
     if (pathValid) {
         /* proc_pidpath gets the path from the executable text vnode, not argv
-         * or a process name. A known different path in a census is enough to
-         * exclude that instance: do not require an unrelated temporary file
-         * still to exist. Only a candidate is canonicalized and retained.
+         * or a process name. Normalize both sides before comparing, including
+         * aliases such as /var and /private/var. If an unrelated temporary file
+         * no longer exists, a known different vnode path still excludes it.
          * If the kernel cannot return any path, absence remains unproven. */
-        if (candidatePath && strcmp(path, candidatePath)) {
+        pathError = HengeAuthProcessCanonicalizePath(path, canonical);
+        if (pathError && candidatePath && strcmp(path, candidatePath)) {
             memcpy(sample->identity.executable_path, path, (size_t)length + 1);
-        } else {
-            errno = 0;
-            canonical = realpath(path, NULL);
-            pathError = errno;
         }
     }
     error = readBSD(pid, &after);
     if (error) {
-        free(canonical);
         sample->kind = error == ESRCH ? HENGE_AUTH_PROCESS_SAMPLE_ABSENT : HENGE_AUTH_PROCESS_SAMPLE_UNAVAILABLE;
         sample->error_number = error;
         return;
@@ -146,42 +158,34 @@ static void readSample(pid_t pid, uid_t expectedUID, const char *candidatePath,
     HengeAuthProcessIdentity original = sample->identity;
     copyBSD(&after, sample);
     if (!sameLifetime(&original, &sample->identity)) {
-        free(canonical);
         sample->kind = HENGE_AUTH_PROCESS_SAMPLE_CHANGED_DURING_READ;
         return;
     }
-    if (sample->zombie) { free(canonical); sample->kind = HENGE_AUTH_PROCESS_SAMPLE_PRESENT; return; }
+    if (sample->zombie) { sample->kind = HENGE_AUTH_PROCESS_SAMPLE_PRESENT; return; }
     if (!pathValid) {
         sample->error_number = pathError ?: EIO;
         return; // A path failure alone does not prove that the process exited.
     }
-    if (candidatePath && strcmp(path, candidatePath)) {
+    if (pathError && candidatePath && strcmp(path, candidatePath)) {
         sample->kind = HENGE_AUTH_PROCESS_SAMPLE_PRESENT;
         return;
     }
-    if (!canonical) { sample->error_number = pathError ?: EIO; return; }
-    size_t canonicalLength = strlen(canonical);
-    if (canonicalLength >= sizeof(sample->identity.executable_path)) {
-        free(canonical); sample->error_number = ENAMETOOLONG; return;
-    }
-    memcpy(sample->identity.executable_path, canonical, canonicalLength + 1);
-    free(canonical);
+    if (pathError) { sample->error_number = pathError; return; }
+    memcpy(sample->identity.executable_path, canonical, strlen(canonical) + 1);
     sample->kind = HENGE_AUTH_PROCESS_SAMPLE_PRESENT;
 }
 
-static int canonicalExpected(const char *path, uid_t uid) {
-    if (!validPath(path) || uid != geteuid() || getuid() != geteuid()) return EINVAL;
-    char *canonical = realpath(path, NULL);
-    if (!canonical) return errno ?: EIO;
-    int error = strcmp(canonical, path) ? EINVAL : 0;
-    free(canonical);
-    return error;
+static int canonicalExpected(const char *path, uid_t uid,
+    char canonical[HENGE_AUTH_PROCESS_PATH_CAPACITY]) {
+    if (uid != geteuid() || getuid() != geteuid()) return EINVAL;
+    return HengeAuthProcessCanonicalizePath(path, canonical);
 }
 
-HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedCanonicalExe,
+HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedExecutablePath,
     uid_t expectedUID, HengeAuthProcessIdentity *outIdentity, HengeAuthProcessObservation *observation) {
     if (outIdentity) memset(outIdentity, 0, sizeof(*outIdentity));
-    int error = pid > 0 && outIdentity ? canonicalExpected(expectedCanonicalExe, expectedUID) : EINVAL;
+    char expectedCanonicalExe[HENGE_AUTH_PROCESS_PATH_CAPACITY] = {0};
+    int error = pid > 0 && outIdentity ? canonicalExpected(expectedExecutablePath, expectedUID, expectedCanonicalExe) : EINVAL;
     if (error) return observed(HENGE_AUTH_PROCESS_UNAVAILABLE, NULL, error, observation);
     HengeAuthProcessSample sample;
     readSample(pid, expectedUID, NULL, &sample);
@@ -217,11 +221,13 @@ static double monotonic(void) {
     return (double)time.tv_sec + time.tv_nsec / 1e9;
 }
 
-HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedCanonicalExe,
+HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedExecutablePath,
     uid_t expectedUID, HengeAuthProcessIdentity *outIdentities, size_t capacity,
     size_t *count, HengeAuthProcessObservation *observation) {
     if (count) *count = 0;
-    int error = outIdentities && count && capacity && capacity <= 64 ? canonicalExpected(expectedCanonicalExe, expectedUID) : EINVAL;
+    char expectedCanonicalExe[HENGE_AUTH_PROCESS_PATH_CAPACITY] = {0};
+    int error = outIdentities && count && capacity && capacity <= 64
+        ? canonicalExpected(expectedExecutablePath, expectedUID, expectedCanonicalExe) : EINVAL;
     if (error) return observed(HENGE_AUTH_PROCESS_UNAVAILABLE, NULL, error, observation);
     memset(outIdentities, 0, capacity * sizeof(*outIdentities));
     enum { MaxPIDs = 8192, MinimumPIDs = 128, CensusAttempts = 3 };

@@ -47,6 +47,12 @@ static NSError *processObservationError(const HengeAuthProcessObservation *obser
         ? [NSError errorWithDomain:NSPOSIXErrorDomain code:observation->error_number userInfo:nil]
         : HengeAuthError(ProcessIdentityUnavailable);
 }
+static NSString *canonicalPath(NSString *path) {
+    if (!path.length) return nil;
+    char canonical[HENGE_AUTH_PROCESS_PATH_CAPACITY];
+    if (HengeAuthProcessCanonicalizePath(path.fileSystemRepresentation, canonical)) return nil;
+    return [NSString stringWithUTF8String:canonical];
+}
 double HengeAuthMonotonic(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -103,7 +109,7 @@ void HengeAuthCaptureTestConfiguration(void) {
     }
     const char *logs = getenv("HENGE_AUTH_TEST_LOG_DIRECTORY"), *fixture = getenv("HENGE_AUTH_TEST_APP");
     if (logs && strlen(logs) < PATH_MAX) testLogDirectory = [NSString stringWithUTF8String:logs];
-    if (fixture && strlen(fixture) < PATH_MAX) testFixturePath = [[NSString stringWithUTF8String:fixture] stringByResolvingSymlinksInPath];
+    if (fixture && strlen(fixture) < PATH_MAX) testFixturePath = canonicalPath([NSString stringWithUTF8String:fixture]);
 #endif
 }
 static int ready(int fd, short events, double deadline) {
@@ -393,12 +399,18 @@ NSDictionary *HengeAuthSignaturePolicySnapshot(NSDictionary *info) {
     return facts;
 }
 static BOOL expectedBundle(NSString *bundlePath) {
-    NSString *canonical = bundlePath.stringByResolvingSymlinksInPath;
+    NSString *canonical = canonicalPath(bundlePath);
+    if (!canonical) return NO;
 #ifdef HENGE_AUTH_TESTING
     if (testFixturePath) return [canonical isEqual:testFixturePath];
 #endif
-    return [canonical isEqual:@"/Applications/ChatGPT.app"] ||
-        [canonical isEqual:[[NSHomeDirectory() stringByAppendingPathComponent:@"Applications/ChatGPT.app"] stringByResolvingSymlinksInPath]];
+    // Only the same two fixed install locations are permitted. Filesystem
+    // aliases must resolve to one of them; no name or suffix matching is used.
+    for (NSString *path in @[@"/Applications/ChatGPT.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/ChatGPT.app"]]) {
+        NSString *allowed = canonicalPath(path);
+        if (allowed && [canonical isEqual:allowed]) return YES;
+    }
+    return NO;
 }
 static NSString *expectedIdentifier(void) {
 #ifdef HENGE_AUTH_TESTING
@@ -427,9 +439,9 @@ static NSDictionary *targetIdentityInformation(NSString *bundlePath, NSError **e
         ![executable isEqual:expectedExecutable()] || !bundle.executablePath) {
         if (error) *error = HengeAuthError(TargetIdentity); return nil;
     }
-    NSString *expected = [[bundlePath stringByAppendingPathComponent:
-        [@"Contents/MacOS" stringByAppendingPathComponent:expectedExecutable()]] stringByResolvingSymlinksInPath];
-    if (![bundle.executablePath.stringByResolvingSymlinksInPath isEqual:expected]) {
+    NSString *expected = canonicalPath([bundlePath stringByAppendingPathComponent:
+        [@"Contents/MacOS" stringByAppendingPathComponent:expectedExecutable()]]);
+    if (!expected || ![canonicalPath(bundle.executablePath) isEqual:expected]) {
         if (error) *error = HengeAuthError(TargetIdentity); return nil;
     }
     struct stat st;
@@ -461,7 +473,9 @@ static NSDictionary *targetPreflight(NSString *bundlePath, HengeAuthProcessIdent
     if (processFailure) *processFailure = NO;
     NSDictionary *info = targetIdentityInformation(bundlePath, error);
     if (!info) return nil;
-    NSString *executable = [NSBundle bundleWithPath:bundlePath].executablePath.stringByResolvingSymlinksInPath;
+    // The process module performs the same POSIX normalization. Do not first
+    // rewrite this path with Foundation's different path standardization.
+    NSString *executable = [NSBundle bundleWithPath:bundlePath].executablePath;
     HengeAuthProcessObservation observation = {0};
     HengeAuthProcessState processState = HengeAuthProcessListMatching(executable.fileSystemRepresentation,
         geteuid(), identities, 2, count, &observation);
@@ -481,9 +495,10 @@ NSDictionary *HengeAuthTargetPreflight(NSString *bundlePath, NSError **error) {
 }
 static NSRunningApplication *applicationForIdentity(NSString *bundlePath, const HengeAuthProcessIdentity *identity) {
     NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:identity->pid];
+    NSString *expected = canonicalPath(bundlePath);
     if (application.processIdentifier != identity->pid || ![application.bundleIdentifier isEqual:expectedIdentifier()] ||
-        ![application.bundleURL.path.stringByResolvingSymlinksInPath isEqual:bundlePath.stringByResolvingSymlinksInPath] ||
-        ![application.executableURL.path.stringByResolvingSymlinksInPath isEqual:[NSString stringWithUTF8String:identity->executable_path]]) return nil;
+        !expected || ![canonicalPath(application.bundleURL.path) isEqual:expected] ||
+        ![canonicalPath(application.executableURL.path) isEqual:[NSString stringWithUTF8String:identity->executable_path]]) return nil;
     // Kernel identity, checked immediately before action, is authoritative for
     // liveness. AppKit's terminated flag may lag and must not authorize a kill.
     return application;
@@ -492,9 +507,9 @@ BOOL HengeAuthCurrentProcessMatches(NSString *bundlePath, NSError **error) {
     if (error) *error = nil;
     char path[PATH_MAX]; uint32_t length = sizeof path;
     if (!expectedBundle(bundlePath) || _NSGetExecutablePath(path, &length) ||
-        ![[[NSString stringWithUTF8String:path] stringByResolvingSymlinksInPath]
-            isEqual:[[bundlePath stringByAppendingPathComponent:
-                [@"Contents/MacOS" stringByAppendingPathComponent:expectedExecutable()]] stringByResolvingSymlinksInPath]]) {
+        ![canonicalPath([NSString stringWithUTF8String:path])
+            isEqual:canonicalPath([bundlePath stringByAppendingPathComponent:
+                [@"Contents/MacOS" stringByAppendingPathComponent:expectedExecutable()]])]) {
         if (error) *error = HengeAuthError(TargetIdentity); return NO;
     }
     SecCodeRef selfCode = NULL;
@@ -651,16 +666,19 @@ static NSString *findTarget(void) {
 #ifdef HENGE_AUTH_TESTING
     if (testFixturePath) return testFixturePath;
 #endif
-    for (NSString *path in @[@"/Applications/ChatGPT.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/ChatGPT.app"]])
-        if ([NSFileManager.defaultManager fileExistsAtPath:path]) return path.stringByResolvingSymlinksInPath;
+    for (NSString *path in @[@"/Applications/ChatGPT.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/ChatGPT.app"]]) {
+        NSString *canonical = canonicalPath(path);
+        if (canonical) return canonical;
+    }
     return nil;
 }
 static NSString *resource(NSString *name) {
     NSString *path = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:name];
-    if ([NSFileManager.defaultManager fileExistsAtPath:path]) return path;
+    NSString *canonical = canonicalPath(path);
+    if (canonical) return canonical;
     // A command-line launcher's adapter is beside it inside the helper bundle.
     path = [[[NSProcessInfo.processInfo.arguments firstObject] stringByDeletingLastPathComponent] stringByAppendingPathComponent:name];
-    return [NSFileManager.defaultManager fileExistsAtPath:path] ? path.stringByResolvingSymlinksInPath : nil;
+    return canonicalPath(path);
 }
 static NSMutableDictionary *launchEnvironment(void) {
     NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
@@ -906,8 +924,8 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     HengeAuthProcessIdentity remaining[2] = {0};
     HengeAuthProcessObservation remainingObservation = {0};
     size_t remainingCount = 0;
-    NSString *canonicalExecutable = [NSBundle bundleWithPath:target].executablePath.stringByResolvingSymlinksInPath;
-    HengeAuthProcessState remainingState = HengeAuthProcessListMatching(canonicalExecutable.fileSystemRepresentation,
+    NSString *executable = [NSBundle bundleWithPath:target].executablePath;
+    HengeAuthProcessState remainingState = HengeAuthProcessListMatching(executable.fileSystemRepresentation,
         geteuid(), remaining, 2, &remainingCount, &remainingObservation);
     if (remainingState != HENGE_AUTH_PROCESS_ALIVE && remainingState != HENGE_AUTH_PROCESS_EXITED) {
         event(@"process_identity_unavailable", processObservationError(&remainingObservation)); return 1;
