@@ -300,14 +300,26 @@ NSDictionary *HengeAuthRequest(NSString *session, NSString *launchID, NSString *
     return HengeAuthDecodeResponse(data, status, session, launchID, requestID, operation, error);
 }
 
+static BOOL objectABI(const char *type) {
+    if (!type) return NO;
+    if (!strcmp(type, "@")) return YES;
+    // A typed block preserves class/protocol annotations (for example
+    // @"NSData"), whereas id is encoded as @. Both have the same object ABI.
+    // @? remains a distinct block parameter; pointers and scalars are rejected.
+    size_t length = strlen(type);
+    return length >= 3 && length <= 512 && type[0] == '@' && type[1] == '"' && type[length - 1] == '"';
+}
 BOOL HengeAuthMethodABI(Class cls, SEL selector, const char *returnType, NSUInteger objects, BOOL finalBlock) {
     Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
     if (!method || !method_getTypeEncoding(method)) return NO;
     @try {
         NSMethodSignature *s = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
         if (!s || strcmp(s.methodReturnType, returnType) || s.numberOfArguments != objects + 2) return NO;
-        for (NSUInteger i = 2; i < s.numberOfArguments; i++)
-            if (strcmp([s getArgumentTypeAtIndex:i], (finalBlock && i + 1 == s.numberOfArguments) ? "@?" : "@")) return NO;
+        for (NSUInteger i = 2; i < s.numberOfArguments; i++) {
+            const char *type = [s getArgumentTypeAtIndex:i];
+            if (finalBlock && i + 1 == s.numberOfArguments) { if (strcmp(type, "@?")) return NO; }
+            else if (!objectABI(type)) return NO;
+        }
         return YES;
     } @catch (__unused NSException *exception) { return NO; }
 }
@@ -328,8 +340,9 @@ BOOL HengeAuthCallbackABI(id callback, NSUInteger objects) {
     if (!signature) return NO;
     @try {
         NSMethodSignature *s = [NSMethodSignature signatureWithObjCTypes:signature];
-        if (!s || strcmp(s.methodReturnType, "v") || s.numberOfArguments != objects + 1) return NO;
-        for (NSUInteger i = 1; i < s.numberOfArguments; i++) if (strcmp([s getArgumentTypeAtIndex:i], "@")) return NO;
+        if (!s || strcmp(s.methodReturnType, "v") || s.numberOfArguments != objects + 1 ||
+            strcmp([s getArgumentTypeAtIndex:0], "@?")) return NO;
+        for (NSUInteger i = 1; i < s.numberOfArguments; i++) if (!objectABI([s getArgumentTypeAtIndex:i])) return NO;
         return YES;
     } @catch (__unused NSException *exception) { return NO; }
 }

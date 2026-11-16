@@ -102,6 +102,18 @@ static int unitTests(void) {
     void (^three)(id, id, id) = ^(id a, id b, id c) { (void)a; (void)b; (void)c; };
     check(HengeAuthCallbackABI(two, 2) && !HengeAuthCallbackABI(two, 3), "two-object callback ABI is exact");
     check(HengeAuthCallbackABI(three, 3) && !HengeAuthCallbackABI(three, 2), "three-object callback ABI is exact");
+    void (^typedTwo)(NSData *, NSError *) = ^(NSData *data, NSError *error) { (void)data; (void)error; };
+    void (^typedThree)(NSData *, NSDictionary *, NSError *) = ^(NSData *signature, NSDictionary *attestation, NSError *error) {
+        (void)signature; (void)attestation; (void)error;
+    };
+    void (^pointer)(void *, id) = ^(void *value, id other) { (void)value; (void)other; };
+    void (^scalar)(NSInteger, id) = ^(NSInteger value, id other) { (void)value; (void)other; };
+    void (^nestedBlock)(void (^)(void), id) = ^(void (^value)(void), id other) { (void)value; (void)other; };
+    check(HengeAuthCallbackABI(typedTwo, 2), "NSData/NSError callback accepts typed object encodings");
+    check(HengeAuthCallbackABI(typedThree, 3), "typed signature/attestation/error callback accepts object encodings");
+    check(!HengeAuthCallbackABI(pointer, 2), "raw pointer is not accepted as a callback object");
+    check(!HengeAuthCallbackABI(scalar, 2), "scalar is not accepted as a callback object");
+    check(!HengeAuthCallbackABI(nestedBlock, 2), "nested block is not accepted as an ordinary callback object");
     check(HengeAuthMethodABI(DCBAASigner.class, @selector(signatureForData:completion:), "v", 2, YES),
           "fixture private method has expected object/block ABI");
     NSString *flagsKey = (__bridge NSString *)kSecCodeInfoFlags, *entitlementsKey = (__bridge NSString *)kSecCodeInfoEntitlementsDict;

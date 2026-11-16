@@ -227,6 +227,14 @@ def main() -> int:
                         raise AssertionError(f"{scenario}: fixture did not finish")
                     result = json.loads(result_path.read_text())
                     if result.get("passed") is not True:
+                        safe_keys = {"stage", "errorDomain", "errorCode", "elapsedMs", "inputBytes", "resultBytes"}
+                        events_path = case / "logs/AuthExperiment.events.jsonl"
+                        if events_path.exists():
+                            for line in events_path.read_bytes().splitlines()[-32:]:
+                                value = json.loads(line)
+                                print("fixture event " + json.dumps({key: value[key] for key in safe_keys if key in value},
+                                                                  sort_keys=True), flush=True)
+                        print("fixture backend operations " + json.dumps(dict(service.operations), sort_keys=True), flush=True)
                         raise AssertionError(f"{scenario}: fixture assertions failed: {result}")
                 events_file = case / "logs/AuthExperiment.events.jsonl"
                 local_events = events_file.read_bytes()
