@@ -48,7 +48,7 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
 RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
 
 # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
-$(B)/henge-agent: tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h tools/helper-app.m tools/helper-app.h
+$(B)/henge-agent: tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h tools/helper-version.h tools/helper-app.m tools/helper-app.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework Network -framework ServiceManagement -framework Security tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-chat-diagnostics.m tools/helper-health.m tools/helper-app.m -o $@
 	codesign -f -s - $@
@@ -70,7 +70,7 @@ $(B)/test_guest_chat_diagnostics_macos_runtime: tests/test_guest_chat_diagnostic
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -DHENGE_CHAT_DIAGNOSTICS_TEST -framework Foundation tests/test_guest_chat_diagnostics_macos_runtime.m tools/guest-chat-diagnostics.m -o $@
 
-$(B)/test_helper_health: tests/test_helper_health.m tools/helper-health.m tools/helper-health.h
+$(B)/test_helper_health: tests/test_helper_health.m tools/helper-health.m tools/helper-health.h tools/helper-version.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework Foundation tests/test_helper_health.m tools/helper-health.m -o $@
 

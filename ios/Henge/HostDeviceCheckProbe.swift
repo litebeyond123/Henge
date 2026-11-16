@@ -11,8 +11,9 @@ enum HostDeviceCheckProbe {
         var result: [String: Any] = [
             "scope": "henge_host_process",
             "api": "DCDevice.current.isSupported",
-            "token_generation_attempted": false,
-            "guest_forwarding_implemented": false,
+            "probe_generates_tokens": false,
+            "authentication_state_source": "device_auth_experiment",
+            "authentication_results_source": "device_auth_backend",
             "interpretation": "Host API support does not establish DeviceCheck support in the macOS guest or acceptance by Chat.",
         ]
 

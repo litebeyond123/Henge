@@ -115,7 +115,7 @@ static const char *const helper_startup_names[] = {"unseen", "network_ready", "c
 static const char *const helper_install_names[] = {"not_started", "script_started", "downloaded", "verified", "replacing", "launch_requested", "confirmed", "failed", "rolled_back", "awaiting_connection"};
 static const char *const helper_error_names[] = {"none", "download_failed", "gzip_invalid", "signature_invalid", "version_invalid", "replace_failed", "plist_invalid", "bootout_failed", "bootstrap_failed", "connection_failed", "health_unconfirmed", "rollback_failed"};
 static struct {
-    int protocol, pid, startup, install, error, exit_code;
+    int protocol, pid, helper_version, auth_experiment_protocol, startup, install, error, exit_code;
     int64_t agent_ms, probe_ms, install_ms;
 } helper_health;
 
@@ -128,9 +128,11 @@ char *hv_share_helper_health(void) {
     int64_t now = host_now_ms();
     int n = snprintf(json, sizeof json,
         "{\"protocol\":1,\"session\":\"%s\",\"helper_protocol\":%d,\"helper_pid\":%d,"
+        "\"helper_version\":%d,\"auth_experiment_protocol\":%d,"
         "\"agent_seen_s\":%ld,\"probe_seen_s\":%ld,\"install_seen_s\":%ld,"
         "\"startup_stage\":\"%s\",\"install_stage\":\"%s\",\"install_error\":\"%s\",\"install_exit_code\":%d}\n",
         host_session, helper_health.protocol, helper_health.pid,
+        helper_health.helper_version, helper_health.auth_experiment_protocol,
         helper_age(now, helper_health.agent_ms), helper_age(now, helper_health.probe_ms), helper_age(now, helper_health.install_ms),
         helper_startup_names[helper_health.startup], helper_install_names[helper_health.install],
         helper_error_names[helper_health.error], helper_health.exit_code);
@@ -1059,6 +1061,38 @@ static int helper_enum(const char *name, const char *const *names, size_t count)
     return -1;
 }
 
+/* Optional capabilities describe the process sending this heartbeat, not the
+   installed file. An old helper omits them and must clear any prior capability.
+   Only bounded decimal integers are accepted; duplicates and unknown fields fail. */
+static int helper_capabilities(const char *query, int *version, int *auth_protocol) {
+    unsigned int seen = 0;
+    *version = *auth_protocol = 0;
+    while (*query) {
+        if (*query++ != '&') return 0;
+        const char *name = query;
+        while (*query && *query != '=' && *query != '&') query++;
+        size_t length = (size_t)(query - name);
+        if (*query++ != '=') return 0;
+        unsigned int bit;
+        int *output;
+        if (length == strlen("helper_version") && !strncmp(name, "helper_version", length)) {
+            bit = 1; output = version;
+        } else if (length == strlen("auth_experiment_protocol") && !strncmp(name, "auth_experiment_protocol", length)) {
+            bit = 2; output = auth_protocol;
+        } else return 0;
+        if (seen & bit) return 0;
+        seen |= bit;
+        unsigned int number = 0, digits = 0;
+        while (*query >= '0' && *query <= '9') {
+            number = number * 10 + (unsigned int)(*query++ - '0');
+            if (++digits > 5 || number > 65535) return 0;
+        }
+        if (!digits || (*query && *query != '&')) return 0;
+        *output = (int)number;
+    }
+    return 1;
+}
+
 static int serve_helper_health(Conn *c, Request *r, const char *what) {
     r->close = 1;
     struct timeval timeout = {.tv_sec = 3};
@@ -1086,9 +1120,10 @@ static int serve_helper_health(Conn *c, Request *r, const char *what) {
     } else if (!strcmp(what, "ping") && !strcmp(r->method, "GET")) {
         char kind[12], stage[32];
         unsigned int pid = 0;
-        int used = 0;
+        int used = 0, version = 0, auth_protocol = 0;
         if (sscanf(r->query, "kind=%11[a-z]&protocol=4&pid=%10u&stage=%31[a-z_]%n", kind, &pid, stage, &used) != 3 ||
-            !used || r->query[used] || !pid || pid > INT_MAX || (strcmp(kind, "agent") && strcmp(kind, "probe"))) {
+            !used || !helper_capabilities(r->query + used, &version, &auth_protocol) ||
+            !pid || pid > INT_MAX || (strcmp(kind, "agent") && strcmp(kind, "probe"))) {
             status = 400; error = "invalid_ping";
         } else {
             int value = helper_enum(stage, helper_startup_names, sizeof helper_startup_names / sizeof *helper_startup_names);
@@ -1098,13 +1133,17 @@ static int serve_helper_health(Conn *c, Request *r, const char *what) {
                 // Preserve startup transitions in the existing native log even if the VM exits before
                 // the next diagnostic snapshot. Repeated health pings must not flood that log.
                 if (!helper_health.agent_ms || helper_health.protocol != 4 || helper_health.pid != (int)pid ||
-                    helper_health.startup != value) {
-                    fprintf(stderr, "hengevm: helper-health protocol=4 pid=%u stage=%s\n", pid, helper_startup_names[value]);
+                    helper_health.startup != value || helper_health.helper_version != version ||
+                    helper_health.auth_experiment_protocol != auth_protocol) {
+                    fprintf(stderr, "hengevm: helper-health protocol=4 pid=%u stage=%s helper_version=%d auth_experiment_protocol=%d\n",
+                            pid, helper_startup_names[value], version, auth_protocol);
                     fflush(stderr); // Flush stdio only; this is not a guarantee against an immediate OS kill.
                 }
                 helper_health.agent_ms = host_now_ms();
                 helper_health.protocol = 4;
                 helper_health.pid = (int)pid;
+                helper_health.helper_version = version;
+                helper_health.auth_experiment_protocol = auth_protocol;
                 helper_health.startup = value;
             }
         }
@@ -1140,6 +1179,7 @@ static int serve_helper_health(Conn *c, Request *r, const char *what) {
                 if (value == 5) { // A prior daemon heartbeat cannot confirm a new launch.
                     helper_health.agent_ms = 0;
                     helper_health.protocol = helper_health.pid = helper_health.startup = 0;
+                    helper_health.helper_version = helper_health.auth_experiment_protocol = 0;
                 }
             }
         }

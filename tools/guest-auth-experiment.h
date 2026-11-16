@@ -26,6 +26,11 @@ BOOL HengeAuthCallbackABI(id callback, NSUInteger objectArguments);
 BOOL HengeAuthMethodABI(Class cls, SEL selector, const char *returnType, NSUInteger objectArguments,
                        BOOL finalArgumentIsBlock);
 BOOL HengeAuthSignaturePolicy(NSDictionary *information);
+// Fixed boolean projection of the existing policy; unknown flags stay unknown.
+NSDictionary *HengeAuthSignaturePolicySnapshot(NSDictionary *information);
+// This target snapshot first performs the original identity/signature checks.
+// Its running/policy observations do not assert that dyld loaded the adapter.
+NSDictionary *HengeAuthTargetPreflight(NSString *bundlePath, NSError **error);
 BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **error);
 BOOL HengeAuthCurrentProcessMatches(NSString *bundlePath, NSError **error);
 void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,

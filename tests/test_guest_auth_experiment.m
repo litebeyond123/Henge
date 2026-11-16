@@ -1,4 +1,5 @@
 #import "../tools/guest-auth-experiment.h"
+#import <AppKit/AppKit.h>
 #import <Security/Security.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,6 +127,31 @@ static int unitTests(void) {
     check(!HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureRuntime), entitlementsKey:
           @{@"com.apple.security.cs.allow-dyld-environment-variables": @YES}}), "missing library-validation exception blocks launch");
     check(!HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureLibraryValidation)}), "explicit library validation blocks foreign adapter");
+    for (unsigned mask = 0; mask < 16; mask++) {
+        BOOL runtime = (mask & 1) != 0, libraryFlag = (mask & 2) != 0;
+        BOOL dyld = (mask & 4) != 0, exception = (mask & 8) != 0;
+        uint32_t flags = (runtime ? kSecCodeSignatureRuntime : 0) | (libraryFlag ? kSecCodeSignatureLibraryValidation : 0);
+        NSDictionary *info = @{flagsKey: @(flags), entitlementsKey:
+            @{@"com.apple.security.cs.allow-dyld-environment-variables": @(dyld),
+              @"com.apple.security.cs.disable-library-validation": @(exception)}};
+        NSDictionary *facts = HengeAuthSignaturePolicySnapshot(info);
+        BOOL allows = runtime ? (dyld && exception) : (!libraryFlag || exception);
+        check([facts[@"flags_known"] boolValue] && [facts[@"hardened_runtime"] boolValue] == runtime &&
+              [facts[@"library_validation_flag"] boolValue] == libraryFlag &&
+              [facts[@"dyld_environment_allowed"] boolValue] == dyld &&
+              [facts[@"library_validation_exception"] boolValue] == exception &&
+              [facts[@"policy_allows_adapter"] boolValue] == allows,
+              "fixed policy facts retain flag/entitlement distinctions and original permission rule");
+    }
+    for (id flags in @[NSNull.null, @"runtime"]) {
+        NSDictionary *facts = HengeAuthSignaturePolicySnapshot(@{flagsKey: flags, entitlementsKey: allowed});
+        check(![facts[@"flags_known"] boolValue] && facts[@"hardened_runtime"] == nil &&
+              facts[@"library_validation_flag"] == nil && ![facts[@"policy_allows_adapter"] boolValue],
+              "unknown flags never become runtime/library-validation off");
+    }
+    NSDictionary *missingFlags = HengeAuthSignaturePolicySnapshot(@{});
+    check(![missingFlags[@"flags_known"] boolValue] && missingFlags[@"hardened_runtime"] == nil,
+          "absent flags remain unknown");
     fprintf(stdout, "guest auth unit checks=%u failures=%u\n", checks, failures); fflush(stdout);
     return failures ? 1 : 0;
 }
@@ -214,9 +240,32 @@ static int injectedFixture(void) {
     usleep(250000);
     return ok ? 0 : 1;
 }
+static int closedWindowFixture(NSString *marker) {
+    // Only our owned fixture uses this entry point. Close a real AppKit window,
+    // keep the main process running, and exit cooperatively when the test asks.
+    NSApplication *application = NSApplication.sharedApplication;
+    [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    [application finishLaunching];
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 120, 80)
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
+    window.releasedWhenClosed = NO;
+    [window orderFront:nil];
+    [window close];
+    NSData *data = json(@{@"window_closed": @(!window.visible), @"pid": @(getpid())});
+    if (![data writeToFile:marker options:NSDataWritingAtomic error:NULL]) return 2;
+    NSString *stop = [marker stringByAppendingString:@".stop"];
+    double deadline = HengeAuthMonotonic() + 60;
+    while (HengeAuthMonotonic() < deadline) {
+        if ([NSFileManager.defaultManager fileExistsAtPath:stop]) return 0;
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    return 3;
+}
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 2 && !strcmp(argv[1], "--unit")) return unitTests();
+        if (argc == 3 && !strcmp(argv[1], "--hold-closed-window"))
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]]);
         return injectedFixture();
     }
 }

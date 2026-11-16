@@ -2,6 +2,7 @@
 """Compile/run the real C queue with synthetic callbacks; never call Apple identity APIs."""
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -32,6 +33,25 @@ def main() -> int:
         if result.returncode:
             sys.stderr.write(result.stderr.decode("utf-8", "replace"))
             return 1
+        exercised = re.search(rb"^enable_calls_exercised=(\d+)$", result.stdout, re.MULTILINE)
+        records = [line for line in result.stderr.splitlines() if line.startswith(b"[device-auth] action=enable ")]
+        record_pattern = re.compile(
+            rb"\[device-auth\] action=enable attempt=(\d+) successes=(\d+) failures=(\d+) "
+            rb"mode=(public_token|baa|invalid) result=(ok|launch_required|invalid_request|internal_error|host_inactive|mode_conflict|launch_reused|launch_limit) "
+            rb"backend_registered=[01] enabled=[01] running=([01]) foreground=([01]) fresh=([01]) active=([01]) state_age_ms=(-1|\d+)"
+        )
+        if exercised is None or len(records) != int(exercised[1]):
+            print("FAIL an enable call did not produce exactly one fixed diagnostic record", file=sys.stderr)
+            return 1
+        for record in records:
+            match = record_pattern.fullmatch(record)
+            if match is None or int(match[1]) != int(match[2]) + int(match[3]):
+                print("FAIL an enable diagnostic record contains unexpected fields or inconsistent counters", file=sys.stderr)
+                return 1
+            if match[9] == b"1" and any(match[index] != b"1" for index in (6, 7, 8)):
+                print("FAIL enable active state contradicts its contemporaneous runtime flags", file=sys.stderr)
+                return 1
+        print(f"PASS every enable call has one fixed diagnostic record ({len(records)} calls)")
         print("PASS native log contains no synthetic challenge/result material")
         return 0
 

@@ -24,6 +24,7 @@ codesign --verify --strict "$HENGE_APP_BUNDLE/Contents/Resources/henge-auth-adap
 plutil -lint "$HENGE_APP_BUNDLE/Contents/Info.plist"
 codesign --force --sign - --identifier com.henge.guesthelper "$HENGE_APP_BUNDLE"
 codesign --verify --deep --strict "$HENGE_APP_BUNDLE"
-test "$("$HENGE_APP_BUNDLE/Contents/MacOS/henge-agent" --version)" = 'henge-agent 7'
+HENGE_EXPECTED_HELPER_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$HENGE_APP_BUNDLE/Contents/Info.plist")
+test "$("$HENGE_APP_BUNDLE/Contents/MacOS/henge-agent" --version)" = "henge-agent $HENGE_EXPECTED_HELPER_VERSION"
 COPYFILE_DISABLE=1 tar --format=ustar -czf "$HENGE_APP_OUTPUT.tmp" -C "$HENGE_APP_STAGE" 'Henge Helper.app'
 mv -f "$HENGE_APP_OUTPUT.tmp" "$HENGE_APP_OUTPUT"

@@ -548,6 +548,22 @@ enum Diagnostics {
         }
     }
 
+    /// Retain UI attempts separately from successful bridge authorization. Fixed fields only.
+    static func recordAuthControl(_ action: DeviceAuthControlAction, mode: String, resultCode: Int? = nil) {
+        let safeMode = ["public_token", "baa"].contains(mode) ? mode : "none"
+        let observed = ISO8601DateFormatter().string(from: Date())
+        queue.async {
+            var interaction: [String: Any] = ["action": action.rawValue, "mode": safeMode, "observed_utc": observed]
+            if let resultCode { interaction["return_code"] = resultCode }
+            var history = run["authentication_controls"] as? [[String: Any]] ?? []
+            history.append(interaction)
+            run["authentication_controls"] = Array(history.suffix(16))
+            HengeLog.log("device-auth-control", "action=\(action.rawValue) mode=\(safeMode) return_code=\(resultCode.map(String.init) ?? "not_returned")")
+            sample("authentication_\(action.rawValue)")
+            scheduleReport(reason: "authentication_control")
+        }
+    }
+
     /// No process-exit inference: this is a timestamped observation only.
     private static func sample(_ event: String) {
         var info = task_vm_info_data_t()
@@ -580,10 +596,13 @@ enum Diagnostics {
         run["peak_observed_footprint_bytes"] = peakFootprint
         run["lowest_observed_allocation_headroom_bytes"] = lowestHeadroom
         run["memory_warning_count"] = memoryWarnings
-        run["helper_health"] = Sharing.helperHealth.diagnostics
+        let helper = Sharing.helperHealth
+        run["helper_health"] = helper.diagnostics
         run["clipboard_recently_seen"] = Sharing.helperRunning
-        run["device_auth_experiment"] = DeviceAuthSnapshot.state()
+        let authState = DeviceAuthSnapshot.state()
+        run["device_auth_experiment"] = authState
         run["device_auth_backend"] = DeviceAuthSnapshot.backend()
+        run["authentication_summary"] = DeviceAuthProgress.read(state: authState, helper: helper).diagnostics
         let footprint = result == KERN_SUCCESS ? String(info.phys_footprint) : "unavailable"
         let resident = result == KERN_SUCCESS ? String(info.resident_size) : "unavailable"
         HengeLog.log("diagnostics", "event=\(event) elapsed_s=\(Int(elapsed)) phys_bytes=\(footprint) resident_bytes=\(resident) allocation_headroom_bytes=\(headroom) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) memory_warnings=\(memoryWarnings)")

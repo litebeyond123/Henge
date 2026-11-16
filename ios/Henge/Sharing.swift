@@ -13,6 +13,8 @@ struct HelperHealthSnapshot: Equatable {
     let valid: Bool
     let session: String
     let helperProtocol: Int
+    let helperVersion: Int
+    let authExperimentProtocol: Int
     let helperPID: Int
     let agentSeenSeconds: Int
     let probeSeenSeconds: Int
@@ -22,7 +24,7 @@ struct HelperHealthSnapshot: Equatable {
     let installError: InstallError
     let installExitCode: Int
 
-    static let unavailable = HelperHealthSnapshot(valid: false, session: "", helperProtocol: 0, helperPID: 0,
+    static let unavailable = HelperHealthSnapshot(valid: false, session: "", helperProtocol: 0, helperVersion: 0, authExperimentProtocol: 0, helperPID: 0,
         agentSeenSeconds: -1, probeSeenSeconds: -1, installSeenSeconds: -1,
         startup: .unseen, install: .not_started, installError: .none, installExitCode: 0)
 
@@ -37,6 +39,8 @@ struct HelperHealthSnapshot: Equatable {
               integer(raw["protocol"], 1...1) == 1,
               let session = raw["session"] as? String, session.isEmpty || UUID(uuidString: session) != nil,
               let helperProtocol = integer(raw["helper_protocol"], 0...65535),
+              let helperVersion = integer(raw["helper_version"] ?? 0, 0...65535),
+              let authExperimentProtocol = integer(raw["auth_experiment_protocol"] ?? 0, 0...65535),
               let pid = integer(raw["helper_pid"], 0...Int(Int32.max)),
               let seen = integer(raw["agent_seen_s"], -1...Int(Int32.max)),
               let probe = integer(raw["probe_seen_s"], -1...Int(Int32.max)),
@@ -45,12 +49,14 @@ struct HelperHealthSnapshot: Equatable {
               let install = (raw["install_stage"] as? String).flatMap(Install.init(rawValue:)),
               let error = (raw["install_error"] as? String).flatMap(InstallError.init(rawValue:)),
               let exit = integer(raw["install_exit_code"], 0...255) else { return .unavailable }
-        return HelperHealthSnapshot(valid: true, session: session, helperProtocol: helperProtocol, helperPID: pid,
+        return HelperHealthSnapshot(valid: true, session: session, helperProtocol: helperProtocol,
+            helperVersion: helperVersion, authExperimentProtocol: authExperimentProtocol, helperPID: pid,
             agentSeenSeconds: seen, probeSeenSeconds: probe, installSeenSeconds: installed,
             startup: startup, install: install, installError: error, installExitCode: exit)
     }
 
     var isConnected: Bool { valid && !session.isEmpty && helperProtocol == 4 && agentSeenSeconds >= 0 && agentSeenSeconds < 30 }
+    var supportsAuthExperiment: Bool { isConnected && helperVersion > 0 && authExperimentProtocol == 1 }
     var connectionTitle: String {
         if !valid { return "Status unavailable" }
         if session.isEmpty { return "Mac is not running" }
@@ -100,6 +106,8 @@ struct HelperHealthSnapshot: Equatable {
     }
     var diagnostics: [String: Any] {
         ["status_available": valid, "session": session, "helper_protocol": helperProtocol, "helper_pid": helperPID,
+         "helper_version": helperVersion, "auth_experiment_protocol": authExperimentProtocol,
+         "auth_experiment_capability_confirmed": supportsAuthExperiment,
          "connected": isConnected, "agent_seen_seconds": agentSeenSeconds, "probe_seen_seconds": probeSeenSeconds,
          "install_seen_seconds": installSeenSeconds, "startup_stage": startup.rawValue, "install_stage": install.rawValue,
          "install_error": installError.rawValue, "install_exit_code": installExitCode]

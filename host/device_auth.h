@@ -104,6 +104,19 @@ typedef enum {
     HV_DEVICE_AUTH_STAGE_REQUEST_DECLINED,
     HV_DEVICE_AUTH_STAGE_TRANSPORT_FAILED,
     HV_DEVICE_AUTH_STAGE_RESPONSE_INVALID,
+    /* Guest observations after target identity validation. These are facts at
+       preflight time, not proof of adapter loading or server acceptance. */
+    HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING,
+    HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_NOT_RUNNING,
+    HV_DEVICE_AUTH_STAGE_POLICY_FLAGS_UNAVAILABLE,
+    HV_DEVICE_AUTH_STAGE_POLICY_RUNTIME_ON,
+    HV_DEVICE_AUTH_STAGE_POLICY_RUNTIME_OFF,
+    HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_FLAG_ON,
+    HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_FLAG_OFF,
+    HV_DEVICE_AUTH_STAGE_POLICY_DYLD_ENV_ALLOWED,
+    HV_DEVICE_AUTH_STAGE_POLICY_DYLD_ENV_NOT_ALLOWED,
+    HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_ON,
+    HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_OFF,
     HV_DEVICE_AUTH_STAGE_SESSION_INACTIVE,
     /* Host-only stages cannot be submitted by the guest event route. */
     HV_DEVICE_AUTH_STAGE_HOST_REQUEST_QUEUED,
@@ -136,6 +149,14 @@ typedef struct {
     int enabled, running, foreground, fresh, active, busy;
     int64_t state_age_ms;        /* -1 before the first publication. */
     uint64_t accepted_requests, completed_requests, refused_requests;
+    /* Enable-call diagnostics for the current begin epoch. Success includes an
+       idempotent OK; none of these fields grants or changes authorization.
+       last_enable_* is meaningful only when enable_attempts is nonzero.
+       A mode other than PUBLIC_TOKEN/BAA is stored as NONE and rendered invalid. */
+    uint64_t enable_attempts, enable_successes, enable_failures;
+    HvDeviceAuthError last_enable_error;
+    HvDeviceAuthMode last_enable_mode;
+    int backend_registered, last_enable_backend_registered;
     size_t event_count;
     HvDeviceAuthEvent events[HV_DEVICE_AUTH_EVENT_COUNT]; /* Oldest first. */
 } HvDeviceAuthState;

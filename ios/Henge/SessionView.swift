@@ -480,6 +480,7 @@ struct SessionView: View {
     private var details: some View {
         NavigationStack {
             List {
+                DeviceAuthExperimentSection()
                 Section(phase) {
                     LabeledContent("CPUs on", value: "\(cpusOn) of \(cpus)")
                     LabeledContent("Temperature", value: Self.thermalLabel(thermalState))
@@ -525,7 +526,6 @@ struct SessionView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 HostServicesSection()
-                DeviceAuthExperimentSection()
                 Section("Lighter macOS") {
                     Button("Type the Lighter macOS Command") {
                         showDetails = false

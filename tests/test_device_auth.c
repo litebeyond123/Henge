@@ -20,13 +20,21 @@ static const char REQUEST_TWO[] = "55234567-89AB-CDEF-0123-456789ABCDEF";
 static const char INPUT[] = "{\"protocol\":1,\"operation\":\"probe\",\"synthetic\":\"SYNTHETIC_INPUT_MATERIAL\"}";
 static const char RESULT[] = "{\"protocol\":1,\"status\":\"ok\",\"synthetic\":\"SYNTHETIC_SECRET_MATERIAL\"}";
 static const char ERROR_RESULT[] = "{\"protocol\":1,\"status\":\"error\",\"diagnostics\":{\"errorCode\":4}}";
-static atomic_uint assertion_count, wakes;
+static atomic_uint assertion_count, wakes, enable_calls;
 
 #define CHECK(test) do { \
     atomic_fetch_add(&assertion_count, 1); \
     if (!(test)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #test); abort(); } \
 } while (0)
 #define RUN(test) do { test(); printf("PASS %s\n", #test); } while (0)
+
+/* Count the externally exercised calls so the runner can require one native
+   log record per call, including validation failures before authorization. */
+static HvDeviceAuthError observed_enable(HvDeviceAuthMode mode, const char *launch) {
+    atomic_fetch_add(&enable_calls, 1);
+    return hv_device_auth_enable(mode, launch);
+}
+#define hv_device_auth_enable(mode, launch) observed_enable((mode), (launch))
 
 static void sleep_ms(unsigned milliseconds) {
     struct timespec duration = { milliseconds / 1000, (long)(milliseconds % 1000) * 1000000L };
@@ -150,6 +158,63 @@ static void metadata_and_default_denial(void) {
     CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_NONE, LAUNCH) == HV_DEVICE_AUTH_INVALID_REQUEST);
     hv_device_auth_end();
     CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH) == HV_DEVICE_AUTH_HOST_INACTIVE);
+}
+
+static void enable_diagnostics_preserve_authorization(void) {
+    hv_device_auth_end();
+    CHECK(hv_device_auth_set_wakeup(NULL, NULL));
+    hv_device_auth_begin(SESSION);
+    HvDeviceAuthState state;
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enable_attempts == 0 && state.enable_successes == 0 && state.enable_failures == 0);
+    CHECK(!state.backend_registered && !state.last_enable_backend_registered);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, NULL) == HV_DEVICE_AUTH_LAUNCH_REQUIRED);
+    CHECK(hv_device_auth_enable((HvDeviceAuthMode)99, LAUNCH) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_BAA, LAUNCH) == HV_DEVICE_AUTH_HOST_INACTIVE);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enable_attempts == 3 && state.enable_successes == 0 && state.enable_failures == 3);
+    CHECK(state.last_enable_error == HV_DEVICE_AUTH_HOST_INACTIVE && state.last_enable_mode == HV_DEVICE_AUTH_MODE_BAA);
+    CHECK(!state.enabled && !state.launch_id[0] && state.mode == HV_DEVICE_AUTH_MODE_NONE && state.event_count == 0);
+
+    hv_device_auth_publish(1, 1);
+    /* Registration is observable, but this patch deliberately preserves the
+       existing enable behavior: missing backend is rejected later by submit. */
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enable_attempts == 4 && state.enable_successes == 1 && state.enable_failures == 3);
+    CHECK(!state.backend_registered && !state.last_enable_backend_registered);
+    CHECK(state.enabled && !strcmp(state.launch_id, LAUNCH) && state.mode == HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN);
+    CHECK(state.event_count == 1 && state.events[0].stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED);
+    HvDeviceAuthRequest input = request();
+    expect_rejected(&input, HV_DEVICE_AUTH_BACKEND_UNAVAILABLE);
+
+    CHECK(hv_device_auth_set_wakeup(idle_wakeup, &wakes));
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH) == HV_DEVICE_AUTH_OK);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_BAA, LAUNCH_TWO) == HV_DEVICE_AUTH_MODE_CONFLICT);
+    CHECK(hv_device_auth_enable((HvDeviceAuthMode)99, "SYNTHETIC_INPUT_MATERIAL") == HV_DEVICE_AUTH_LAUNCH_REQUIRED);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enable_attempts == 7 && state.enable_successes == 2 && state.enable_failures == 5);
+    CHECK(state.last_enable_error == HV_DEVICE_AUTH_LAUNCH_REQUIRED && state.last_enable_mode == HV_DEVICE_AUTH_MODE_NONE);
+    CHECK(state.backend_registered && state.last_enable_backend_registered);
+    CHECK(state.enabled && !strcmp(state.launch_id, LAUNCH) && state.mode == HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN);
+    CHECK(state.event_count == 1); /* Attempts do not replace the existing stage. */
+
+    hv_device_auth_disable();
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH) == HV_DEVICE_AUTH_LAUNCH_REUSED);
+    hv_device_auth_snapshot(&state);
+    CHECK(!state.enabled && !strcmp(state.launch_id, LAUNCH) && state.mode == HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN);
+    CHECK(state.enable_attempts == 8 && state.enable_successes == 2 && state.enable_failures == 6);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_BAA, LAUNCH_TWO) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_end();
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enable_attempts == 9 && state.enable_successes == 3 && state.enable_failures == 6);
+    CHECK(state.enable_attempts == state.enable_successes + state.enable_failures);
+    hv_device_auth_begin(SESSION_TWO);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enable_attempts == 0 && state.enable_successes == 0 && state.enable_failures == 0);
+    CHECK(state.last_enable_error == HV_DEVICE_AUTH_OK && state.last_enable_mode == HV_DEVICE_AUTH_MODE_NONE);
+    CHECK(state.backend_registered && !state.last_enable_backend_registered);
+    CHECK(!state.enabled && !state.launch_id[0] && state.event_count == 0);
 }
 
 static void immediate_completion_and_copy_ownership(void) {
@@ -432,8 +497,50 @@ static void stale_host_state_is_not_revived_by_a_late_publication(void) {
     CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH_TWO) == HV_DEVICE_AUTH_OK);
 }
 
+static void fixed_guest_preflight_observations(void) {
+    static const struct { const char *name; HvDeviceAuthStage stage; } observations[] = {
+        {"target_process_running", HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING},
+        {"target_process_not_running", HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_NOT_RUNNING},
+        {"policy_flags_unavailable", HV_DEVICE_AUTH_STAGE_POLICY_FLAGS_UNAVAILABLE},
+        {"policy_runtime_on", HV_DEVICE_AUTH_STAGE_POLICY_RUNTIME_ON},
+        {"policy_runtime_off", HV_DEVICE_AUTH_STAGE_POLICY_RUNTIME_OFF},
+        {"policy_library_flag_on", HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_FLAG_ON},
+        {"policy_library_flag_off", HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_FLAG_OFF},
+        {"policy_dyld_env_allowed", HV_DEVICE_AUTH_STAGE_POLICY_DYLD_ENV_ALLOWED},
+        {"policy_dyld_env_not_allowed", HV_DEVICE_AUTH_STAGE_POLICY_DYLD_ENV_NOT_ALLOWED},
+        {"policy_library_exception_on", HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_ON},
+        {"policy_library_exception_off", HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_OFF},
+    };
+    setup(idle_wakeup);
+    HvDeviceAuthEvent event = {0};
+    memcpy(event.request_id, REQUEST, sizeof(REQUEST));
+    for (size_t i = 0; i < sizeof observations / sizeof observations[0]; i++) {
+        event.stage = observations[i].stage;
+        CHECK(hv_device_auth_stage_from_name(observations[i].name) == event.stage);
+        CHECK(!strcmp(hv_device_auth_stage_name(event.stage), observations[i].name));
+        CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    }
+    for (int stage = HV_DEVICE_AUTH_STAGE_HOST_REQUEST_QUEUED; stage <= HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_DISABLED; stage++) {
+        event.stage = (HvDeviceAuthStage)stage;
+        CHECK(hv_device_auth_stage_from_name(hv_device_auth_stage_name(event.stage)) == HV_DEVICE_AUTH_STAGE_NONE);
+        CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    }
+    HvDeviceAuthState state;
+    hv_device_auth_snapshot(&state);
+    CHECK(state.event_count == 1 + sizeof observations / sizeof observations[0]);
+    for (size_t i = 1; i < state.event_count; i++) {
+        CHECK(state.events[i].from_guest && state.events[i].stage == observations[i - 1].stage);
+        CHECK(!strcmp(state.events[i].request_id, REQUEST) && !strcmp(state.events[i].launch_id, LAUNCH));
+        CHECK(state.events[i].error_domain == HV_DEVICE_AUTH_DOMAIN_NONE && state.events[i].error_code == 0);
+        CHECK(state.events[i].input_bytes == 0 && state.events[i].result_bytes == 0 && state.events[i].elapsed_ms == 0);
+    }
+    CHECK(state.enabled && state.mode == HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN && !strcmp(state.launch_id, LAUNCH));
+    CHECK(state.accepted_requests == 0 && state.completed_requests == 0 && atomic_load(&wakes) == 0);
+}
+
 int main(void) {
     RUN(metadata_and_default_denial);
+    RUN(enable_diagnostics_preserve_authorization);
     RUN(immediate_completion_and_copy_ownership);
     RUN(queued_timeout_never_reaches_backend);
     RUN(single_flight_survives_waiter_timeout);
@@ -446,9 +553,11 @@ int main(void) {
     RUN(bounded_backend_output_and_error_payload);
     RUN(rate_limit_is_enforced_before_backend);
     RUN(fixed_event_fields_and_bounded_history);
+    RUN(fixed_guest_preflight_observations);
     RUN(stale_host_state_is_not_revived_by_a_late_publication);
     hv_device_auth_end();
     CHECK(hv_device_auth_set_wakeup(NULL, NULL));
     printf("PASS device-auth production C: %u assertions; synthetic backend only\n", atomic_load(&assertion_count));
+    printf("enable_calls_exercised=%u\n", atomic_load(&enable_calls));
     return 0;
 }

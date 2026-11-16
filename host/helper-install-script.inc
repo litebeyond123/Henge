@@ -116,7 +116,7 @@
 "[ -d \"$HENGE_STAGED_APP\" ] && [ ! -L \"$HENGE_STAGED_APP\" ] && [ -x \"$HENGE_STAGED_BINARY\" ] || fail gzip_invalid 1\n"
 "codesign --verify --deep --strict \"$HENGE_STAGED_APP\" || fail signature_invalid \"$?\"\n"
 "HENGE_HELPER_VERSION=$(\"$HENGE_STAGED_BINARY\" --version) || fail version_invalid \"$?\"\n"
-"[ \"$HENGE_HELPER_VERSION\" = 'henge-agent 7' ] || fail version_invalid 1\n"
+"[ \"$HENGE_HELPER_VERSION\" = 'henge-agent 8' ] || fail version_invalid 1\n"
 "# A Terminal probe cannot prove a LaunchServices app has local-network permission.\n"
 "# Start the verified application below and confirm its own PID/health instead.\n"
 "receipt verified none 0 || fail connection_failed 1\n"

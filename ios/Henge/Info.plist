@@ -37,9 +37,9 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>4008</string>
+	<string>4009</string>
 	<key>HengeTestBuildName</key>
-	<string>0.4 Test 7</string>
+	<string>0.4 Test 8</string>
 	<key>HengeBaseCommit</key>
 	<string>2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f</string>
 	<key>LSApplicationQueriesSchemes</key>

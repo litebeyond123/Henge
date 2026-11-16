@@ -194,6 +194,51 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         self.assertEqual(body["diagnostics"], {"errorDomain": "com.apple.devicecheck.error", "errorCode": 4})
         self.assertNotIn("resultBase64", body)
 
+    def test_enable_diagnostics_cover_failure_idempotence_and_epoch_reset(self):
+        state = self.server.auth_state()
+        self.assertEqual((state["enable_attempts"], state["enable_successes"], state["enable_failures"]), (0, 0, 0))
+        self.assertEqual((state["last_enable_error"], state["last_enable_mode"]), ("not_attempted", "not_attempted"))
+        self.assertIs(state["backend_registered"], True)
+        self.assertIs(state["last_enable_backend_registered"], False)
+
+        self.assertEqual(self.server.control("enable public_token SYNTHETIC_INPUT_MATERIAL"), "enabled launch_required")
+        state = self.server.auth_state()
+        self.assertEqual((state["enable_attempts"], state["enable_successes"], state["enable_failures"]), (1, 0, 1))
+        self.assertEqual((state["last_enable_error"], state["last_enable_mode"]), ("launch_required", "public_token"))
+        self.assertEqual((state["enabled"], state["launch_id"], state["mode"], state["events"]), (False, "", "none", []))
+        self.assertNotIn("SYNTHETIC_INPUT_MATERIAL", json.dumps(state))
+        self.assertEqual(self.server.control(f"enable invalid {LAUNCH}"), "enabled invalid_request")
+        state = self.server.auth_state()
+        self.assertEqual((state["last_enable_error"], state["last_enable_mode"]), ("invalid_request", "invalid"))
+        self.assertEqual(self.server.control("publish 0 1"), "ok")
+        self.assertEqual(self.server.control(f"enable baa {LAUNCH}"), "enabled host_inactive")
+        self.assertEqual(self.server.control("publish 1 1"), "ok")
+        self.enable()
+        authorized = self.server.auth_state()
+        self.assertEqual((authorized["enable_attempts"], authorized["enable_successes"], authorized["enable_failures"]), (4, 1, 3))
+        self.assertEqual(authorized["events"][-1]["stage"], "host_bridge_enabled")
+        self.enable()  # Idempotent OK is a successful call, not a second stage.
+        self.assertEqual(self.server.control(f"enable baa {LAUNCH_TWO}"), "enabled mode_conflict")
+        state = self.server.auth_state()
+        self.assertEqual((state["enable_attempts"], state["enable_successes"], state["enable_failures"]), (6, 2, 4))
+        self.assertEqual((state["enabled"], state["launch_id"], state["mode"]), (True, LAUNCH, "public_token"))
+        self.assertEqual([event["sequence"] for event in state["events"]], [event["sequence"] for event in authorized["events"]])
+        self.assertEqual((state["last_enable_error"], state["last_enable_mode"]), ("mode_conflict", "baa"))
+        self.assertIs(state["last_enable_backend_registered"], True)
+        self.assertEqual((state["accepted_requests"], state["completed_requests"], state["refused_requests"]), (0, 0, 0))
+
+        self.assertEqual(self.server.control("disable"), "ok")
+        self.assertEqual(self.server.control(f"enable public_token {LAUNCH}"), "enabled launch_reused")
+        state = self.server.auth_state()
+        self.assertEqual((state["enable_attempts"], state["enable_successes"], state["enable_failures"]), (7, 2, 5))
+        self.assertEqual((state["enabled"], state["launch_id"], state["mode"]), (False, LAUNCH, "public_token"))
+        self.assertEqual(self.server.control("begin " + OTHER), "ok")
+        state = self.server.auth_state()
+        self.assertEqual((state["enable_attempts"], state["enable_successes"], state["enable_failures"]), (0, 0, 0))
+        self.assertEqual((state["last_enable_error"], state["last_enable_mode"]), ("not_attempted", "not_attempted"))
+        self.assertIs(state["last_enable_backend_registered"], False)
+        self.assertEqual((state["session"], state["enabled"], state["launch_id"], state["mode"], state["events"]), (OTHER, False, "", "none", []))
+
     def test_modes_are_enforced_before_backend_claim(self):
         self.enable()
         self.assert_error(self.server.auth_post(self.request_json(operation="baa_data", payloadBase64="YQ==")), 403, "mode_forbidden")
@@ -278,6 +323,45 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         self.assertEqual(self.server.control("take"), "taken 0")
         self.assertEqual(self.server.control("stats"), "wakes 1 takes 0")
         self.assertEqual(self.server.control("enable public_token " + LAUNCH), "enabled launch_reused")
+
+    def test_fixed_guest_preflight_observations_do_not_allow_host_stages_or_raw_metadata(self):
+        self.enable()
+        stages = ["target_process_running", "target_process_not_running", "policy_flags_unavailable",
+                  "policy_runtime_on", "policy_runtime_off", "policy_library_flag_on", "policy_library_flag_off",
+                  "policy_dyld_env_allowed", "policy_dyld_env_not_allowed", "policy_library_exception_on",
+                  "policy_library_exception_off"]
+        event = {"protocol": 1, "launch_id": LAUNCH, "request_id": REQUEST,
+                 "errorCode": 0, "elapsedMs": 0, "inputBytes": 0, "resultBytes": 0}
+        for stage in stages:
+            with self.subTest(stage=stage):
+                response = self.server.auth_post(dict(event, stage=stage), "event")
+                self.assertEqual(response.status, 200)
+                self.assert_no_store(response)
+        for stage in ["host_request_queued", "host_request_started", "host_request_completed", "host_request_failed",
+                      "host_request_cancelled", "host_bridge_enabled", "host_bridge_disabled"]:
+            self.assert_error(self.server.auth_post(dict(event, stage=stage), "event"), 400, "invalid_request")
+        self.assert_error(self.server.auth_post(dict(event, stage=stages[0], signatureInfo="SYNTHETIC_INPUT_MATERIAL"), "event"),
+                          400, "invalid_auth_json")
+        # The observed facts do not replace the separate, unchanged 1010 refusal.
+        refused = dict(event, stage="signature_policy_blocked", errorDomain="HengeAuthBridge", errorCode=1010)
+        self.assertEqual(self.server.auth_post(refused, "event").status, 200)
+        state = self.server.auth_state()
+        observed = state["events"][1:]
+        self.assertEqual([entry["stage"] for entry in observed], stages + ["signature_policy_blocked"])
+        allowed = {"sequence", "age_ms", "from_guest", "request_id", "launch_id", "stage", "errorDomain", "errorCode",
+                   "elapsedMs", "inputBytes", "resultBytes"}
+        for entry in observed:
+            self.assertEqual(set(entry), allowed)
+            self.assertTrue(entry["from_guest"])
+            self.assertEqual((entry["request_id"], entry["launch_id"]), (REQUEST, LAUNCH))
+            self.assertEqual((entry["elapsedMs"], entry["inputBytes"], entry["resultBytes"]), (0, 0, 0))
+        self.assertTrue(all(entry["errorDomain"] == "" and entry["errorCode"] == 0 for entry in observed[:-1]))
+        self.assertEqual((observed[-1]["errorDomain"], observed[-1]["errorCode"]), ("HengeAuthBridge", 1010))
+        self.assertNotIn("SYNTHETIC_INPUT_MATERIAL", json.dumps(state))
+        self.assertEqual((state["enabled"], state["mode"], state["launch_id"]), (True, "public_token", LAUNCH))
+        self.assertEqual((state["accepted_requests"], state["completed_requests"]), (0, 0))
+        self.assertEqual(self.server.control("stats"), "wakes 0 takes 0")
+        self.assertFalse(state["serverAcceptanceVerified"])
 
     def test_background_discards_claimed_response_and_requires_new_enable(self):
         self.enable()

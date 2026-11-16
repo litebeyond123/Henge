@@ -27,11 +27,30 @@ int main(void) {
     @autoreleasepool {
         NSDictionary *health = HengeHelperValidateHealth(json(snapshot()));
         CHECK(health != nil);
+        CHECK([health[@"helper_version"] isEqual:@0]);
+        CHECK([health[@"auth_experiment_protocol"] isEqual:@0]);
         CHECK(HengeHelperHealthMatchesPID(health, 321));
         CHECK(!HengeHelperHealthMatchesPID(health, 123));
         CHECK(!HengeHelperHealthMatchesPID(nil, 321));
         CHECK(!HengeHelperHealthMatchesPID(health, 0));
         CHECK(health[@"install_stage"] == nil); // whitelist, no unrelated/raw values returned
+        for (NSString *key in @[@"helper_version", @"auth_experiment_protocol"]) {
+            for (id invalid in @[@YES, @"8", @1.5, NSNull.null, @-1, @65536]) {
+                NSMutableDictionary *value = snapshot(); value[key] = invalid;
+                CHECK(HengeHelperValidateHealth(json(value)) == nil);
+            }
+            for (NSNumber *valid in @[@0, @8, @65535]) {
+                NSMutableDictionary *value = snapshot(); value[key] = valid;
+                CHECK([HengeHelperValidateHealth(json(value))[key] isEqual:valid]);
+            }
+        }
+        NSMutableDictionary *current = snapshot();
+        current[@"helper_version"] = @(HENGE_HELPER_VERSION);
+        current[@"auth_experiment_protocol"] = @(HENGE_HELPER_AUTH_EXPERIMENT_PROTOCOL);
+        health = HengeHelperValidateHealth(json(current));
+        CHECK([health[@"helper_version"] intValue] == HENGE_HELPER_VERSION);
+        CHECK([health[@"auth_experiment_protocol"] intValue] == HENGE_HELPER_AUTH_EXPERIMENT_PROTOCOL);
+        CHECK(HengeHelperHealthMatchesPID(health, 321));
         for (NSString *stage in @[@"network_ready", @"clipboard_starting", @"ready", @"clipboard_unavailable"]) {
             NSMutableDictionary *value = snapshot(); value[@"startup_stage"] = stage;
             CHECK(HengeHelperHealthMatchesPID(HengeHelperValidateHealth(json(value)), 321));
@@ -61,9 +80,13 @@ int main(void) {
         CHECK([calls[1][@"session"] isEqual:Session]);
         CHECK([calls[1][@"path"] containsString:@"kind=probe&protocol=4"]);
         CHECK([calls[1][@"path"] containsString:[NSString stringWithFormat:@"pid=%d", getpid()]]);
+        NSString *capabilities = [NSString stringWithFormat:@"&helper_version=%d&auth_experiment_protocol=%d",
+            HENGE_HELPER_VERSION, HENGE_HELPER_AUTH_EXPERIMENT_PROTOCOL];
+        CHECK([calls[1][@"path"] hasSuffix:capabilities]);
         [calls removeAllObjects];
         CHECK(HengeHelperPing(transport, @"ready", NO));
         CHECK([calls[1][@"path"] containsString:@"kind=agent&protocol=4"]);
+        CHECK([calls[1][@"path"] hasSuffix:capabilities]);
         rejectPing = YES;
         CHECK(!HengeHelperPing(transport, @"ready", NO));
         rejectPing = NO;

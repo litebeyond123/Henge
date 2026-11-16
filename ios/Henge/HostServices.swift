@@ -78,6 +78,10 @@ final class HostServices: ObservableObject {
         }
     }
 
+    /// Refresh the existing session immediately before an explicit authentication start.
+    /// This never creates a session or substitutes a foreground/running value.
+    func refreshForAuthenticationStart() { publish() }
+
     private func publish(forceInactive: Bool = false) {
         guard session != nil else { return }
         let running = henge_vm_state() == 1

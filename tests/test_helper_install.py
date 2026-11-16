@@ -2,6 +2,8 @@
 """Real C health protocol plus the exact served installer in an isolated, controlled guest environment."""
 import json
 import os
+import plistlib
+import re
 import select
 from pathlib import Path
 import subprocess
@@ -13,6 +15,10 @@ import test_host_services as existing
 ROOT = Path(__file__).resolve().parents[1]
 SESSION = existing.SESSION
 OTHER = existing.OTHER
+VERSION_HEADER = (ROOT / "tools/helper-version.h").read_text()
+HELPER_VERSION = int(re.search(r"(?m)^#define HENGE_HELPER_VERSION ([0-9]+)$", VERSION_HEADER).group(1))
+AUTH_PROTOCOL = int(re.search(r"(?m)^#define HENGE_HELPER_AUTH_EXPERIMENT_PROTOCOL ([0-9]+)$", VERSION_HEADER).group(1))
+VERSION_TEXT = f"henge-agent {HELPER_VERSION}"
 
 
 class HelperInstallTests(unittest.TestCase):
@@ -40,8 +46,8 @@ class HelperInstallTests(unittest.TestCase):
         self.assertEqual(status, 200)
         return json.loads(body)
 
-    def ping(self, kind="agent", pid=123, stage="network_ready", session=SESSION):
-        return self.server.request("GET", f"/.henge/helper/ping?kind={kind}&protocol=4&pid={pid}&stage={stage}",
+    def ping(self, kind="agent", pid=123, stage="network_ready", session=SESSION, capabilities=""):
+        return self.server.request("GET", f"/.henge/helper/ping?kind={kind}&protocol=4&pid={pid}&stage={stage}{capabilities}",
                                    headers=(f"X-Henge-Session: {session}",))
 
     def receipt(self, stage, reason="none", code=0, pid=0, session=SESSION):
@@ -65,6 +71,56 @@ class HelperInstallTests(unittest.TestCase):
         self.assertEqual(self.receipt("confirmed", pid=123)[0], 409)
         self.assertEqual(self.receipt("confirmed", pid=456)[0], 200)
         self.assertEqual(self.health()["install_stage"], "confirmed")
+
+    def test_runtime_capabilities_follow_actual_agent_and_reset_for_old_helpers(self):
+        suffix = f"&helper_version={HELPER_VERSION}&auth_experiment_protocol={AUTH_PROTOCOL}"
+        self.assertEqual(self.ping("probe", capabilities=suffix)[0], 200)
+        self.assertEqual(self.health()["helper_version"], 0)
+        self.assertEqual(self.health()["auth_experiment_protocol"], 0)
+        self.assertEqual(self.ping(capabilities=suffix)[0], 200)
+        self.assertEqual(self.health()["helper_version"], HELPER_VERSION)
+        self.assertEqual(self.health()["auth_experiment_protocol"], AUTH_PROTOCOL)
+        self.assertEqual(self.ping(pid=456)[0], 200)  # A restored old helper must not inherit capabilities.
+        self.assertEqual(self.health()["helper_version"], 0)
+        self.assertEqual(self.health()["auth_experiment_protocol"], 0)
+        self.assertEqual(self.health()["helper_protocol"], 4)
+        self.assertEqual(self.ping(capabilities=suffix)[0], 200)
+        self.assertEqual(self.receipt("launch_requested")[0], 200)
+        self.assertEqual(self.health()["helper_version"], 0)
+        self.assertEqual(self.health()["auth_experiment_protocol"], 0)
+        self.assertEqual(self.ping(capabilities=suffix)[0], 200)
+        self.server.control("begin " + OTHER)
+        self.assertEqual(self.health()["helper_version"], 0)
+        self.assertEqual(self.health()["auth_experiment_protocol"], 0)
+
+    def test_optional_capabilities_are_independent_bounded_decimal_values(self):
+        for suffix, expected in (
+            ("&helper_version=8", (8, 0)),
+            ("&auth_experiment_protocol=1", (0, 1)),
+            ("&auth_experiment_protocol=1&helper_version=8", (8, 1)),
+            ("&helper_version=65535&auth_experiment_protocol=65535", (65535, 65535)),
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(self.ping(capabilities=suffix)[0], 200)
+                health = self.health()
+                self.assertEqual((health["helper_version"], health["auth_experiment_protocol"]), expected)
+        before = self.health()
+        for key in ("helper_version", "auth_experiment_protocol"):
+            for invalid in ("true", "false", "null", "", "-1", "+1", "1.5", "65536", "999999999999999", "8garbage"):
+                with self.subTest(key=key, invalid=invalid):
+                    self.assertEqual(self.ping(capabilities=f"&{key}={invalid}")[0], 400)
+        for suffix in ("&helper_version=8&helper_version=8", "&auth_experiment_protocol=1&auth_experiment_protocol=1",
+                       "&helper_version=8&", "&helper_version", "&unknown=8"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(self.ping(capabilities=suffix)[0], 400)
+        after = self.health()
+        self.assertEqual((before["helper_version"], before["auth_experiment_protocol"]),
+                         (after["helper_version"], after["auth_experiment_protocol"]))
+
+    def test_installer_and_bundle_version_match_runtime_constant(self):
+        info = plistlib.loads((ROOT / "tools/HengeHelper-Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleVersion"], str(HELPER_VERSION))
+        self.assertIn(f"[ \"$HENGE_HELPER_VERSION\" = '{VERSION_TEXT}' ]".encode(), self.script())
 
     def test_native_log_keeps_fixed_receipts_and_changed_health_only(self):
         self.assertEqual(self.ping()[0], 200)
@@ -90,11 +146,11 @@ class HelperInstallTests(unittest.TestCase):
         log = b"".join(pieces).decode("utf-8")
         lines = [line for line in log.splitlines() if line.startswith("hengevm: helper-")]
         self.assertEqual(lines, [
-            "hengevm: helper-health protocol=4 pid=123 stage=network_ready",
-            "hengevm: helper-health protocol=4 pid=123 stage=ready",
-            "hengevm: helper-health protocol=4 pid=456 stage=ready",
+            "hengevm: helper-health protocol=4 pid=123 stage=network_ready helper_version=0 auth_experiment_protocol=0",
+            "hengevm: helper-health protocol=4 pid=123 stage=ready helper_version=0 auth_experiment_protocol=0",
+            "hengevm: helper-health protocol=4 pid=456 stage=ready helper_version=0 auth_experiment_protocol=0",
             "hengevm: helper-install stage=launch_requested error=none exit_code=0 pid=0",
-            "hengevm: helper-health protocol=4 pid=456 stage=ready",
+            "hengevm: helper-health protocol=4 pid=456 stage=ready helper_version=0 auth_experiment_protocol=0",
             "hengevm: helper-install stage=confirmed error=none exit_code=0 pid=456",
             "hengevm: helper-install stage=failed error=bootstrap_failed exit_code=5 pid=0",
         ])
@@ -159,7 +215,7 @@ scenario=os.environ.get("HENGE_INSTALL_TEST_SCENARIO", "ok")
 mode=sys.argv[1]
 with (root/"helper-calls.jsonl").open("a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")
 if mode == "--version":
-    print("henge-agent 4" if scenario == "version_invalid" else "henge-agent 7"); sys.exit(0)
+    print("henge-agent 4" if scenario == "version_invalid" else "__HENGE_VERSION_TEXT__"); sys.exit(0)
 if mode == "--app-pid":
     if not state["app_running"]: sys.exit(1)
     print(999); sys.exit(0)
@@ -174,6 +230,7 @@ if mode == "--health-check":
     sys.exit(0 if success and sys.argv[2] == "999" else 1)
 sys.exit(2)
 '''
+        payload = payload.replace("__HENGE_VERSION_TEXT__", VERSION_TEXT)
         (state / "new-agent").write_text(payload)
         app = home / "Applications/Henge Helper.app"
         if previous_app:

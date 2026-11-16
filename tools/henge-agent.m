@@ -288,7 +288,7 @@ static void keepMounted(void) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc == 2 && !strcmp(argv[1], "--version")) { puts("henge-agent 7"); return 0; }
+        if (argc == 2 && !strcmp(argv[1], "--version")) { puts(HENGE_HELPER_VERSION_TEXT); return 0; }
         if (argc == 2 && !strcmp(argv[1], "--app-pid")) return HengeHelperAppPID();
         if (argc == 2 && !strcmp(argv[1], "--quit-app")) return HengeHelperQuitApp();
         if (argc == 2 && !strcmp(argv[1], "--login-status")) { puts(HengeHelperLoginStatus()); return 0; }

@@ -84,11 +84,17 @@ char *hv_share_auth_state(void) {
     Text json={0};
     addf(&json,"{\"protocol\":1,\"session\":\"%s\",\"launch_id\":\"%s\",\"mode\":\"%s\","
         "\"enabled\":%s,\"running\":%s,\"foreground\":%s,\"fresh\":%s,\"active\":%s,\"busy\":%s,"
-        "\"state_age_ms\":%lld,\"accepted_requests\":%llu,\"completed_requests\":%llu,\"refused_requests\":%llu,\"events\":[",
+        "\"state_age_ms\":%lld,\"accepted_requests\":%llu,\"completed_requests\":%llu,\"refused_requests\":%llu,"
+        "\"enable_attempts\":%llu,\"enable_successes\":%llu,\"enable_failures\":%llu,"
+        "\"last_enable_error\":\"%s\",\"last_enable_mode\":\"%s\",\"backend_registered\":%s,\"last_enable_backend_registered\":%s,\"events\":[",
         state.session,state.launch_id,hv_device_auth_mode_name(state.mode),state.enabled?"true":"false",state.running?"true":"false",
         state.foreground?"true":"false",state.fresh?"true":"false",state.active?"true":"false",state.busy?"true":"false",
         (long long)state.state_age_ms,(unsigned long long)state.accepted_requests,(unsigned long long)state.completed_requests,
-        (unsigned long long)state.refused_requests);
+        (unsigned long long)state.refused_requests,
+        (unsigned long long)state.enable_attempts,(unsigned long long)state.enable_successes,(unsigned long long)state.enable_failures,
+        state.enable_attempts?hv_device_auth_error_name(state.last_enable_error):"not_attempted",
+        !state.enable_attempts?"not_attempted":state.last_enable_mode==HV_DEVICE_AUTH_MODE_NONE?"invalid":hv_device_auth_mode_name(state.last_enable_mode),
+        state.backend_registered?"true":"false",state.last_enable_backend_registered?"true":"false");
     for (size_t i=0;i<state.event_count;i++) {
         const HvDeviceAuthEvent *e=&state.events[i];
         if (i) adds(&json,",");

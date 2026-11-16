@@ -364,6 +364,20 @@ BOOL HengeAuthSignaturePolicy(NSDictionary *info) {
     return !(bits & kSecCodeSignatureLibraryValidation) ||
            entitlement(info, @"com.apple.security.cs.disable-library-validation");
 }
+NSDictionary *HengeAuthSignaturePolicySnapshot(NSDictionary *info) {
+    id flags = info[(__bridge NSString *)kSecCodeInfoFlags];
+    BOOL known = [flags isKindOfClass:NSNumber.class];
+    NSMutableDictionary *facts = [@{@"flags_known": @(known),
+        @"dyld_environment_allowed": @(entitlement(info, @"com.apple.security.cs.allow-dyld-environment-variables")),
+        @"library_validation_exception": @(entitlement(info, @"com.apple.security.cs.disable-library-validation")),
+        @"policy_allows_adapter": @(HengeAuthSignaturePolicy(info))} mutableCopy];
+    if (known) {
+        uint32_t bits = [flags unsignedIntValue];
+        facts[@"hardened_runtime"] = @((bits & kSecCodeSignatureRuntime) != 0);
+        facts[@"library_validation_flag"] = @((bits & kSecCodeSignatureLibraryValidation) != 0);
+    }
+    return facts;
+}
 static BOOL expectedBundle(NSString *bundlePath) {
     NSString *canonical = bundlePath.stringByResolvingSymlinksInPath;
 #ifdef HENGE_AUTH_TESTING
@@ -391,22 +405,22 @@ static BOOL signingIdentity(NSDictionary *info) {
 #endif
     return [info[(__bridge NSString *)kSecCodeInfoTeamIdentifier] isEqual:@"2DC432GLL2"];
 }
-BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **error) {
+static NSDictionary *targetIdentityInformation(NSString *bundlePath, NSError **error) {
     if (error) *error = nil;
     NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
     NSString *executable = [bundle objectForInfoDictionaryKey:@"CFBundleExecutable"];
     if (!expectedBundle(bundlePath) || ![bundle.bundleIdentifier isEqual:expectedIdentifier()] ||
         ![executable isEqual:expectedExecutable()] || !bundle.executablePath) {
-        if (error) *error = HengeAuthError(TargetIdentity); return NO;
+        if (error) *error = HengeAuthError(TargetIdentity); return nil;
     }
     NSString *expected = [[bundlePath stringByAppendingPathComponent:
         [@"Contents/MacOS" stringByAppendingPathComponent:expectedExecutable()]] stringByResolvingSymlinksInPath];
     if (![bundle.executablePath.stringByResolvingSymlinksInPath isEqual:expected]) {
-        if (error) *error = HengeAuthError(TargetIdentity); return NO;
+        if (error) *error = HengeAuthError(TargetIdentity); return nil;
     }
     struct stat st;
     if (lstat(expected.fileSystemRepresentation, &st) || !S_ISREG(st.st_mode) || (st.st_mode & (S_ISUID | S_ISGID))) {
-        if (error) *error = HengeAuthError(TargetIdentity); return NO;
+        if (error) *error = HengeAuthError(TargetIdentity); return nil;
     }
     SecStaticCodeRef code = NULL;
     CFDictionaryRef information = NULL;
@@ -417,11 +431,36 @@ BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **e
     NSDictionary *info = CFBridgingRelease(information);
     if (code) CFRelease(code);
     if (status != errSecSuccess || !info) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:status userInfo:nil]; return NO;
+        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:status userInfo:nil]; return nil;
     }
-    if (!signingIdentity(info)) { if (error) *error = HengeAuthError(TargetIdentity); return NO; }
+    if (!signingIdentity(info)) { if (error) *error = HengeAuthError(TargetIdentity); return nil; }
+    return info;
+}
+BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **error) {
+    NSDictionary *info = targetIdentityInformation(bundlePath, error);
+    if (!info) return NO;
     if (checkPolicy && !HengeAuthSignaturePolicy(info)) { if (error) *error = HengeAuthError(SignaturePolicy); return NO; }
     return YES;
+}
+NSDictionary *HengeAuthTargetPreflight(NSString *bundlePath, NSError **error) {
+    NSDictionary *info = targetIdentityInformation(bundlePath, error);
+    if (!info) return nil;
+    NSMutableDictionary *facts = [HengeAuthSignaturePolicySnapshot(info) mutableCopy];
+    NSString *canonicalBundle = bundlePath.stringByResolvingSymlinksInPath;
+    NSString *canonicalExecutable = [NSBundle bundleWithPath:canonicalBundle].executablePath.stringByResolvingSymlinksInPath;
+    BOOL running = NO;
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:expectedIdentifier()]) {
+        // A closed window does not imply process exit. Match the validated
+        // main executable and bundle, never an Electron child or another copy.
+        if (!app.terminated && [app.bundleIdentifier isEqual:expectedIdentifier()] &&
+            [app.bundleURL.path.stringByResolvingSymlinksInPath isEqual:canonicalBundle] &&
+            [app.executableURL.path.stringByResolvingSymlinksInPath isEqual:canonicalExecutable]) {
+            running = YES;
+            break;
+        }
+    }
+    facts[@"main_process_running"] = @(running);
+    return facts;
 }
 BOOL HengeAuthCurrentProcessMatches(NSString *bundlePath, NSError **error) {
     if (error) *error = nil;
@@ -518,6 +557,9 @@ void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, 
                    NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes) {
     if (!uuid(session) || !uuid(launchID) || !uuid(requestID)) return;
     NSArray *stages = @[@"launch_requested", @"target_not_found", @"target_identity_mismatch", @"target_signature_invalid",
+        @"target_process_running", @"target_process_not_running", @"policy_flags_unavailable",
+        @"policy_runtime_on", @"policy_runtime_off", @"policy_library_flag_on", @"policy_library_flag_off",
+        @"policy_dyld_env_allowed", @"policy_dyld_env_not_allowed", @"policy_library_exception_on", @"policy_library_exception_off",
         @"signature_policy_blocked", @"already_running", @"launch_started", @"launch_failed", @"launch_timeout",
         @"adapter_loaded", @"adapter_not_loaded", @"adapter_target_rejected", @"adapter_abi_mismatch", @"adapter_ready",
         @"probe_requested", @"probe_result", @"token_requested", @"token_result", @"baa_data_requested", @"baa_data_result",
@@ -592,15 +634,25 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     }
     NSString *target = findTarget();
     if (!target) { event(@"target_not_found", HengeAuthError(TargetMissing)); return 1; }
-    if (!HengeAuthTargetIdentity(target, YES, &error)) {
-        NSString *stage = [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == SignaturePolicy ? @"signature_policy_blocked" :
-            ([error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity ? @"target_identity_mismatch" : @"target_signature_invalid");
+    NSDictionary *preflight = HengeAuthTargetPreflight(target, &error);
+    if (!preflight) {
+        NSString *stage = [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity
+            ? @"target_identity_mismatch" : @"target_signature_invalid";
         event(stage, error); return 1;
     }
-    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:expectedIdentifier()])
-        if ([app.bundleURL.path.stringByResolvingSymlinksInPath isEqual:target]) {
-            event(@"already_running", HengeAuthError(AlreadyRunning)); return 1;
-        }
+    event([preflight[@"main_process_running"] boolValue] ? @"target_process_running" : @"target_process_not_running", nil);
+    if ([preflight[@"flags_known"] boolValue]) {
+        event([preflight[@"hardened_runtime"] boolValue] ? @"policy_runtime_on" : @"policy_runtime_off", nil);
+        event([preflight[@"library_validation_flag"] boolValue] ? @"policy_library_flag_on" : @"policy_library_flag_off", nil);
+    } else event(@"policy_flags_unavailable", nil);
+    event([preflight[@"dyld_environment_allowed"] boolValue] ? @"policy_dyld_env_allowed" : @"policy_dyld_env_not_allowed", nil);
+    event([preflight[@"library_validation_exception"] boolValue] ? @"policy_library_exception_on" : @"policy_library_exception_off", nil);
+    if (![preflight[@"policy_allows_adapter"] boolValue]) {
+        event(@"signature_policy_blocked", HengeAuthError(SignaturePolicy)); return 1;
+    }
+    if ([preflight[@"main_process_running"] boolValue]) {
+        event(@"already_running", HengeAuthError(AlreadyRunning)); return 1;
+    }
     NSString *adapter = resource(@"henge-auth-adapter.dylib");
     if (!adapter || [adapter containsString:@":"]) { event(@"launch_failed", HengeAuthError(LaunchFailed)); return 1; }
     // Check that the independently signed adapter is intact as well. The target

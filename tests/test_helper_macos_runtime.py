@@ -26,6 +26,9 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 ADDRESS = "10.0.2.4"
+VERSION_HEADER = (ROOT / "tools/helper-version.h").read_text()
+HELPER_VERSION = int(re.search(r"(?m)^#define HENGE_HELPER_VERSION ([0-9]+)$", VERSION_HEADER).group(1))
+AUTH_PROTOCOL = int(re.search(r"(?m)^#define HENGE_HELPER_AUTH_EXPERIMENT_PROTOCOL ([0-9]+)$", VERSION_HEADER).group(1))
 
 
 class GateError(Exception):
@@ -116,7 +119,8 @@ def main():
         helper = args.helper.resolve()
     if args.mode == "app" and matching_pids(helper):
         raise GateError("test_app_already_running")
-    expected_version = args.expected_version or ("henge-agent 4" if args.mode == "legacy" else "henge-agent 7")
+    expected_version = args.expected_version or ("henge-agent 4" if args.mode == "legacy" else f"henge-agent {HELPER_VERSION}")
+    expect_runtime_capabilities = args.mode == "app" and expected_version == f"henge-agent {HELPER_VERSION}"
     command(["/usr/bin/codesign", "--verify", "--strict", app or helper])
     if command([helper, "--version"]).stdout.strip() != expected_version:
         raise GateError("helper_version_mismatch")
@@ -143,6 +147,7 @@ def main():
                "lan_privacy_authorization_tested": False, "clipboard_tested": False,
                "shared_mount_tested": False, "login_registration_tested": False,
                "smoke_test_marker_verified": False, "app_pid_cli_verified": False,
+               "runtime_version_heartbeat_verified": False,
                "app_quit_cli_verified": False, "cleanup_complete": False}
     failure = None
     launched_app_pids = set()
@@ -231,6 +236,13 @@ def main():
                 except (ValueError, OSError):
                     collector_seen = False
             if connected:
+                summary["observed_helper_version"] = health.get("helper_version", 0)
+                summary["observed_auth_experiment_protocol"] = health.get("auth_experiment_protocol", 0)
+                if expect_runtime_capabilities:
+                    if (type(health.get("helper_version")) is not int or health["helper_version"] != HELPER_VERSION or
+                        type(health.get("auth_experiment_protocol")) is not int or health["auth_experiment_protocol"] != AUTH_PROTOCOL):
+                        raise GateError("running_helper_capabilities_mismatch")
+                    summary["runtime_version_heartbeat_verified"] = True
                 if pid != previous_pid:
                     stable_start, previous_pid = time.monotonic(), pid
                 if (collector_seen and stable_start is not None and time.monotonic() - stable_start >= args.stable_seconds and

@@ -16,14 +16,18 @@ NSDictionary *HengeHelperValidateHealth(NSData *data) {
     if (![value isKindOfClass:NSDictionary.class]) return nil;
     NSDictionary *health = value;
     NSString *session = health[@"session"];
+    id helperVersion = health[@"helper_version"] ?: @0;
+    id authProtocol = health[@"auth_experiment_protocol"] ?: @0;
     if (!integer(health[@"protocol"], 1, 1) || ![session isKindOfClass:NSString.class] || session.length != 36 ||
         ![[NSUUID alloc] initWithUUIDString:session] || !integer(health[@"helper_protocol"], 0, 4) ||
         ![@[@0, @4] containsObject:health[@"helper_protocol"]] || !integer(health[@"helper_pid"], 0, INT_MAX) ||
-        !integer(health[@"agent_seen_s"], -1, INT_MAX) || !integer(health[@"probe_seen_s"], -1, INT_MAX)) return nil;
+        !integer(health[@"agent_seen_s"], -1, INT_MAX) || !integer(health[@"probe_seen_s"], -1, INT_MAX) ||
+        !integer(helperVersion, 0, 65535) || !integer(authProtocol, 0, 65535)) return nil;
     NSArray *stages = @[@"unseen", @"network_ready", @"clipboard_starting", @"ready", @"clipboard_unavailable"];
     if (![stages containsObject:health[@"startup_stage"]]) return nil;
     // Return only the fields this module uses, never arbitrary server text.
     return @{@"session": session, @"helper_protocol": health[@"helper_protocol"], @"helper_pid": health[@"helper_pid"],
+             @"helper_version": helperVersion, @"auth_experiment_protocol": authProtocol,
              @"agent_seen_s": health[@"agent_seen_s"], @"probe_seen_s": health[@"probe_seen_s"], @"startup_stage": health[@"startup_stage"]};
 }
 
@@ -39,7 +43,9 @@ BOOL HengeHelperPing(HengeHelperTransport transport, NSString *stage, BOOL probe
     NSData *data = transport(@"GET", @"/.henge/helper/health", nil, &status);
     NSDictionary *health = status == 200 ? HengeHelperValidateHealth(data) : nil;
     if (!health) return NO;
-    NSString *path = [NSString stringWithFormat:@"/.henge/helper/ping?kind=%@&protocol=4&pid=%d&stage=%@", probe ? @"probe" : @"agent", getpid(), stage];
+    NSString *path = [NSString stringWithFormat:@"/.henge/helper/ping?kind=%@&protocol=%d&pid=%d&stage=%@&helper_version=%d&auth_experiment_protocol=%d",
+        probe ? @"probe" : @"agent", HENGE_HELPER_HEALTH_PROTOCOL, getpid(), stage,
+        HENGE_HELPER_VERSION, HENGE_HELPER_AUTH_EXPERIMENT_PROTOCOL];
     data = transport(@"GET", path, health[@"session"], &status);
     if (!data || status != 200 || data.length > 4096) return NO;
     id ack = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];

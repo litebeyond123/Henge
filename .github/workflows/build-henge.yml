@@ -28,31 +28,10 @@ env:
   HENGE_PACKAGE_OUTPUT_DIR: ${{ github.workspace }}/packages
   HENGE_BUILD_LOG_DIR: ${{ github.workspace }}/build-logs
   HENGE_EXPECTED_VERSION: '0.4.0'
-  HENGE_EXPECTED_BUILD: '4008'
+  HENGE_EXPECTED_BUILD: '4009'
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  # The first Test7 verification runs predate the concurrency group above.
-  # Retire only the exact earlier run that the final log-delivery fix supersedes.
-  # This job receives no source checkout or repository-content write permission.
-  retire-superseded-test7:
-    if: ${{ github.repository == 'litebeyond123/Henge' && github.ref == 'refs/heads/work/0.4-ipados17-test' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    permissions:
-      actions: write
-    steps:
-      - uses: actions/github-script@v7
-        with:
-          script: |
-            const runId = 43822420280;
-            const args = {owner: context.repo.owner, repo: context.repo.repo, run_id: runId};
-            const {data: run} = await github.rest.actions.getWorkflowRun(args);
-            if (run.head_sha !== 'd3a184b2a64c5bd8657072a368abaabebf2a975b' || run.head_branch !== 'work/0.4-ipados17-test') {
-              throw new Error('Superseded run identity mismatch');
-            }
-            if (run.status !== 'completed') await github.rest.actions.cancelWorkflowRun(args);
-
   build:
     # Preserve the runner used by the successful 2ed42fcf61f2 build.
     runs-on: xcode-27
@@ -139,10 +118,13 @@ jobs:
           make build/test_helper_health build/henge-agent.gz build/henge-helper.app.tar.gz 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-health-compile.log"
           build/test_helper_health 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-health-tests.log"
           codesign --verify --strict build/henge-agent
-          test "$(build/henge-agent --version)" = "henge-agent 7"
+          test "$(build/henge-agent --version)" = "henge-agent 8"
           xcrun --sdk macosx swiftc -swift-version 5 ios/Henge/Sharing.swift tests/test_helper_status.swift \
             -o "$RUNNER_TEMP/henge-test-helper-status" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-status-compile.log"
           "$RUNNER_TEMP/henge-test-helper-status" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-status-tests.log"
+          xcrun --sdk macosx swiftc -swift-version 5 ios/Henge/Sharing.swift ios/Henge/DeviceAuthProgress.swift tests/test_device_auth_progress.swift \
+            -o "$RUNNER_TEMP/henge-test-auth-progress" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/auth-progress-compile.log"
+          "$RUNNER_TEMP/henge-test-auth-progress" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/auth-progress-tests.log"
 
       - name: Run the signed Mac helper through actual LaunchServices
         working-directory: Henge
@@ -258,7 +240,7 @@ jobs:
       - name: Upload validated TIPA and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4008-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4009-tipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.manifest.json
@@ -282,7 +264,7 @@ jobs:
         if: ${{ success() && inputs.include_ipa }}
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4008-ipa-${{ github.sha }}
+          name: Henge-0.4.0-4009-ipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.manifest.json
@@ -300,8 +282,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  publish-test7:
-    name: Publish the validated Test 7 prerelease
+  publish-test8:
+    name: Publish the validated Test 8 prerelease
     needs: build
     if: ${{ success() && github.repository == 'litebeyond123/Henge' && github.ref == 'refs/heads/work/0.4-ipados17-test' }}
     runs-on: ubuntu-latest
@@ -315,13 +297,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          sparse-checkout: docs/release-test7.md
+          sparse-checkout: docs/release-test8.md
           sparse-checkout-cone-mode: false
 
       - name: Download the validated package from this run
         uses: actions/download-artifact@v4
         with:
-          name: Henge-0.4.0-4008-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4009-tipa-${{ github.sha }}
           path: validated-package
 
       - name: Verify and name release assets
@@ -336,28 +318,28 @@ jobs:
           digest = hashlib.sha256(package.read_bytes()).hexdigest()
           assert manifest['source']['henge_commit'] == os.environ['BUILT_COMMIT'], 'Source commit mismatch'
           assert manifest['application']['version'] == '0.4.0', 'Version mismatch'
-          assert manifest['application']['build'] == '4008', 'Build mismatch'
+          assert manifest['application']['build'] == '4009', 'Build mismatch'
           assert manifest['package']['sha256'] == digest, 'Package digest mismatch'
           out = pathlib.Path('release-assets')
           out.mkdir()
-          name = 'Henge-0.4.0-test7.tipa'
+          name = 'Henge-0.4.0-test8.tipa'
           shutil.copyfile(package, out / name)
           manifest['package']['filename'] = name
-          (out / 'Henge-0.4.0-test7.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-          (out / 'Henge-0.4.0-test7.sha256').write_text(f'{digest}  {name}\n')
-          print(f'Validated Test 7 package: {digest}')
+          (out / 'Henge-0.4.0-test8.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          (out / 'Henge-0.4.0-test8.sha256').write_text(f'{digest}  {name}\n')
+          print(f'Validated Test 8 package: {digest}')
           PY
 
-      - name: Publish Test 7 as a prerelease
+      - name: Publish Test 8 as a prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BUILT_COMMIT: ${{ github.sha }}
         run: |
-          gh release create v0.4.0-test7 \
+          gh release create v0.4.0-test8 \
             --target "$BUILT_COMMIT" --prerelease --latest=false \
-            --title "Henge 0.4 Test 7 (4008)" \
-            --notes-file docs/release-test7.md \
-            release-assets/Henge-0.4.0-test7.tipa \
-            release-assets/Henge-0.4.0-test7.manifest.json \
-            release-assets/Henge-0.4.0-test7.sha256
+            --title "Henge 0.4 Test 8 (4009)" \
+            --notes-file docs/release-test8.md \
+            release-assets/Henge-0.4.0-test8.tipa \
+            release-assets/Henge-0.4.0-test8.manifest.json \
+            release-assets/Henge-0.4.0-test8.sha256

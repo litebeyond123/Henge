@@ -184,7 +184,8 @@ def main() -> int:
         sys.stdout.buffer.write(unit.stdout)
         sys.stdout.flush()
         scenarios = ["public_success", "unsupported", "token_error", "empty_token", "mismatched_response",
-                     "session_revoked", "baa_success", "baa_bad_input", "signature_blocked", "identity_mismatch"]
+                     "session_revoked", "baa_success", "baa_bad_input", "signature_blocked", "identity_mismatch",
+                     "already_running", "signature_blocked_running"]
         for scenario in scenarios:
             case = folder / scenario
             application = case / "Fixture.app"
@@ -198,7 +199,7 @@ def main() -> int:
                     "HengeFixtureScenario": scenario, "HengeFixtureResultPath": str(result_path)}
             (application / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
             entitlements = {"com.apple.security.cs.disable-library-validation": True}
-            if scenario != "signature_blocked":
+            if not scenario.startswith("signature_blocked"):
                 entitlements["com.apple.security.cs.allow-dyld-environment-variables"] = True
             entitlements_path = case / "fixture-entitlements.plist"
             entitlements_path.write_bytes(plistlib.dumps(entitlements))
@@ -207,12 +208,25 @@ def main() -> int:
             service = Service(scenario)
             thread = threading.Thread(target=service.serve_forever, daemon=True)
             thread.start()
+            holder = None
+            window_marker = case / "window-closed.json"
             try:
                 child_env = dict(env, HENGE_AUTH_TEST_PORT=str(service.server_port),
                                  HENGE_AUTH_TEST_APP=str(application), HENGE_AUTH_TEST_LOG_DIRECTORY=str(case / "logs"))
                 before = {str(path.relative_to(application)): hashlib.sha256(path.read_bytes()).digest()
                           for path in application.rglob("*") if path.is_file()}
-                expected_failure = scenario in {"signature_blocked", "identity_mismatch"}
+                if scenario in {"already_running", "signature_blocked_running"}:
+                    holder = subprocess.Popen([str(macos / "HengeAuthFixture"), "--hold-closed-window", str(window_marker)],
+                                              env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    deadline = time.monotonic() + 10
+                    while not window_marker.exists() and holder.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if not window_marker.exists() or holder.poll() is not None:
+                        raise AssertionError("owned window fixture did not remain alive after closing its window")
+                    closed = json.loads(window_marker.read_text())
+                    if closed.get("window_closed") is not True or closed.get("pid") != holder.pid:
+                        raise AssertionError("owned fixture did not confirm its closed window and exact main PID")
+                expected_failure = scenario in {"signature_blocked", "identity_mismatch", "already_running", "signature_blocked_running"}
                 run = command([str(launcher), "--session", service.session, "--launch-id", service.launch_id,
                                "--mode", service.mode], env=child_env, timeout=50, expected=1 if expected_failure else 0)
                 if expected_failure:
@@ -242,11 +256,27 @@ def main() -> int:
                     raise AssertionError("event ring exceeds its bound")
                 events = [json.loads(line) for line in local_events.splitlines()]
                 stages = {event["stage"] for event in events}
+                server_stages = {event["stage"] for event in service.events}
+                if scenario == "identity_mismatch":
+                    if any(stage.startswith(("target_process_", "policy_")) for stage in stages):
+                        raise AssertionError("unverified target was reported as a validated process/policy observation")
+                else:
+                    observed_process = "target_process_running" if holder else "target_process_not_running"
+                    observations = {observed_process, "policy_runtime_on", "policy_library_exception_on",
+                                    "policy_dyld_env_not_allowed" if scenario.startswith("signature_blocked") else "policy_dyld_env_allowed"}
+                    if not observations <= stages or not observations <= server_stages:
+                        raise AssertionError(f"{scenario}: verified preflight facts were not delivered to host")
+                    if len(stages & {"policy_library_flag_on", "policy_library_flag_off"}) != 1 or "policy_flags_unavailable" in stages:
+                        raise AssertionError("known signature flags were not distinguished from unavailable flags")
+                    for event in events:
+                        if event["stage"].startswith(("target_process_", "policy_")) and any(event[key] for key in ("errorCode", "inputBytes", "resultBytes")):
+                            raise AssertionError("preflight facts must not overload error/byte fields")
                 if expected_failure:
-                    required = "signature_policy_blocked" if scenario == "signature_blocked" else "target_identity_mismatch"
+                    required = ("signature_policy_blocked" if scenario.startswith("signature_blocked") else
+                                "already_running" if scenario == "already_running" else "target_identity_mismatch")
                     if required not in stages or "adapter_loaded" in stages or service.operations:
                         raise AssertionError(f"{scenario}: preflight did not stop before injection")
-                    if required not in {event["stage"] for event in service.events}:
+                    if required not in server_stages:
                         raise AssertionError(f"{scenario}: short-lived launcher exited before delivering its failure stage")
                 elif "adapter_loaded" not in stages or "adapter_ready" not in stages or not service.operations["probe"]:
                     raise AssertionError(f"{scenario}: adapter did not actually load and call the backend")
@@ -263,12 +293,38 @@ def main() -> int:
                         raise AssertionError("synthetic secret or target output leaked to experiment logs")
                 if service.failures:
                     raise AssertionError(f"fixture transport rejected request: {service.failures}")
+                if holder:
+                    if holder.poll() is not None:
+                        raise AssertionError("launcher unexpectedly stopped the already-running owned target")
+                    # The test, not the launcher, requests a cooperative exit.
+                    Path(str(window_marker) + ".stop").write_bytes(b"")
+                    if holder.wait(timeout=5) != 0:
+                        raise AssertionError("owned target did not exit cooperatively")
+                    holder = None
+                    if scenario == "signature_blocked_running":
+                        # A fully exited process now reports not-running; the identical signed
+                        # bundle still fails the unchanged policy, proving these are independent.
+                        service.launch_id = str(uuid.uuid4()).upper()
+                        command([str(launcher), "--session", service.session, "--launch-id", service.launch_id,
+                                 "--mode", service.mode], env=child_env, timeout=50, expected=1)
+                        later = {event["stage"] for event in service.events if event["launch_id"] == service.launch_id}
+                        if not {"target_process_not_running", "signature_policy_blocked"} <= later or "target_process_running" in later:
+                            raise AssertionError("process exit did not change only the independent running observation")
+                        if service.operations:
+                            raise AssertionError("policy-blocked target reached authentication after process exit")
                 after = {str(path.relative_to(application)): hashlib.sha256(path.read_bytes()).digest()
                          for path in application.rglob("*") if path.is_file()}
                 if before != after:
                     raise AssertionError("launcher or adapter changed the signed target bundle")
                 print(f"PASS real DYLD fixture {scenario}; fixed logs only", flush=True)
             finally:
+                if holder and holder.poll() is None:
+                    Path(str(window_marker) + ".stop").write_bytes(b"")
+                    try:
+                        holder.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        holder.terminate()  # Cleanup only the test's own fixture, never ChatGPT.
+                        holder.wait(timeout=5)
                 service.shutdown()
                 service.server_close()
                 thread.join(timeout=2)
