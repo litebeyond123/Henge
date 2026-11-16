@@ -373,8 +373,8 @@ NSDictionary *HengeAuthSignaturePolicySnapshot(NSDictionary *info) {
         @"policy_allows_adapter": @(HengeAuthSignaturePolicy(info))} mutableCopy];
     if (known) {
         uint32_t bits = [flags unsignedIntValue];
-        facts[@"hardened_runtime"] = @((bits & kSecCodeSignatureRuntime) != 0);
-        facts[@"library_validation_flag"] = @((bits & kSecCodeSignatureLibraryValidation) != 0);
+        facts[@"hardened_runtime"] = (bits & kSecCodeSignatureRuntime) ? @YES : @NO;
+        facts[@"library_validation_flag"] = (bits & kSecCodeSignatureLibraryValidation) ? @YES : @NO;
     }
     return facts;
 }

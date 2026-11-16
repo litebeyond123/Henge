@@ -224,7 +224,13 @@ def main() -> int:
                     if not window_marker.exists() or holder.poll() is not None:
                         raise AssertionError("owned window fixture did not remain alive after closing its window")
                     closed = json.loads(window_marker.read_text())
-                    if closed.get("window_closed") is not True or closed.get("pid") != holder.pid:
+                    pid_matches = type(closed.get("pid")) is int and closed["pid"] == holder.pid
+                    if closed.get("window_closed") is not True or not pid_matches:
+                        print("fixture window state " + json.dumps({
+                            "window_closed": closed.get("window_closed") is True,
+                            "window_closed_is_boolean": type(closed.get("window_closed")) is bool,
+                            "pid_matches": pid_matches, "holder_running": holder.poll() is None,
+                        }, sort_keys=True), flush=True)
                         raise AssertionError("owned fixture did not confirm its closed window and exact main PID")
                 expected_failure = scenario in {"signature_blocked", "identity_mismatch", "already_running", "signature_blocked_running"}
                 run = command([str(launcher), "--session", service.session, "--launch-id", service.launch_id,

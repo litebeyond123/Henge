@@ -1,5 +1,6 @@
 #import "../tools/guest-auth-experiment.h"
 #import <AppKit/AppKit.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <Security/Security.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +49,10 @@ static NSString *const session = @"11111111-1111-4111-8111-111111111111";
 static NSString *const launch = @"22222222-2222-4222-8222-222222222222";
 static NSString *const request = @"33333333-3333-4333-8333-333333333333";
 static NSData *json(id object) { return [NSJSONSerialization dataWithJSONObject:object options:0 error:NULL]; }
+static NSData *windowMarker(BOOL visible, pid_t pid) {
+    // C's unary ! has type int; @(!visible) becomes JSON 0/1 rather than true/false.
+    return json(@{@"window_closed": visible ? @NO : @YES, @"pid": @(pid)});
+}
 static NSMutableDictionary *envelope(NSString *operation, NSDictionary *result) {
     NSData *bytes = [NSPropertyListSerialization dataWithPropertyList:result format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
     return [@{@"protocol": @1, @"session": session, @"launch_id": launch, @"request_id": request,
@@ -135,8 +140,15 @@ static int unitTests(void) {
             @{@"com.apple.security.cs.allow-dyld-environment-variables": @(dyld),
               @"com.apple.security.cs.disable-library-validation": @(exception)}};
         NSDictionary *facts = HengeAuthSignaturePolicySnapshot(info);
+        NSDictionary *decoded = [NSJSONSerialization JSONObjectWithData:json(facts) options:0 error:NULL];
+        BOOL booleanTypes = YES;
+        for (NSString *key in @[@"flags_known", @"hardened_runtime", @"library_validation_flag",
+                               @"dyld_environment_allowed", @"library_validation_exception", @"policy_allows_adapter"]) {
+            id value = decoded[key];
+            if (!value || CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) booleanTypes = NO;
+        }
         BOOL allows = runtime ? (dyld && exception) : (!libraryFlag || exception);
-        check([facts[@"flags_known"] boolValue] && [facts[@"hardened_runtime"] boolValue] == runtime &&
+        check(booleanTypes && [facts[@"flags_known"] boolValue] && [facts[@"hardened_runtime"] boolValue] == runtime &&
               [facts[@"library_validation_flag"] boolValue] == libraryFlag &&
               [facts[@"dyld_environment_allowed"] boolValue] == dyld &&
               [facts[@"library_validation_exception"] boolValue] == exception &&
@@ -152,6 +164,13 @@ static int unitTests(void) {
     NSDictionary *missingFlags = HengeAuthSignaturePolicySnapshot(@{});
     check(![missingFlags[@"flags_known"] boolValue] && missingFlags[@"hardened_runtime"] == nil,
           "absent flags remain unknown");
+    for (NSNumber *visible in @[@NO, @YES]) {
+        NSDictionary *marker = [NSJSONSerialization JSONObjectWithData:windowMarker(visible.boolValue, getpid()) options:0 error:NULL];
+        id closed = marker[@"window_closed"];
+        check(closed && CFGetTypeID((__bridge CFTypeRef)closed) == CFBooleanGetTypeID() &&
+              [closed boolValue] == !visible.boolValue && [marker[@"pid"] intValue] == getpid(),
+              "window marker serializes the real visibility inverse as JSON boolean with its exact PID");
+    }
     fprintf(stdout, "guest auth unit checks=%u failures=%u\n", checks, failures); fflush(stdout);
     return failures ? 1 : 0;
 }
@@ -249,9 +268,15 @@ static int closedWindowFixture(NSString *marker) {
     NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 120, 80)
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
     window.releasedWhenClosed = NO;
+    window.animationBehavior = NSWindowAnimationBehaviorNone;
     [window orderFront:nil];
     [window close];
-    NSData *data = json(@{@"window_closed": @(!window.visible), @"pid": @(getpid())});
+    double closeDeadline = HengeAuthMonotonic() + 1;
+    while (window.visible && HengeAuthMonotonic() < closeDeadline)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    // If AppKit did not close the window in time, retain false so the strict
+    // parent assertion fails with observable state rather than claiming closure.
+    NSData *data = windowMarker(window.visible, getpid());
     if (![data writeToFile:marker options:NSDataWritingAtomic error:NULL]) return 2;
     NSString *stop = [marker stringByAppendingString:@".stop"];
     double deadline = HengeAuthMonotonic() + 60;
