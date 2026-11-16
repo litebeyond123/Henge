@@ -246,6 +246,8 @@ def main() -> int:
                     required = "signature_policy_blocked" if scenario == "signature_blocked" else "target_identity_mismatch"
                     if required not in stages or "adapter_loaded" in stages or service.operations:
                         raise AssertionError(f"{scenario}: preflight did not stop before injection")
+                    if required not in {event["stage"] for event in service.events}:
+                        raise AssertionError(f"{scenario}: short-lived launcher exited before delivering its failure stage")
                 elif "adapter_loaded" not in stages or "adapter_ready" not in stages or not service.operations["probe"]:
                     raise AssertionError(f"{scenario}: adapter did not actually load and call the backend")
                 if service.mode == "public_token" and (service.operations["baa_data"] or service.operations["baa_dictionary"]):

@@ -30,6 +30,9 @@ BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **e
 BOOL HengeAuthCurrentProcessMatches(NSString *bundlePath, NSError **error);
 void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
                    NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes);
+// Only the short-lived launcher drains before exiting. Native adapter callbacks
+// never wait for diagnostic delivery; the drain is bounded to 2.5 seconds.
+void HengeAuthFlushEvents(void);
 NSString *HengeAuthEventPath(void);
 BOOL HengeAuthEventWasRecorded(NSString *launchID, NSString *stage);
 NSError *HengeAuthError(NSInteger code);

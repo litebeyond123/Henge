@@ -8,6 +8,8 @@ int main(int argc, const char *argv[]) {
             if (!value || value.length > 256) return 64;
             [arguments addObject:value];
         }
-        return HengeGuestAuthExperimentRun(arguments);
+        int result = HengeGuestAuthExperimentRun(arguments);
+        HengeAuthFlushEvents();
+        return result;
     }
 }

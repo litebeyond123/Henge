@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+# A newer push supersedes an unpublished test build on the same branch.
+concurrency:
+  group: henge-test-packages-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   HUSK: ${{ github.workspace }}/Husk
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
@@ -27,6 +32,27 @@ env:
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
+  # The first Test7 verification runs predate the concurrency group above.
+  # Retire only the exact earlier run that the final log-delivery fix supersedes.
+  # This job receives no source checkout or repository-content write permission.
+  retire-superseded-test7:
+    if: ${{ github.repository == 'litebeyond123/Henge' && github.ref == 'refs/heads/work/0.4-ipados17-test' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = 43822420280;
+            const args = {owner: context.repo.owner, repo: context.repo.repo, run_id: runId};
+            const {data: run} = await github.rest.actions.getWorkflowRun(args);
+            if (run.head_sha !== 'd3a184b2a64c5bd8657072a368abaabebf2a975b' || run.head_branch !== 'work/0.4-ipados17-test') {
+              throw new Error('Superseded run identity mismatch');
+            }
+            if (run.status !== 'completed') await github.rest.actions.cancelWorkflowRun(args);
+
   build:
     # Preserve the runner used by the successful 2ed42fcf61f2 build.
     runs-on: xcode-27

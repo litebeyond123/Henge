@@ -477,6 +477,15 @@ BOOL HengeAuthEventWasRecorded(NSString *launchID, NSString *stage) {
         if ([event[@"launch_id"] isEqual:launchID] && [event[@"stage"] isEqual:stage]) return YES;
     return NO;
 }
+static dispatch_group_t eventDeliveryGroup(void) {
+    static dispatch_group_t group;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ group = dispatch_group_create(); });
+    return group;
+}
+void HengeAuthFlushEvents(void) {
+    (void)dispatch_group_wait(eventDeliveryGroup(), dispatch_time(DISPATCH_TIME_NOW, 2500 * NSEC_PER_MSEC));
+}
 static void appendEvent(NSData *line) {
     NSString *path = HengeAuthEventPath(), *directory = path.stringByDeletingLastPathComponent;
     [NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES
@@ -528,7 +537,7 @@ void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, 
     appendEvent(line);
     // Event delivery is best effort, never recursively logs transport failures,
     // and never delays a native completion. Only the bounded safe JSON is queued.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    dispatch_group_async(eventDeliveryGroup(), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
             int status = 0;
             (void)HengeAuthHTTP(@"POST", eventPath, data, session, 4096, 2, &status, NULL);
