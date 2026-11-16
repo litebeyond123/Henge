@@ -29,16 +29,26 @@ struct GuestChatReadiness: Equatable {
 
 /// The guest can submit only a small, typed summary. Shared files are untrusted input.
 enum GuestChatDiagnosticsSchema {
+    enum CollectionMode: String {
+        case automatic, manual
+        var budgets: (collection: Int, log: Int, display: Int) {
+            self == .manual ? (35_000, 30_000, 3_000) : (10_000, 8_000, 1_500)
+        }
+    }
+    static let maximumManualWait: TimeInterval = 45
+    static let electronVersionPattern = "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,6}(-(alpha|beta|rc|nightly)\\.[0-9]{1,12})?"
     struct Request {
         let sessionID: UUID
         let requestID: UUID
         let created: Date
         let expires: Date
         let collect: Bool
-        init(sessionID: UUID, now: Date = Date(), collect: Bool = true) {
+        let collectionMode: CollectionMode
+        init(sessionID: UUID, now: Date = Date(), collect: Bool = true, collectionMode: CollectionMode = .automatic) {
             self.sessionID = sessionID
             requestID = UUID()
             self.collect = collect
+            self.collectionMode = collect ? collectionMode : .automatic
             // New helpers use the explicit Bool; the old timestamp also keeps
             // an older helper from collecting under ordinary clock drift.
             let start = collect ? now : now.addingTimeInterval(-86_400)
@@ -47,7 +57,8 @@ enum GuestChatDiagnosticsSchema {
         }
         var dictionary: [String: Any] {
             ["schema_version": 1, "task": "chat_error_summary", "vm_session_id": sessionID.uuidString,
-             "request_id": requestID.uuidString, "created_utc": utc(created), "expires_utc": utc(expires), "collect": collect]
+             "request_id": requestID.uuidString, "created_utc": utc(created), "expires_utc": utc(expires), "collect": collect,
+             "collection_mode": collectionMode.rawValue]
         }
     }
 
@@ -104,7 +115,7 @@ enum GuestChatDiagnosticsSchema {
               let architecture = choice(raw["architecture"], ["arm64", "arm64e", "x86_64", "unknown"]),
               let found = raw["client_found"] as? NSNumber, CFGetTypeID(found) == CFBooleanGetTypeID(),
               integer(raw["log_window_seconds"], maximum: 900) == 900,
-              let elapsed = integer(raw["collection_elapsed_ms"], maximum: 30_000),
+              let elapsed = integer(raw["collection_elapsed_ms"], maximum: raw["collection_mode"] as? String == "manual" ? 60_000 : 30_000),
               let events = integer(raw["log_event_count"], maximum: 50_000),
               let matched = integer(raw["matched_event_count"], maximum: events),
               raw["source_scope"] as? String == "mixed_chatgpt_device_services",
@@ -165,7 +176,7 @@ enum GuestChatDiagnosticsSchema {
         let phaseChoices: [(String, [String])] = [
             ("log_command_status", commandStatuses), ("metadata_status", ["complete", "partial"]),
             ("signature_display_status", commandStatuses + ["not_found"]),
-            ("signature_verify_status", commandStatuses + ["not_found"])
+            ("signature_verify_status", commandStatuses + ["not_found", "not_requested"])
         ]
         for (key, choices) in phaseChoices {
             if let rawValue = raw[key] {
@@ -175,10 +186,44 @@ enum GuestChatDiagnosticsSchema {
         }
         for key in ["log_command_elapsed_ms", "metadata_elapsed_ms", "signature_display_elapsed_ms", "signature_verify_elapsed_ms"] {
             if let rawValue = raw[key] {
-                guard let value = integer(rawValue, maximum: 30_000) else { return nil }
+                guard let value = integer(rawValue, maximum: raw["collection_mode"] as? String == "manual" ? 60_000 : 30_000) else { return nil }
                 result[key] = value
             }
         }
+        let budgetKeys = ["collection_budget_ms", "collection_effective_budget_ms", "log_command_budget_ms",
+                          "log_command_effective_budget_ms", "signature_display_budget_ms",
+                          "signature_display_effective_budget_ms", "signature_verify_budget_ms"]
+        if raw["collection_mode"] != nil || budgetKeys.contains(where: { raw[$0] != nil }) {
+            guard let mode = (raw["collection_mode"] as? String).flatMap(CollectionMode.init(rawValue:)),
+                  mode == request.collectionMode else { return nil }
+            let budgets = mode.budgets
+            let expected = ["collection_budget_ms": budgets.collection, "log_command_budget_ms": budgets.log,
+                            "signature_display_budget_ms": budgets.display, "signature_verify_budget_ms": 0]
+            for (key, maximum) in expected {
+                guard integer(raw[key], maximum: maximum) == maximum else { return nil }
+                result[key] = maximum
+            }
+            guard let effective = integer(raw["collection_effective_budget_ms"], maximum: budgets.collection),
+                  let log = integer(raw["log_command_effective_budget_ms"], maximum: min(budgets.log, effective)),
+                  let display = integer(raw["signature_display_effective_budget_ms"], maximum: min(budgets.display, effective)) else { return nil }
+            result["collection_mode"] = mode.rawValue
+            result["collection_effective_budget_ms"] = effective
+            result["log_command_effective_budget_ms"] = log
+            result["signature_display_effective_budget_ms"] = display
+            // Test11 does not duplicate the launcher's validation in the collector.
+            // Metadata display must never be promoted to a verified signature.
+            guard signatureCheck == (found.boolValue ? "not_verified" : "not_found"),
+                  result["signature_verify_status"] as? String == (found.boolValue ? "not_requested" : "not_found"),
+                  result["signature_verify_elapsed_ms"] as? Int == 0 else { return nil }
+        }
+        if let rawStatus = raw["electron_framework_metadata_status"] {
+            guard let metadataStatus = choice(rawStatus, ["complete", "not_found", "unavailable", "invalid"]) else { return nil }
+            result["electron_framework_metadata_status"] = metadataStatus
+            if metadataStatus == "complete" {
+                guard let version = string(raw["electron_framework_version"], pattern: electronVersionPattern, limit: 48) else { return nil }
+                result["electron_framework_version"] = version
+            } else if raw["electron_framework_version"] != nil { return nil }
+        } else if raw["electron_framework_version"] != nil { return nil }
         if let started = raw["log_command_started"] {
             guard let value = started as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
             result["log_command_started"] = value.boolValue
@@ -255,9 +300,22 @@ enum GuestChatDiagnosticsSchema {
         let command = choice(report["log_command_status"], commandStatuses) ?? "legacy_unreported"
         var fields = ["result=\(status)", "request=\(request)", "collected_utc=\(collected)",
                       "log_counts_status=\(availability)", "classification=\(classification)", "log_command_status=\(command)"]
+        if let mode = choice(report["collection_mode"], ["automatic", "manual"]) { fields.append("collection_mode=\(mode)") }
+        for (key, choices) in [("metadata_status", ["complete", "partial"]),
+                              ("signature_display_status", commandStatuses + ["not_found"]),
+                              ("signature_verify_status", commandStatuses + ["not_found", "not_requested"]),
+                              ("electron_framework_metadata_status", ["complete", "not_found", "unavailable", "invalid"])] {
+            if let value = choice(report[key], choices) { fields.append("\(key)=\(value)") }
+        }
+        if let version = string(report["electron_framework_version"], pattern: electronVersionPattern, limit: 48) {
+            fields.append("electron_framework_version=\(version)")
+        }
         for key in ["collection_elapsed_ms", "log_command_elapsed_ms", "log_event_count", "matched_event_count",
+                    "metadata_elapsed_ms", "signature_display_elapsed_ms", "signature_verify_elapsed_ms",
+                    "collection_budget_ms", "collection_effective_budget_ms", "log_command_budget_ms", "log_command_effective_budget_ms",
+                    "signature_display_budget_ms", "signature_display_effective_budget_ms", "signature_verify_budget_ms",
                     "chatgpt_matched_event_count", "system_devicecheck_matched_event_count", "unknown_source_matched_event_count"] + countKeys {
-            if let value = integer(report[key], maximum: 50_000) { fields.append("\(key)=\(value)") }
+            if let value = integer(report[key], maximum: 60_000) { fields.append("\(key)=\(value)") }
         }
         return fields.joined(separator: " ")
     }
@@ -430,13 +488,13 @@ import UIKit
         }
     }
 
-    private static func makeRequest(collect: Bool = true) -> Bool {
+    private static func makeRequest(collect: Bool = true, collectionMode: GuestChatDiagnosticsSchema.CollectionMode = .automatic) -> Bool {
         guard let session else { return false }
-        let next = GuestChatDiagnosticsSchema.Request(sessionID: session, collect: collect)
+        let next = GuestChatDiagnosticsSchema.Request(sessionID: session, collect: collect, collectionMode: collectionMode)
         guard let data = try? JSONSerialization.data(withJSONObject: next.dictionary, options: [.sortedKeys]),
               GuestChatDiagnosticsFiles.write(data, directory: folder, name: "request.json") else { return false }
         request = next; imported = nil
-        HengeLog.log("guest-diagnostics", "request=\(collect ? "collection" : "heartbeat_only")")
+        HengeLog.log("guest-diagnostics", "request=\(collect ? "collection" : "heartbeat_only") collection_mode=\(next.collectionMode.rawValue)")
         return true
     }
 
@@ -488,7 +546,12 @@ import UIKit
         value["data_freshness"] = lastSafeReport == nil ? "no_guest_snapshot" : "stale"
         value["host_status_utc"] = GuestChatDiagnosticsSchema.utc(Date())
         if let session { value["active_vm_session_id"] = session.uuidString }
-        if let request { value["active_request_id"] = request.requestID.uuidString }
+        if let request {
+            value["active_request_id"] = request.requestID.uuidString
+            value["active_collection_mode"] = request.collectionMode.rawValue
+            value["active_collection_budget_ms"] = request.collectionMode.budgets.collection
+            value["active_log_budget_ms"] = request.collectionMode.budgets.log
+        }
         let heartbeat = readiness(), health = Sharing.helperHealth
         value["diagnostic_heartbeat_state"] = heartbeat.state.rawValue
         if let age = heartbeat.ageSeconds { value["diagnostic_heartbeat_age_seconds"] = age }
@@ -510,7 +573,7 @@ import UIKit
     }
 
     /// Main actor stays responsive. The single pending task has a fixed deadline, not arbitrary guest commands.
-    static func refresh(timeout: TimeInterval = 15) async -> String {
+    static func refresh(timeout: TimeInterval = 45) async -> String {
         guard let activeSession = session, henge_vm_state() == 1 else {
             try? fileManager.createDirectory(at: inputFolder, withIntermediateDirectories: true)
             writeState("not_running")
@@ -519,7 +582,7 @@ import UIKit
         guard !refreshing else { return "Mac diagnostics is already being collected; host diagnostics are ready." }
         refreshing = true
         defer { refreshing = false }
-        let end = ProcessInfo.processInfo.systemUptime + min(max(timeout, 0), 15)
+        let end = ProcessInfo.processInfo.systemUptime + (timeout.isFinite ? min(max(timeout, 0), GuestChatDiagnosticsSchema.maximumManualWait) : 0)
         let reconnectUntil = min(end, ProcessInfo.processInfo.systemUptime + 3)
         if !isReady() { writeState("connecting") }
         while !isReady() && ProcessInfo.processInfo.systemUptime < reconnectUntil && !Task.isCancelled {
@@ -539,7 +602,7 @@ import UIKit
                 ? "The helper is connected. \(readiness().explanation) Host diagnostics include this state; guest collection did not start."
                 : "The helper has not reconnected yet. Host diagnostics include its connection and installation receipt; guest collection did not start."
         }
-        guard makeRequest(), let requested = request else {
+        guard makeRequest(collectionMode: .manual), let requested = request else {
             writeState("unavailable")
             return "The Mac diagnostic request could not be saved. Host diagnostics are ready."
         }

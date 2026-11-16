@@ -16,6 +16,7 @@ extern "C" {
 #define HV_DEVICE_AUTH_STATE_MAX_AGE_MS 5000u
 #define HV_DEVICE_AUTH_EVENT_COUNT 32u
 #define HV_DEVICE_AUTH_STARTUP_EVENT_COUNT 48u
+#define HV_DEVICE_AUTH_STATE_RESPONSE_MAX (64u * 1024u)
 
 typedef enum {
     HV_DEVICE_AUTH_MODE_NONE = 0,
@@ -142,6 +143,12 @@ typedef enum {
     HV_DEVICE_AUTH_STAGE_PROCESS_IDENTITY_UNAVAILABLE,
     HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_CHANGED,
     HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED,
+    HV_DEVICE_AUTH_STAGE_QUIT_OPERATION_RETURNED,
+    HV_DEVICE_AUTH_STAGE_PROCESS_EXIT_PENDING,
+    HV_DEVICE_AUTH_STAGE_POST_EXIT_SIGNATURE_STARTED,
+    HV_DEVICE_AUTH_STAGE_POST_EXIT_SIGNATURE_COMPLETED,
+    HV_DEVICE_AUTH_STAGE_POST_EXIT_CENSUS_STARTED,
+    HV_DEVICE_AUTH_STAGE_POST_EXIT_CENSUS_COMPLETED,
     HV_DEVICE_AUTH_STAGE_SESSION_INACTIVE,
     /* Host-only stages cannot be submitted by the guest event route. */
     HV_DEVICE_AUTH_STAGE_HOST_REQUEST_QUEUED,
@@ -152,6 +159,15 @@ typedef enum {
     HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED,
     HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_DISABLED
 } HvDeviceAuthStage;
+
+/* Capability 4: fixed process evidence, stored once per current launch rather
+   than copied into every ring/cache entry. These fields never authorize work. */
+typedef struct {
+    int present;
+    uint32_t phase, source, state, flags, status, retries, sample_ms;
+    int operation_invoked, operation_result;
+    uint32_t phase_elapsed_ms;
+} HvDeviceAuthProcessObservation;
 
 typedef struct {
     uint64_t sequence;           /* Filled by the service, never accepted from the guest. */
@@ -166,6 +182,7 @@ typedef struct {
     uint32_t input_bytes;
     uint32_t result_bytes;
     int32_t target_pid, observed_pid; /* 0 means not observed; fixed process metadata only. */
+    HvDeviceAuthProcessObservation process;
 } HvDeviceAuthEvent;
 
 typedef struct {
@@ -191,6 +208,7 @@ typedef struct {
        by service sequence. Request/probe traffic cannot evict these facts. */
     size_t startup_event_count;
     HvDeviceAuthEvent startup_events[HV_DEVICE_AUTH_STARTUP_EVENT_COUNT];
+    HvDeviceAuthEvent process_observation; /* process.present=0 means no evidence yet. */
 } HvDeviceAuthState;
 
 typedef struct {

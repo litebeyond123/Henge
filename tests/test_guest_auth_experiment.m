@@ -88,6 +88,12 @@ static int unitTests(void) {
     state[@"protocol"] = @1; state[@"mode"] = @"future";
     check(HengeAuthValidateState(json(state)) == nil, "unknown mode rejected");
     check(HengeAuthValidateState(json(@{@"protocol": @1, @"enabled": @NO})) != nil, "disabled state needs no reusable launch identity");
+    NSMutableDictionary *largeState = [@{@"protocol": @1, @"enabled": @YES, @"session": session,
+        @"launch_id": launch, @"mode": @"public_token", @"launch_action": @"normal_quit"} mutableCopy];
+    largeState[@"fixed_evidence_padding"] = [@"" stringByPaddingToLength:40000 withString:@"x" startingAtIndex:0];
+    check(HengeAuthValidateState(json(largeState)) != nil, "capability-4 state accepts bounded evidence above the old 32KiB limit");
+    largeState[@"fixed_evidence_padding"] = [@"" stringByPaddingToLength:65536 withString:@"x" startingAtIndex:0];
+    check(!HengeAuthValidateState(json(largeState)), "capability-4 state still rejects bodies above 64KiB");
     NSData *token = [@"SYNTHETIC_TOKEN_DO_NOT_LOG" dataUsingEncoding:NSUTF8StringEncoding];
     NSMutableDictionary *wire = envelope(@"dc_token", @{@"token": token});
     NSError *error = nil;

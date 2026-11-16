@@ -16,4 +16,8 @@ NSData *HengeChatDiagnosticsTestCommand(NSString *path, NSArray<NSString *> *arg
                                       double seconds, NSUInteger limit, NSString **status);
 NSDictionary *HengeChatDiagnosticsTestLogCommand(NSString *path, NSArray<NSString *> *arguments, double seconds,
                                                NSString *executable, NSString *bundleID);
+NSDictionary *HengeChatDiagnosticsTestBudgetPlan(NSString *mode, double remainingSeconds);
+NSDictionary *HengeChatDiagnosticsTestPlannedLogCommand(NSString *mode, double remainingSeconds,
+    NSString *path, NSArray<NSString *> *arguments, NSString *executable, NSString *bundleID);
+NSDictionary *HengeChatDiagnosticsTestElectronMetadata(NSString *clientApp);
 #endif

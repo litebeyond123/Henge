@@ -60,6 +60,8 @@ static struct {
     HvDeviceAuthEvent startup_events[HV_DEVICE_AUTH_STARTUP_EVENT_COUNT];
     uint64_t startup_times[HV_DEVICE_AUTH_STARTUP_EVENT_COUNT];
     size_t startup_count;
+    HvDeviceAuthEvent process_observation;
+    uint64_t process_observation_ms;
     HvDeviceAuthWakeup wakeup;
     void *wakeup_context;
     Slot slot;
@@ -155,18 +157,20 @@ static int active_locked(uint64_t now) {
 
 static int startup_stage(HvDeviceAuthStage stage) {
     return (stage >= HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED && stage <= HV_DEVICE_AUTH_STAGE_ADAPTER_READY) ||
-        (stage >= HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING && stage <= HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED) ||
+        (stage >= HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING && stage <= HV_DEVICE_AUTH_STAGE_POST_EXIT_CENSUS_COMPLETED) ||
         stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED || stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_DISABLED;
 }
 
 _Static_assert((HV_DEVICE_AUTH_STAGE_ADAPTER_READY - HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED + 1) +
-    (HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED - HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING + 1) + 2 <=
+    (HV_DEVICE_AUTH_STAGE_POST_EXIT_CENSUS_COMPLETED - HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING + 1) + 2 <=
     HV_DEVICE_AUTH_STARTUP_EVENT_COUNT, "startup cache must hold every allowed stage");
 
 static void reset_startup_locked(void) {
     memset(service.startup_events, 0, sizeof(service.startup_events));
     memset(service.startup_times, 0, sizeof(service.startup_times));
     service.startup_count = 0;
+    memset(&service.process_observation, 0, sizeof(service.process_observation));
+    service.process_observation_ms = 0;
 }
 
 static void event_locked(const HvDeviceAuthEvent *input, int from_guest, uint64_t now) {
@@ -177,6 +181,12 @@ static void event_locked(const HvDeviceAuthEvent *input, int from_guest, uint64_
     event->age_ms = 0;
     event->from_guest = from_guest;
     memcpy(event->launch_id, service.launch_id, sizeof(event->launch_id));
+    if (from_guest && input->process.present && (!service.process_observation.process.present ||
+        input->elapsed_ms >= service.process_observation.elapsed_ms)) {
+        service.process_observation = *event;
+        service.process_observation_ms = now;
+    }
+    memset(&event->process, 0, sizeof(event->process));
     service.event_times[index] = now;
     service.event_next = (index + 1) % HV_DEVICE_AUTH_EVENT_COUNT;
     if (service.event_count < HV_DEVICE_AUTH_EVENT_COUNT) service.event_count++;
@@ -453,6 +463,9 @@ void hv_device_auth_snapshot(HvDeviceAuthState *out) {
         }
         out->startup_events[at] = event;
     }
+    out->process_observation = service.process_observation;
+    if (out->process_observation.process.present)
+        out->process_observation.age_ms = now >= service.process_observation_ms ? now - service.process_observation_ms : 0;
     pthread_mutex_unlock(&service.mutex);
 }
 
@@ -707,6 +720,14 @@ HvDeviceAuthError hv_device_auth_record_event(const char *session, const char *l
         event->elapsed_ms > 300000u || event->input_bytes > HV_DEVICE_AUTH_BODY_MAX || event->result_bytes > HV_DEVICE_AUTH_RESPONSE_MAX ||
         event->target_pid < 0 || event->observed_pid < 0)
         return HV_DEVICE_AUTH_INVALID_REQUEST;
+    const HvDeviceAuthProcessObservation *p = &event->process;
+    if (p->present != 0 && p->present != 1) return HV_DEVICE_AUTH_INVALID_REQUEST;
+    if (p->present && (p->phase > 6 || p->source > 12 || p->state > 4 || p->flags > 15 ||
+        p->status > 255 || p->retries > 25 || p->sample_ms > 300000 || p->phase_elapsed_ms > 300000 ||
+        (p->operation_invoked != 0 && p->operation_invoked != 1) ||
+        (!p->operation_invoked && p->operation_result != -1) ||
+        (p->operation_invoked && (p->operation_result < 0 || p->operation_result > 1))))
+        return HV_DEVICE_AUTH_INVALID_REQUEST;
     copy.stage = event->stage;
     copy.error_domain = event->error_domain;
     copy.error_code = event->error_code;
@@ -715,11 +736,29 @@ HvDeviceAuthError hv_device_auth_record_event(const char *session, const char *l
     copy.result_bytes = event->result_bytes;
     copy.target_pid = event->target_pid;
     copy.observed_pid = event->observed_pid;
+    if (p->present) copy.process = *p;
+    p = &copy.process;
     lock_service();
     uint64_t now = now_ms();
     refresh_locked(now);
     HvDeviceAuthError error = authorize_locked(normalized_session, launch, now);
-    if (error == HV_DEVICE_AUTH_OK) event_locked(&copy, 1, now);
+    if (error == HV_DEVICE_AUTH_OK) {
+        event_locked(&copy, 1, now);
+        /* Persist every accepted fixed guest stage once. Ring eviction must
+           not erase the earlier attempts; no arbitrary guest text is logged. */
+        flockfile(stderr);
+        fprintf(stderr, "[device-auth-guest] launch=%.36s request=%.36s stage=%s domain=%s code=%lld elapsed_ms=%u target_pid=%d observed_pid=%d",
+            launch, copy.request_id, hv_device_auth_stage_name(copy.stage),
+            hv_device_auth_domain_name(copy.error_domain), (long long)copy.error_code,
+            copy.elapsed_ms, copy.target_pid, copy.observed_pid);
+        if (copy.process.present) fprintf(stderr,
+            " process_phase=%u process_source=%u process_state=%u process_flags=%u process_status=%u process_retries=%u process_sample_ms=%u operation_invoked=%d operation_result=%d phase_elapsed_ms=%u",
+            p->phase, p->source, p->state, p->flags, p->status, p->retries, p->sample_ms,
+            p->operation_invoked, p->operation_result, p->phase_elapsed_ms);
+        fputc('\n', stderr);
+        fflush(stderr);
+        funlockfile(stderr);
+    }
     pthread_mutex_unlock(&service.mutex);
     return error;
 }
@@ -794,6 +833,8 @@ static const char *const stage_names[] = {
     "quit_refused", "quit_timeout", "target_exited_before_adapter", "adapter_initialization_failed",
     "force_quit_requested", "force_quit_completed", "force_quit_refused", "force_quit_timeout",
     "process_identity_unavailable", "target_process_changed", "target_reappeared",
+    "quit_operation_returned", "process_exit_pending", "post_exit_signature_started", "post_exit_signature_completed",
+    "post_exit_census_started", "post_exit_census_completed",
     "session_inactive", "host_request_queued", "host_request_started", "host_request_completed", "host_request_failed",
     "host_request_cancelled", "host_bridge_enabled", "host_bridge_disabled"
 };

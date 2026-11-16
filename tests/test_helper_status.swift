@@ -27,7 +27,12 @@ import Foundation
         check(!current.supportsVerifiedExit && current.requiresVerifiedExitUpdate)
         check(!current.permitsVerifiedExit(forSession: current.session))
         check(current.diagnostics["auth_cold_start_capability_confirmed"] as? Bool == true)
+        value["helper_version"] = 11; value["auth_experiment_protocol"] = 4
+        let observedExitValue = value
         value["helper_version"] = 10; value["auth_experiment_protocol"] = 3
+        let oldVerifiedExit = try decode(value)
+        check(!oldVerifiedExit.supportsVerifiedExit && oldVerifiedExit.requiresVerifiedExitUpdate)
+        value = observedExitValue
         let verifiedExit = try decode(value)
         check(verifiedExit.supportsVerifiedExit && verifiedExit.supportsAuthForceQuit && !verifiedExit.requiresVerifiedExitUpdate)
         check(verifiedExit.permitsVerifiedExit(forSession: verifiedExit.session.lowercased()))
@@ -40,9 +45,9 @@ import Foundation
         value["agent_seen_s"] = 2
         value["helper_version"] = 9
         check(try !decode(value).permitsVerifiedExit(forSession: verifiedExit.session)) // Capability alone is insufficient.
-        value["helper_version"] = 10; value["auth_experiment_protocol"] = 2
+        value["helper_version"] = 11; value["auth_experiment_protocol"] = 3
         check(try !decode(value).permitsVerifiedExit(forSession: verifiedExit.session)) // Version alone is insufficient.
-        value["auth_experiment_protocol"] = 3
+        value["auth_experiment_protocol"] = 4
         value.removeValue(forKey: "helper_version")
         let versionMissing = try decode(value)
         check(!versionMissing.supportsAuthColdStart && !versionMissing.requiresAuthColdStartUpdate)
@@ -50,7 +55,7 @@ import Foundation
         value["helper_version"] = 9; value.removeValue(forKey: "auth_experiment_protocol")
         let capabilityMissing = try decode(value)
         check(!capabilityMissing.supportsAuthColdStart && !capabilityMissing.requiresAuthColdStartUpdate)
-        value["helper_version"] = 10
+        value["helper_version"] = 11
         let currentCapabilityMissing = try decode(value)
         check(!currentCapabilityMissing.supportsVerifiedExit && !currentCapabilityMissing.requiresVerifiedExitUpdate)
         value["helper_version"] = 9

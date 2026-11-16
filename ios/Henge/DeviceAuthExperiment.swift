@@ -19,6 +19,7 @@ struct DeviceAuthExperimentSection: View {
     @State private var state: [String: Any] = [:]
     @State private var helper = HelperHealthSnapshot.unavailable
     @State private var actionError: String?
+    @State private var captureStatus = "Starts with the next authentication test"
 
     private var enabled: Bool { state["enabled"] as? Bool == true }
     private var progress: DeviceAuthProgress { DeviceAuthProgress.read(state: state, helper: helper) }
@@ -28,12 +29,13 @@ struct DeviceAuthExperimentSection: View {
         let current = DeviceAuthSnapshot.state()
         helper = Sharing.helperHealth
         guard helper.permitsVerifiedExit(forSession: current["session"] as? String ?? "") else {
-            actionError = "This startup needs Helper 10 with a current connection to this Mac. Use Install / Repair below and wait for its connection."
+            actionError = "This startup needs Helper 11 with a current connection to this Mac. Use Install / Repair below and wait for its connection."
             Diagnostics.recordAuthControl(.startBlockedHelper, mode: mode, launchAction: action.rawValue)
             state = current
             return // Do not revoke an earlier authorized attempt when capability is unknown.
         }
         if action == .forceQuit {
+            NetworkCapture.stop(HV_NET_CAPTURE_STOP_USER)
             hv_device_auth_disable()
             if current["enabled"] as? Bool == true {
                 Diagnostics.recordAuthControl(.stopCompleted, mode: mode,
@@ -43,14 +45,19 @@ struct DeviceAuthExperimentSection: View {
         HostServices.shared.refreshForAuthenticationStart()
         let selected = mode == "baa" ? HV_DEVICE_AUTH_MODE_BAA : HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN
         let nativeAction = action == .forceQuit ? HV_DEVICE_AUTH_ACTION_FORCE_QUIT : HV_DEVICE_AUTH_ACTION_NORMAL_QUIT
-        let result = hv_device_auth_enable_with_action(selected, nativeAction, UUID().uuidString.lowercased())
+        let launchID = UUID().uuidString.lowercased()
+        let result = hv_device_auth_enable_with_action(selected, nativeAction, launchID)
         Diagnostics.recordAuthControl(.startCompleted, mode: mode, resultCode: Int(result.rawValue), launchAction: action.rawValue)
         actionError = result == HV_DEVICE_AUTH_OK ? nil : String(cString: hv_device_auth_error_name(result))
         state = DeviceAuthSnapshot.state()
+        if result == HV_DEVICE_AUTH_OK {
+            let captureResult = NetworkCapture.start(session: state["session"] as? String ?? "", launchID: launchID)
+            captureStatus = captureResult == 0 ? NetworkCapture.status : "Could not start capture (\(captureResult))"
+        }
     }
 
     var body: some View {
-        Section("ChatGPT authentication · Test10") {
+        Section("ChatGPT authentication · Test11") {
             Text(progress.title).font(.headline)
             Text(progress.detail).font(.footnote).foregroundStyle(.secondary)
             Picker("Path", selection: $mode) {
@@ -59,6 +66,7 @@ struct DeviceAuthExperimentSection: View {
             }.disabled(enabled)
             if enabled {
                 Button("Stop authentication test", role: .destructive) {
+                    NetworkCapture.stop(HV_NET_CAPTURE_STOP_USER)
                     hv_device_auth_disable()
                     Diagnostics.recordAuthControl(.stopCompleted, mode: mode, launchAction: progress.launchAction)
                     actionError = nil
@@ -78,8 +86,11 @@ struct DeviceAuthExperimentSection: View {
                 .font(.caption)
             LabeledContent("Startup action", value: progress.launchAction == "force_quit" ? "Explicit force quit" :
                 progress.launchAction == "normal_quit" ? "Normal quit" : "Unconfirmed").font(.caption)
+            LabeledContent("Network capture", value: captureStatus).font(.caption)
+            Text("Each test records up to two minutes of Mac network headers. The same diagnostic report includes the capture. Message contents, HTTP bodies and authentication values are excluded; encrypted HTTPS responses remain unreadable.")
+                .font(.footnote).foregroundStyle(.secondary)
             if helper.requiresVerifiedExitUpdate {
-                Text("Update the Mac helper with Install / Repair below. This test needs Helper 10's current startup capability.")
+                Text("Update the Mac helper with Install / Repair below. This test needs Helper 11's current startup capability.")
                     .font(.caption).foregroundStyle(.orange)
             }
             if progress.adapterReadiness == "confirmed" {
@@ -103,6 +114,7 @@ struct DeviceAuthExperimentSection: View {
             while !Task.isCancelled {
                 state = DeviceAuthSnapshot.state()
                 helper = Sharing.helperHealth
+                captureStatus = NetworkCapture.status
                 if enabled, let current = state["mode"] as? String { mode = current }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }

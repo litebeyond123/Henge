@@ -146,15 +146,15 @@ import Foundation
         let safe = try DeviceAuthProgress.read(state: state, helper: helper()).diagnostics
         check(!String(decoding: try JSONSerialization.data(withJSONObject: safe), as: UTF8.self).contains("PRIVATE-TOKEN-FIXTURE"), "summary has fixed categories only")
 
-        // Test10 binds the action to this launch. Both buttons use the same verified-exit
+        // Test11 binds the action to this launch. Both buttons use the same verified-exit
         // capability gate; a Helper9 cold-start heartbeat remains valid historical evidence.
         state["events"] = []; state["session"] = health["session"]
         check(try DeviceAuthProgress.read(state: state, helper: helper()).launchAction == "normal_quit", "missing legacy action defaults to normal")
         state["launch_action"] = "normal_quit"
-        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_update_required", "Helper9 cannot start a Test10 normal attempt")
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_update_required", "Helper9 cannot start a Test11 normal attempt")
         state["launch_action"] = "force_quit"
         check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_update_required", "Helper9 cannot start a force attempt")
-        health["helper_version"] = 10; health["auth_experiment_protocol"] = 3
+        health["helper_version"] = 11; health["auth_experiment_protocol"] = 4
         check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "waiting_for_adapter", "new capable helper waits for real evidence")
         state["session"] = UUID().uuidString
         check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_capability_unconfirmed", "another VM helper cannot explain this launch")
@@ -166,6 +166,13 @@ import Foundation
         check(try DeviceAuthProgress.read(state: state, helper: helper()).stage == "force_quit_completed", "late request cannot undo verified exit")
         state["events"] = [event("launch_started"), event("force_quit_completed")]
         check(try DeviceAuthProgress.read(state: state, helper: helper()).stage == "launch_started", "late exit cannot undo spawn")
+        for stage in ["quit_operation_returned", "process_exit_pending", "post_exit_signature_started",
+                      "post_exit_signature_completed", "post_exit_census_started", "post_exit_census_completed"] {
+            state["events"] = [event(stage), event("quit_requested")]
+            check(try DeviceAuthProgress.read(state: state, helper: helper()).stage == stage, "observed phase survives late quit intent")
+            state["events"] = [event(stage), event("process_identity_unavailable")]
+            check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "process_identity_unavailable", "terminal process failure takes precedence over observed phase")
+        }
         for failure in ["force_quit_refused", "force_quit_timeout", "process_identity_unavailable", "target_process_changed", "target_reappeared"] {
             var observation = event(failure, code: 1023, domain: "HengeAuthBridge", sequence: 44)
             observation["targetPid"] = 321; observation["observedPid"] = 654

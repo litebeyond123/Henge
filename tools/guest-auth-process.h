@@ -18,6 +18,23 @@ typedef enum {
     HENGE_AUTH_PROCESS_UNAVAILABLE
 } HengeAuthProcessState;
 
+/* Fixed diagnostic labels, not syscall errno values. No path is serialized. */
+typedef enum {
+    HENGE_AUTH_PROCESS_SOURCE_NONE = 0,
+    HENGE_AUTH_PROCESS_SOURCE_ARGUMENTS,
+    HENGE_AUTH_PROCESS_SOURCE_EXPECTED_REALPATH,
+    HENGE_AUTH_PROCESS_SOURCE_BSD_BEFORE,
+    HENGE_AUTH_PROCESS_SOURCE_PIDPATH,
+    HENGE_AUTH_PROCESS_SOURCE_PATH_REALPATH,
+    HENGE_AUTH_PROCESS_SOURCE_BSD_AFTER,
+    HENGE_AUTH_PROCESS_SOURCE_CENSUS_SIZE,
+    HENGE_AUTH_PROCESS_SOURCE_CENSUS_READ,
+    HENGE_AUTH_PROCESS_SOURCE_CENSUS_CAPACITY,
+    HENGE_AUTH_PROCESS_SOURCE_CENSUS_DEADLINE,
+    HENGE_AUTH_PROCESS_SOURCE_IDENTITY_CHANGE,
+    HENGE_AUTH_PROCESS_SOURCE_APPKIT_LOOKUP
+} HengeAuthProcessSource;
+
 /* This path is used only for comparison. Never serialize it to diagnostics. */
 typedef struct {
     pid_t pid;
@@ -35,6 +52,9 @@ typedef struct {
     uint64_t observed_start_seconds, observed_start_microseconds;
     uint32_t observed_status;
     int identity_available, zombie;
+    HengeAuthProcessSource source;
+    int same_lifetime, path_only_esrch;
+    unsigned retry_count, sample_elapsed_ms;
 } HengeAuthProcessObservation;
 
 /* One path representation for the kernel reader and AppKit callers. Returns 0
@@ -52,6 +72,11 @@ HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedExe
     uid_t expectedUID, HengeAuthProcessIdentity *outIdentity, HengeAuthProcessObservation *observation);
 HengeAuthProcessState HengeAuthProcessCheck(const HengeAuthProcessIdentity *identity,
     HengeAuthProcessObservation *observation);
+/* Only this exact unknown observation may be waited on AFTER one requested
+ * operation. It never means exited, never authorizes a signal, and never
+ * changes the caller's existing deadline. Other unknowns fail closed. */
+int HengeAuthProcessCanWaitForExit(const HengeAuthProcessIdentity *identity,
+    const HengeAuthProcessObservation *observation);
 
 /* A bounded kernel census of the current UID, not an AppKit cache. ALIVE means
  * count > 0; EXITED means a complete scan found no matching live instance.
@@ -77,6 +102,9 @@ typedef struct {
     HengeAuthProcessIdentity identity;
     uint32_t process_status;
     int zombie, error_number;
+    HengeAuthProcessSource source;
+    int path_only_esrch;
+    unsigned retry_count, sample_elapsed_ms;
 } HengeAuthProcessSample;
 HengeAuthProcessState HengeAuthProcessCompare(const HengeAuthProcessIdentity *expected,
     const HengeAuthProcessSample *sample, HengeAuthProcessObservation *observation);

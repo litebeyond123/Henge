@@ -103,10 +103,44 @@ struct DiagnosticsTests {
                 check(exported.contains(crossing), "UTF-8 scalar (\(scalar.utf8.count) bytes) survives boundary \(boundary)")
             }
         }
+        try checkPacketEncoding(in: folder)
         try checkArchive(in: folder)
         checkThrottle()
         print(failures == 0 ? "diagnostics: all checks passed" : "diagnostics: \(failures) failure(s)")
         if failures > 0 { throw NSError(domain: "DiagnosticsTests", code: failures) }
+    }
+
+    static func checkPacketEncoding(in folder: URL) throws {
+        let packet = folder.appendingPathComponent("header-fixture.pcap")
+        let log = folder.appendingPathComponent("packet-neighbor.log")
+        let output = folder.appendingPathComponent("packet-report.txt")
+        try Data("Authorization: Bearer NEIGHBOR-SECRET\nordinary diagnostic retained\n".utf8).write(to: log)
+        for length in [24, 49_153, 98_310, 2 * 1024 * 1024] {
+            // Binary transport test only; the native capture tests separately validate
+            // every exported PCAP header and the exclusion of application secrets.
+            let bytes = Data((0..<length).map { UInt8(truncatingIfNeeded: $0) })
+            try bytes.write(to: packet)
+            try DiagnosticReportWriter.write(to: output, sources: [
+                .init(name: "network-headers.pcap", url: packet, packetHeadersBase64: true),
+                .init(name: "ordinary.log", url: log)])
+            let report = try String(contentsOf: output, encoding: .utf8)
+            let begin = "-----BEGIN HENGE HEADER PCAP BASE64-----\n"
+            let end = "-----END HENGE HEADER PCAP BASE64-----"
+            let encoded = report.components(separatedBy: begin).last!.components(separatedBy: end).first!
+            check(Data(base64Encoded: encoded, options: .ignoreUnknownCharacters) == bytes,
+                  "packet bytes survive single-report encoding at length \(length)")
+            check(report.contains("read \(length)/\(length) captured bytes"), "packet byte count is exact")
+            check(!report.contains("NEIGHBOR-SECRET") && report.contains("ordinary diagnostic retained"),
+                  "packet encoding does not bypass filtering for ordinary log sources")
+        }
+        for length in [23, 2 * 1024 * 1024 + 1] {
+            try Data(repeating: 42, count: length).write(to: packet)
+            try DiagnosticReportWriter.write(to: output, sources: [
+                .init(name: "out-of-bound.pcap", url: packet, packetHeadersBase64: true)])
+            let report = try String(contentsOf: output, encoding: .utf8)
+            check(report.contains("outside its fixed bound") && !report.contains("BEGIN HENGE HEADER PCAP BASE64"),
+                  "invalid packet snapshot length \(length) is explicit and never encoded")
+        }
     }
 
     static func checkArchive(in folder: URL) throws {

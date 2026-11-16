@@ -116,7 +116,7 @@ HENGE_STAGED_BINARY="$HENGE_STAGED_APP/Contents/MacOS/henge-agent"
 [ -d "$HENGE_STAGED_APP" ] && [ ! -L "$HENGE_STAGED_APP" ] && [ -x "$HENGE_STAGED_BINARY" ] || fail gzip_invalid 1
 codesign --verify --deep --strict "$HENGE_STAGED_APP" || fail signature_invalid "$?"
 HENGE_HELPER_VERSION=$("$HENGE_STAGED_BINARY" --version) || fail version_invalid "$?"
-[ "$HENGE_HELPER_VERSION" = 'henge-agent 10' ] || fail version_invalid 1
+[ "$HENGE_HELPER_VERSION" = 'henge-agent 11' ] || fail version_invalid 1
 # A Terminal probe cannot prove a LaunchServices app has local-network permission.
 # Start the verified application below and confirm its own PID/health instead.
 receipt verified none 0 || fail connection_failed 1

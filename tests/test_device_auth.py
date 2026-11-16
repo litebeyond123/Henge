@@ -52,6 +52,21 @@ def main() -> int:
                 print("FAIL enable active state contradicts its contemporaneous runtime flags", file=sys.stderr)
                 return 1
         print(f"PASS every enable call has one fixed diagnostic record ({len(records)} calls)")
+        accepted = re.search(rb"^accepted_guest_events_exercised=(\d+)$", result.stdout, re.MULTILINE)
+        guest_records = [line for line in result.stderr.splitlines() if line.startswith(b"[device-auth-guest] ")]
+        guest_pattern = re.compile(
+            rb"\[device-auth-guest\] launch=[0-9A-Fa-f-]{36} request=[0-9A-Fa-f-]{36} stage=[a-z_]+ "
+            rb"domain=[A-Za-z.]* code=-?\d+ elapsed_ms=\d+ target_pid=\d+ observed_pid=\d+"
+            rb"(?: process_phase=\d+ process_source=\d+ process_state=\d+ process_flags=\d+ process_status=\d+ "
+            rb"process_retries=\d+ process_sample_ms=\d+ operation_invoked=[01] operation_result=-?[01] phase_elapsed_ms=\d+)?"
+        )
+        if accepted is None or len(guest_records) != int(accepted[1]) or any(not guest_pattern.fullmatch(r) for r in guest_records):
+            print("FAIL accepted guest stages must each produce one fixed persistent journal record", file=sys.stderr)
+            return 1
+        if not any(b"process_phase=4 process_source=4" in r for r in guest_records):
+            print("FAIL process observation was not preserved in the native journal", file=sys.stderr)
+            return 1
+        print(f"PASS every accepted guest stage has one persistent fixed diagnostic record ({len(guest_records)} events)")
         print("PASS native log contains no synthetic challenge/result material")
         return 0
 

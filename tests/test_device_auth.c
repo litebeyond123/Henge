@@ -41,6 +41,14 @@ static HvDeviceAuthError observed_enable_action(HvDeviceAuthMode mode, HvDeviceA
 }
 #define hv_device_auth_enable_with_action(mode, action, launch) observed_enable_action((mode), (action), (launch))
 
+static _Atomic unsigned accepted_event_calls;
+static HvDeviceAuthError observed_guest_event(const char *session, const char *launch, const HvDeviceAuthEvent *event) {
+    HvDeviceAuthError result = hv_device_auth_record_event(session, launch, event);
+    if (result == HV_DEVICE_AUTH_OK) atomic_fetch_add(&accepted_event_calls, 1);
+    return result;
+}
+#define hv_device_auth_record_event(session, launch, event) observed_guest_event((session), (launch), (event))
+
 static void sleep_ms(unsigned milliseconds) {
     struct timespec duration = { milliseconds / 1000, (long)(milliseconds % 1000) * 1000000L };
     while (nanosleep(&duration, &duration) != 0) {}
@@ -646,6 +654,54 @@ static void launch_action_is_explicit_immutable_and_revocable(void) {
     CHECK(state.enable_attempts == 0 && state.startup_event_count == 0);
 }
 
+static void process_observation_survives_ring_and_rejects_invalid_metadata(void) {
+    setup(idle_wakeup);
+    HvDeviceAuthEvent event = {0};
+    memcpy(event.request_id, REQUEST, sizeof(REQUEST));
+    event.stage = HV_DEVICE_AUTH_STAGE_PROCESS_EXIT_PENDING;
+    event.target_pid = 321; event.observed_pid = 321; event.elapsed_ms = 1000;
+    event.process = (HvDeviceAuthProcessObservation){ .present=1, .phase=4, .source=4, .state=4,
+        .flags=7, .status=2, .retries=25, .sample_ms=250, .operation_invoked=1, .operation_result=1,
+        .phase_elapsed_ms=800 };
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    HvDeviceAuthState state;
+    hv_device_auth_snapshot(&state);
+    uint64_t first_sequence = state.process_observation.sequence;
+    CHECK(first_sequence > 0 && state.process_observation.process.present);
+    CHECK(state.process_observation.process.operation_invoked == 1);
+    CHECK(!strcmp(state.process_observation.launch_id, LAUNCH));
+    CHECK(!state.events[state.event_count-1].process.present);
+    event.elapsed_ms = 900;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.process_observation.sequence == first_sequence);
+    event.elapsed_ms = 1000; event.process.phase_elapsed_ms = 850;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.process_observation.sequence > first_sequence);
+    CHECK(state.process_observation.process.phase_elapsed_ms == 850);
+    event.process.operation_invoked = 0;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    event.process.operation_result = -1;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    event.process.phase = 7;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    event.process.phase = 4; event.process.source = 13;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    event.process.source = 4; event.process.retries = 26;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    event.process.present = 0; event.stage = HV_DEVICE_AUTH_STAGE_PROBE_RESULT;
+    for (unsigned i = 0; i < 40; ++i) CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.process_observation.process.present && state.process_observation.elapsed_ms == 1000);
+    hv_device_auth_disable();
+    hv_device_auth_snapshot(&state);
+    CHECK(state.process_observation.process.present);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH_TWO) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(!state.process_observation.process.present && state.process_observation.sequence == 0);
+}
+
 int main(void) {
     RUN(metadata_and_default_denial);
     RUN(enable_diagnostics_preserve_authorization);
@@ -664,10 +720,12 @@ int main(void) {
     RUN(fixed_guest_preflight_observations);
     RUN(startup_facts_survive_request_traffic_and_reset_only_with_new_launch);
     RUN(launch_action_is_explicit_immutable_and_revocable);
+    RUN(process_observation_survives_ring_and_rejects_invalid_metadata);
     RUN(stale_host_state_is_not_revived_by_a_late_publication);
     hv_device_auth_end();
     CHECK(hv_device_auth_set_wakeup(NULL, NULL));
     printf("PASS device-auth production C: %u assertions; synthetic backend only\n", atomic_load(&assertion_count));
     printf("enable_calls_exercised=%u\n", atomic_load(&enable_calls));
+    printf("accepted_guest_events_exercised=%u\n", atomic_load(&accepted_event_calls));
     return 0;
 }

@@ -95,6 +95,9 @@ enum DiagnosticReportWriter {
     struct Source {
         let name: String
         let url: URL
+        // Only a private snapshot returned by the native header-only capture
+        // provider may use this encoding. Ordinary log sources stay filtered.
+        var packetHeadersBase64 = false
     }
 
     private struct Snapshot {
@@ -152,6 +155,31 @@ enum DiagnosticReportWriter {
             try append("\n===== BEGIN \(item.source.name) | snapshot bytes: \(item.length) =====\n")
             guard let input = item.file else {
                 try append("[unavailable: \(item.unavailable ?? "unknown")]\n===== END \(item.source.name) =====\n")
+                continue
+            }
+            if item.source.packetHeadersBase64 {
+                guard item.length >= 24, item.length <= 2 * 1024 * 1024 else {
+                    try append("[unavailable: packet snapshot size is outside its fixed bound]\n===== END \(item.source.name) =====\n")
+                    continue
+                }
+                try append("Encoding: base64. Actual guest NIC Ethernet/IP/transport headers only; application payload was removed before capture. This is not decrypted HTTPS or host Apple-framework traffic.\n")
+                var remaining = item.length
+                var bytesRead: UInt64 = 0
+                var carry = Data()
+                try append("-----BEGIN HENGE HEADER PCAP BASE64-----\n")
+                while remaining > 0 {
+                    guard let chunk = try input.read(upToCount: Int(min(remaining, 48 * 1024))), !chunk.isEmpty else { break }
+                    remaining -= UInt64(chunk.count)
+                    bytesRead += UInt64(chunk.count)
+                    carry.append(chunk)
+                    let complete = carry.count - carry.count % 3
+                    if complete > 0 {
+                        try append(carry.prefix(complete).base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed]) + "\n")
+                        carry.removeFirst(complete)
+                    }
+                }
+                if !carry.isEmpty { try append(carry.base64EncodedString() + "\n") }
+                try append("-----END HENGE HEADER PCAP BASE64-----\n[read \(bytesRead)/\(item.length) captured bytes; headers were bounded before encoding]\n===== END \(item.source.name) =====\n")
                 continue
             }
             var remaining = item.length
@@ -492,6 +520,7 @@ enum Diagnostics {
                 Task { @MainActor in
                     let backgroundTime = event == "entered_background" ? DiagnosticBackgroundTime() : nil
                     if event == "memory_warning" { GuestChatDiagnostics.pauseAutomaticCollectionAfterMemoryWarning() }
+                    if event == "entered_background" { NetworkCapture.stop(HV_NET_CAPTURE_STOP_BACKGROUND) }
                     queue.async {
                         if event == "memory_warning" { memoryWarnings += 1 }
                         sample(event)
@@ -740,6 +769,9 @@ enum Diagnostics {
                     if !guestStorage.hasPrefix("summary_write_failed") {
                         files.insert(.init(name: "guest-chat-summary.json", url: guestSummaryURL), at: 2)
                     }
+                    let packetSources = NetworkCapture.reportSources(in: attachmentFolder, persistentDirectory: reportDirectory)
+                    defer { for source in packetSources { try? FileManager.default.removeItem(at: source.url) } }
+                    files.insert(contentsOf: packetSources, at: min(3, files.count))
                     let publication = try store.publish(identity: identity, sources: files, privateRoots: [NSHomeDirectory()],
                                                         context: "Capture reason: \(reason). Guest summary storage: \(guestStorage). A not_updated summary is from an earlier run; a failed summary is omitted. Guest checks are a timestamped summary, not an attestation token.")
                     let attachment = automatic ? nil : try store.attachment(from: publication, in: attachmentFolder)
@@ -1017,10 +1049,10 @@ struct DiagnosticsExportButton: View {
         preparing = true
         failure = nil
         outcome = nil
-        progress = "Checking Mac diagnostics (up to 15 seconds)…"
+        progress = "Checking Mac diagnostics (up to 45 seconds)…"
         Diagnostics.recordPresentation("collection_started")
         Task { @MainActor in
-            guestStatus = await GuestChatDiagnostics.refresh(timeout: 15)
+            guestStatus = await GuestChatDiagnostics.refresh(timeout: 45)
             progress = "Saving the combined report…"
             do {
                 let url = try await Diagnostics.export()

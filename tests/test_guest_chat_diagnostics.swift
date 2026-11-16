@@ -12,6 +12,13 @@ import Foundation
         precondition(!probe.collect && probe.dictionary["collect"] as? Bool == false)
         precondition(probe.expires < guestClockNinetySecondsBehind)
         precondition(request.collect && request.dictionary["collect"] as? Bool == true)
+        precondition(request.collectionMode == .automatic && request.dictionary["collection_mode"] as? String == "automatic")
+        let manualRequest = GuestChatDiagnosticsSchema.Request(sessionID: request.sessionID, now: now, collectionMode: .manual)
+        precondition(manualRequest.dictionary["collection_mode"] as? String == "manual")
+        precondition(manualRequest.expires.timeIntervalSince(manualRequest.created) == 60)
+        precondition(GuestChatDiagnosticsSchema.maximumManualWait == 45)
+        let manualProbe = GuestChatDiagnosticsSchema.Request(sessionID: request.sessionID, now: now, collect: false, collectionMode: .manual)
+        precondition(!manualProbe.collect && manualProbe.collectionMode == .automatic)
         var report: [String: Any] = [
             "schema_version": 1, "collector_version": 1, "vm_session_id": request.sessionID.uuidString,
             "request_id": request.requestID.uuidString, "request_created_utc": GuestChatDiagnosticsSchema.utc(request.created),
@@ -167,10 +174,85 @@ import Foundation
         precondition(!String(data: encoded(safe), encoding: .utf8)!.contains(secret))
         precondition(safe["messages"] == nil && safe["env"] == nil && safe["client_build"] == nil && safe["client_team_identifier"] == nil)
         precondition(!GuestChatDiagnosticsSchema.collectionReceipt(bad).contains(secret))
+
+        // The manual profile accepts a completed 35-second collection inside the
+        // unchanged 60-second request lifetime, with explicit phase budgets/statuses.
+        var manual = report
+        manual["request_id"] = manualRequest.requestID.uuidString
+        manual["request_created_utc"] = GuestChatDiagnosticsSchema.utc(manualRequest.created)
+        manual["request_expires_utc"] = GuestChatDiagnosticsSchema.utc(manualRequest.expires)
+        manual["collected_utc"] = GuestChatDiagnosticsSchema.utc(now.addingTimeInterval(35))
+        manual["collection_mode"] = "manual"
+        manual["collection_elapsed_ms"] = 35_000
+        manual["collection_budget_ms"] = 35_000
+        manual["collection_effective_budget_ms"] = 35_000
+        manual["log_command_budget_ms"] = 30_000
+        manual["log_command_effective_budget_ms"] = 30_000
+        manual["log_command_elapsed_ms"] = 30_000
+        manual["log_command_status"] = "complete"
+        manual["log_command_started"] = true
+        manual["log_command_exit_code"] = 0
+        manual["signature_display_budget_ms"] = 3_000
+        manual["signature_display_effective_budget_ms"] = 3_000
+        manual["signature_display_status"] = "complete"
+        manual["signature_display_elapsed_ms"] = 500
+        manual["signature_verify_budget_ms"] = 0
+        manual["signature_verify_status"] = "not_requested"
+        manual["signature_verify_elapsed_ms"] = 0
+        manual["client_signature_check"] = "not_verified"
+        manual["electron_framework_metadata_status"] = "complete"
+        manual["electron_framework_version"] = "42.0.0-beta.2"
+        let afterCollection = now.addingTimeInterval(36)
+        precondition(manual.count <= 96 && encoded(manual).count <= 16_384)
+        let extended = GuestChatDiagnosticsSchema.canonicalReport(encoded(manual), request: manualRequest, now: afterCollection)!
+        precondition(extended["collection_elapsed_ms"] as? Int == 35_000 && extended["collection_budget_ms"] as? Int == 35_000)
+        precondition(extended["client_signature_check"] as? String == "not_verified")
+        precondition(extended["electron_framework_version"] as? String == "42.0.0-beta.2")
+        let manualReceipt = GuestChatDiagnosticsSchema.collectionReceipt(extended)
+        precondition(manualReceipt.contains("collection_mode=manual") && manualReceipt.contains("log_command_budget_ms=30000"))
+        precondition(manualReceipt.contains("signature_verify_status=not_requested") && manualReceipt.contains("electron_framework_version=42.0.0-beta.2"))
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(manual), request: manualRequest, now: now.addingTimeInterval(61)) == nil)
+        for (key, invalid) in [("collection_mode", "automatic" as Any), ("collection_mode", true),
+                              ("collection_budget_ms", 35_001), ("collection_effective_budget_ms", 35_001),
+                              ("log_command_budget_ms", 8_000), ("log_command_effective_budget_ms", 30_001),
+                              ("signature_display_budget_ms", 3_001), ("signature_display_effective_budget_ms", 3_001),
+                              ("signature_verify_budget_ms", 1), ("signature_verify_elapsed_ms", 1),
+                              ("collection_elapsed_ms", 60_001), ("log_command_elapsed_ms", true),
+                              ("client_signature_check", "valid_main_bundle"), ("signature_verify_status", "complete"),
+                              ("electron_framework_metadata_status", "not_found"), ("electron_framework_version", secret)] {
+            bad = manual; bad[key] = invalid
+            precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: manualRequest, now: afterCollection) == nil,
+                         "accepted invalid manual/metadata field: \(key)")
+        }
+        bad = manual; bad["log_command_effective_budget_ms"] = nil
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: manualRequest, now: afterCollection) == nil)
+        bad = manual; bad["electron_framework_version"] = nil
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: manualRequest, now: afterCollection) == nil)
+        bad = manual; bad["electron_framework_metadata_status"] = "not_found"; bad["electron_framework_version"] = nil
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: manualRequest, now: afterCollection) != nil)
+        bad = manual; bad["collection_effective_budget_ms"] = 2_000; bad["log_command_effective_budget_ms"] = 2_000
+        bad["signature_display_effective_budget_ms"] = 0
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(bad), request: manualRequest, now: afterCollection) != nil)
+        // A new helper must not label a zero-event timeout as a healthy empty query.
+        var manualTimeout = manual
+        for key in GuestChatDiagnosticsSchema.countKeys { manualTimeout[key] = 0 }
+        for key in ["log_event_count", "matched_event_count", "chatgpt_matched_event_count",
+                    "system_devicecheck_matched_event_count", "unknown_source_matched_event_count"] { manualTimeout[key] = 0 }
+        manualTimeout["collection_status"] = "partial"; manualTimeout["log_status"] = "timed_out"
+        manualTimeout["log_counts_status"] = "unavailable"; manualTimeout["log_command_status"] = "timed_out"
+        manualTimeout["classification"] = "logs_unavailable"; manualTimeout["log_command_exit_code"] = nil
+        manualTimeout["log_command_termination_signal"] = 9
+        let missingManual = GuestChatDiagnosticsSchema.canonicalReport(encoded(manualTimeout), request: manualRequest, now: afterCollection)!
+        precondition(GuestChatDiagnosticsSchema.collectionMessage(missingManual).contains("could not be determined"))
+        manualTimeout["classification"] = "no_known_error_observed"
+        precondition(GuestChatDiagnosticsSchema.canonicalReport(encoded(manualTimeout), request: manualRequest, now: afterCollection) == nil)
+        bad = manual; bad["electron_framework_version"] = secret; bad["collection_mode"] = secret
+        precondition(!GuestChatDiagnosticsSchema.collectionReceipt(bad).contains(secret))
         precondition(GuestChatDiagnosticsSchema.canonicalReport(Data(repeating: 32, count: 16385), request: request, now: now) == nil)
         let heartbeat: [String: Any] = ["schema_version": 1, "collector_version": 1,
             "vm_session_id": request.sessionID.uuidString, "seen_utc": GuestChatDiagnosticsSchema.utc(now)]
         precondition(GuestChatDiagnosticsSchema.ready(encoded(heartbeat), session: request.sessionID, now: now))
+        precondition(GuestChatDiagnosticsSchema.ready(encoded(heartbeat), session: request.sessionID, now: now.addingTimeInterval(35)))
         precondition(!GuestChatDiagnosticsSchema.ready(encoded(heartbeat), session: UUID(), now: now))
         precondition(!GuestChatDiagnosticsSchema.ready(encoded(heartbeat), session: request.sessionID, now: now.addingTimeInterval(46)))
         precondition(GuestChatDiagnosticsSchema.readiness(nil, session: request.sessionID, now: now).state == .missing_or_unreadable)

@@ -1,5 +1,6 @@
 #import "guest-auth-experiment.h"
 #import "guest-auth-process.h"
+#import "guest-auth-exit-wait.h"
 #import <AppKit/AppKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
@@ -24,10 +25,10 @@
 NSString *const HengeAuthBridgeErrorDomain = @"HengeAuthBridge";
 const NSUInteger HengeAuthResponseLimit = 96 * 1024;
 static const NSUInteger inputLimit = 32 * 1024, resultLimit = 64 * 1024, ringLimit = 64 * 1024;
-static const NSUInteger stateLimit = 32 * 1024;
-// Only capability-3 clients may observe an explicitly authorized force action.
+static const NSUInteger stateLimit = 64 * 1024;
+// Only capability-4 clients may consume the current lifecycle request.
 // Never fall back to the legacy state URL if this request is rejected.
-static NSString *const statePath = @"/.henge/v1/auth/state?capability=3";
+static NSString *const statePath = @"/.henge/v1/auth/state?capability=4";
 static NSString *const requestPath = @"/.henge/v1/auth/request";
 static NSString *const eventPath = @"/.henge/v1/auth/event";
 
@@ -469,7 +470,7 @@ BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **e
     return YES;
 }
 static NSDictionary *targetPreflight(NSString *bundlePath, HengeAuthProcessIdentity *identities, size_t *count,
-                                     BOOL *processFailure, NSError **error) {
+                                     BOOL *processFailure, HengeAuthProcessObservation *processObservation, NSError **error) {
     if (processFailure) *processFailure = NO;
     NSDictionary *info = targetIdentityInformation(bundlePath, error);
     if (!info) return nil;
@@ -479,6 +480,7 @@ static NSDictionary *targetPreflight(NSString *bundlePath, HengeAuthProcessIdent
     HengeAuthProcessObservation observation = {0};
     HengeAuthProcessState processState = HengeAuthProcessListMatching(executable.fileSystemRepresentation,
         geteuid(), identities, 2, count, &observation);
+    if (processObservation) *processObservation = observation;
     if (processState != HENGE_AUTH_PROCESS_ALIVE && processState != HENGE_AUTH_PROCESS_EXITED) {
         if (processFailure) *processFailure = YES;
         if (error) *error = processObservationError(&observation);
@@ -491,7 +493,7 @@ static NSDictionary *targetPreflight(NSString *bundlePath, HengeAuthProcessIdent
 NSDictionary *HengeAuthTargetPreflight(NSString *bundlePath, NSError **error) {
     HengeAuthProcessIdentity identities[2] = {0};
     size_t count = 0;
-    return targetPreflight(bundlePath, identities, &count, NULL, error);
+    return targetPreflight(bundlePath, identities, &count, NULL, NULL, error);
 }
 static NSRunningApplication *applicationForIdentity(NSString *bundlePath, const HengeAuthProcessIdentity *identity) {
     NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:identity->pid];
@@ -615,7 +617,7 @@ static void appendEvent(NSData *line) {
 }
 static void recordAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
                             NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes,
-                            int targetPID, int observedPID) {
+                            int targetPID, int observedPID, const HengeAuthQuitProgress *process) {
     if (!uuid(session) || !uuid(launchID) || !uuid(requestID) || targetPID < 0 || observedPID < 0) return;
     NSArray *stages = @[@"launch_requested", @"target_not_found", @"target_identity_mismatch", @"target_signature_invalid",
         @"target_process_running", @"target_process_not_running", @"policy_flags_unavailable",
@@ -625,6 +627,8 @@ static void recordAuthEvent(NSString *session, NSString *launchID, NSString *req
         @"target_exited_before_adapter", @"adapter_initialization_failed",
         @"force_quit_requested", @"force_quit_completed", @"force_quit_refused", @"force_quit_timeout",
         @"process_identity_unavailable", @"target_process_changed", @"target_reappeared",
+        @"quit_operation_returned", @"process_exit_pending", @"post_exit_signature_started", @"post_exit_signature_completed",
+        @"post_exit_census_started", @"post_exit_census_completed",
         @"signature_policy_blocked", @"already_running", @"launch_started", @"launch_failed", @"launch_timeout",
         @"adapter_loaded", @"adapter_not_loaded", @"adapter_target_rejected", @"adapter_abi_mismatch", @"adapter_ready",
         @"probe_requested", @"probe_result", @"token_requested", @"token_result", @"baa_data_requested", @"baa_data_result",
@@ -640,6 +644,24 @@ static void recordAuthEvent(NSString *session, NSString *launchID, NSString *req
         @"inputBytes": @(MIN(inputBytes, 128 * 1024)), @"resultBytes": @(MIN(resultBytes, HengeAuthResponseLimit))} mutableCopy];
     if (targetPID) event[@"targetPid"] = @(targetPID);
     if (observedPID) event[@"observedPid"] = @(observedPID);
+    if (process) {
+        const HengeAuthProcessObservation *observation = &process->observation;
+        int flags = (observation->identity_available ? 1 : 0) | (observation->same_lifetime ? 2 : 0) |
+            (observation->path_only_esrch ? 4 : 0) | (observation->zombie ? 8 : 0);
+        double phaseSeconds = HengeAuthMonotonic() - process->phase_started;
+        // The complete fixed group is numeric, including 0/1 booleans. The
+        // host rejects partial groups and does not copy them into every ring row.
+        [event addEntriesFromDictionary:@{
+            @"processPhase": @((int)process->phase), @"processSource": @((int)observation->source),
+            @"processState": @((int)process->state), @"processFlags": @(flags),
+            @"processStatus": @(MIN(observation->observed_status, 255u)),
+            @"processRetries": @(MIN(observation->retry_count, 25u)),
+            @"processSampleMs": @(MIN(observation->sample_elapsed_ms, 300000u)),
+            @"operationInvoked": @((int)!!process->operation_invoked),
+            @"operationResult": @(process->operation_invoked ? !!process->operation_result : -1),
+            @"phaseElapsedMs": @((NSUInteger)(fmin(fmax(isfinite(phaseSeconds) ? phaseSeconds : 0, 0), 300) * 1000))
+        }];
+    }
     NSData *data = [NSJSONSerialization dataWithJSONObject:event options:NSJSONWritingSortedKeys error:NULL];
     if (!data.length || data.length > 2048) return;
     NSMutableData *line = [data mutableCopy]; [line appendBytes:"\n" length:1];
@@ -655,11 +677,11 @@ static void recordAuthEvent(NSString *session, NSString *launchID, NSString *req
 }
 void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
                    NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes) {
-    recordAuthEvent(session, launchID, requestID, stage, error, elapsedSeconds, inputBytes, resultBytes, 0, 0);
+    recordAuthEvent(session, launchID, requestID, stage, error, elapsedSeconds, inputBytes, resultBytes, 0, 0, NULL);
 }
 void HengeAuthProcessEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
                           NSError *error, double elapsedSeconds, int targetPID, int observedPID) {
-    recordAuthEvent(session, launchID, requestID, stage, error, elapsedSeconds, 0, 0, targetPID, observedPID);
+    recordAuthEvent(session, launchID, requestID, stage, error, elapsedSeconds, 0, 0, targetPID, observedPID, NULL);
 }
 
 static NSString *findTarget(void) {
@@ -776,6 +798,32 @@ static void serviceMainRunLoop(double seconds) {
     double remaining = deadline - HengeAuthMonotonic();
     if (remaining > 0) usleep((useconds_t)(remaining * 1000000));
 }
+typedef int (^HengeQuitAuthorize)(double remaining);
+typedef void (^HengeQuitNotify)(HengeAuthQuitNotice notice, const HengeAuthQuitProgress *progress);
+typedef struct {
+    const HengeAuthProcessIdentity *identity;
+    NSRunningApplication *__unsafe_unretained application;
+    HengeQuitAuthorize __unsafe_unretained authorize;
+    HengeQuitNotify __unsafe_unretained notify;
+    int force;
+} HengeQuitRuntime;
+static double quitNow(void *context) { (void)context; return HengeAuthMonotonic(); }
+static HengeAuthProcessState quitCheck(void *context, HengeAuthProcessObservation *observation) {
+    return HengeAuthProcessCheck(((HengeQuitRuntime *)context)->identity, observation);
+}
+static int quitAuthorize(void *context, double remaining) { return ((HengeQuitRuntime *)context)->authorize(remaining); }
+static int quitInvoke(void *context) {
+    HengeQuitRuntime *runtime = context;
+    return runtime->force ? [runtime->application forceTerminate] : [runtime->application terminate];
+}
+static void quitPump(void *context, double seconds) { (void)context; serviceMainRunLoop(seconds); }
+static void quitNotify(void *context, HengeAuthQuitNotice notice, const HengeAuthQuitProgress *progress) {
+    ((HengeQuitRuntime *)context)->notify(notice, progress);
+}
+static const HengeAuthQuitCallbacks quitCallbacks = {
+    quitNow, quitCheck, quitAuthorize, quitInvoke, quitPump, quitNotify
+};
+
 int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     HengeAuthCaptureTestConfiguration();
     if ((arguments.count != 6 && arguments.count != 8) || ![arguments[0] isEqual:@"--session"] || ![arguments[2] isEqual:@"--launch-id"] ||
@@ -788,12 +836,15 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     NSString *session = arguments[1], *launchID = arguments[3], *mode = arguments[5], *requestID = NSUUID.UUID.UUIDString;
     double started = HengeAuthMonotonic();
     __block int targetPID = 0, observedPID = 0;
-    void (^event)(NSString *, NSError *) = ^(NSString *stage, NSError *error) {
-        HengeAuthProcessEvent(session, launchID, requestID, stage, error, HengeAuthMonotonic() - started, targetPID, observedPID);
+    void (^processEvent)(NSString *, NSError *, const HengeAuthQuitProgress *) =
+        ^(NSString *stage, NSError *error, const HengeAuthQuitProgress *progress) {
+        recordAuthEvent(session, launchID, requestID, stage, error, HengeAuthMonotonic() - started,
+            0, 0, targetPID, observedPID, progress);
         fprintf(stdout, "henge-auth stage=%s errorCode=%ld\n", stage.UTF8String, (long)(error ? error.code : 0));
         fflush(stdout);
     };
-    NSError *error = nil;
+    void (^event)(NSString *, NSError *) = ^(NSString *stage, NSError *error) { processEvent(stage, error, NULL); };
+    __block NSError *error = nil;
     NSDictionary *state = HengeAuthReadState(&error);
     if (!authorizationMatches(state, session, launchID, mode, action)) {
         event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
@@ -810,12 +861,17 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     HengeAuthProcessIdentity originalProcesses[2] = {0};
     size_t originalCount = 0;
     BOOL preflightProcessFailure = NO;
-    NSDictionary *preflight = targetPreflight(target, originalProcesses, &originalCount, &preflightProcessFailure, &error);
+    HengeAuthQuitProgress progress = {.phase = HENGE_AUTH_PHASE_PREFLIGHT,
+        .phase_started = HengeAuthMonotonic(), .operation_result = -1};
+    NSDictionary *preflight = targetPreflight(target, originalProcesses, &originalCount,
+        &preflightProcessFailure, &progress.observation, &error);
+    progress.state = progress.observation.state;
     if (!preflight) {
         NSString *stage = preflightProcessFailure
             ? @"process_identity_unavailable" : [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity
                 ? @"target_identity_mismatch" : @"target_signature_invalid";
-        event(stage, error); return 1;
+        if (preflightProcessFailure) processEvent(stage, error, &progress); else event(stage, error);
+        return 1;
     }
     if (originalCount == 1) targetPID = observedPID = originalProcesses[0].pid;
     event([preflight[@"main_process_running"] boolValue] ? @"target_process_running" : @"target_process_not_running", nil);
@@ -849,71 +905,68 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     if (originalCount > 1) { event(quitRefused, HengeAuthError(QuitRefused)); return 1; }
     if (originalCount == 1) {
         const HengeAuthProcessIdentity *original = &originalProcesses[0];
-        HengeAuthProcessObservation observation = {0};
-        HengeAuthProcessState processState = HengeAuthProcessCheck(original, &observation);
+        progress.phase = HENGE_AUTH_PHASE_BEFORE_ACTION;
+        progress.phase_started = HengeAuthMonotonic();
+        progress.state = HengeAuthProcessCheck(original, &progress.observation);
         double quitDeadline = MIN(started + 75, HengeAuthMonotonic() + (force ? 10 : 30));
-        if (quitDeadline <= HengeAuthMonotonic()) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
-        BOOL actionRequested = NO;
-        if (processState == HENGE_AUTH_PROCESS_ALIVE) {
-            NSRunningApplication *application = applicationForIdentity(target, original);
-            if (!application) { event(@"process_identity_unavailable", HengeAuthError(ProcessIdentityUnavailable)); return 1; }
-            double authorizationBudget = quitDeadline - HengeAuthMonotonic();
-            if (authorizationBudget <= 0) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
-            state = readStateWithTimeout(MIN(2, authorizationBudget), &error);
-            if (!authorizationMatches(state, session, launchID, mode, action)) {
-                event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
-            }
-            // No normal-quit failure ever reaches forceTerminate. The explicit
-            // launch action and this exact PID/birth/UID/executable identity
-            // must both still match immediately before the one requested action.
-            processState = HengeAuthProcessCheck(original, &observation);
-            if (processState == HENGE_AUTH_PROCESS_ALIVE) {
-                event(quitRequested, nil);
-                // Fixed event I/O must not separate the final lifetime check
-                // from the OS operation on that original application.
-                processState = HengeAuthProcessCheck(original, &observation);
-                if (processState == HENGE_AUTH_PROCESS_ALIVE) {
-                    actionRequested = YES;
-                    BOOL sent = force ? [application forceTerminate] : [application terminate];
-                    processState = HengeAuthProcessCheck(original, &observation);
-                    if (!sent && processState == HENGE_AUTH_PROCESS_ALIVE) {
-                        event(quitRefused, HengeAuthError(QuitRefused)); return 1;
-                    }
-                }
-            }
+        if (quitDeadline <= HengeAuthMonotonic()) { processEvent(@"launch_timeout", HengeAuthError(LaunchTimeout), &progress); return 1; }
+        __attribute__((objc_precise_lifetime)) NSRunningApplication *application = progress.state == HENGE_AUTH_PROCESS_ALIVE
+            ? applicationForIdentity(target, original) : nil;
+        if (progress.state == HENGE_AUTH_PROCESS_ALIVE && !application) {
+            progress.state = progress.observation.state = HENGE_AUTH_PROCESS_UNAVAILABLE;
+            progress.observation.source = HENGE_AUTH_PROCESS_SOURCE_APPKIT_LOOKUP;
+            progress.observation.error_number = 0;
+            processEvent(@"process_identity_unavailable", HengeAuthError(ProcessIdentityUnavailable), &progress); return 1;
         }
-        double nextAuthorizationCheck = 0;
-        while (processState == HENGE_AUTH_PROCESS_ALIVE && HengeAuthMonotonic() < quitDeadline) {
-            double now = HengeAuthMonotonic();
-            if (now >= nextAuthorizationCheck) {
-                state = readStateWithTimeout(MIN(2, quitDeadline - now), &error);
-                if (!authorizationMatches(state, session, launchID, mode, action)) {
-                    event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
-                }
-                nextAuthorizationCheck = HengeAuthMonotonic() + 0.5;
-            }
-            // Service AppKit notifications without using its cached terminated
-            // property as the exit decision. The kernel identity remains final.
-            serviceMainRunLoop(MIN(0.05, MAX(0, quitDeadline - HengeAuthMonotonic())));
-            processState = HengeAuthProcessCheck(original, &observation);
+        __attribute__((objc_precise_lifetime)) HengeQuitAuthorize authorize = ^int(double remaining) {
+            NSError *authorizationError = nil;
+            NSDictionary *current = readStateWithTimeout(MIN(2, remaining), &authorizationError);
+            if (authorizationMatches(current, session, launchID, mode, action)) return 1;
+            error = authorizationError ?: HengeAuthError(SessionInactive);
+            return 0;
+        };
+        __attribute__((objc_precise_lifetime)) HengeQuitNotify notify = ^(HengeAuthQuitNotice notice, const HengeAuthQuitProgress *value) {
+            NSString *stage = notice == HENGE_AUTH_QUIT_INTENT ? quitRequested :
+                notice == HENGE_AUTH_QUIT_RETURNED ? @"quit_operation_returned" : @"process_exit_pending";
+            NSError *observationError = value->state == HENGE_AUTH_PROCESS_UNAVAILABLE
+                ? processObservationError(&value->observation) : nil;
+            processEvent(stage, observationError, value);
+        };
+        // These synchronous references are kept alive by precise-lifetime
+        // owners above. The shared flow contains the only invoke.
+        HengeQuitRuntime runtime = {original, application, authorize, notify, force};
+        HengeAuthQuitOutcome outcome = HengeAuthQuitOriginalAndWait(original, quitDeadline,
+            &runtime, &quitCallbacks, &progress);
+        if (outcome == HENGE_AUTH_QUIT_CANCELLED) { processEvent(@"session_inactive", error, &progress); return 1; }
+        if (outcome == HENGE_AUTH_QUIT_CHANGED) {
+            observedPID = progress.observation.observed_pid > 0 ? progress.observation.observed_pid : targetPID;
+            processEvent(@"target_process_changed", HengeAuthError(TargetProcessChanged), &progress); return 1;
         }
-        if (processState == HENGE_AUTH_PROCESS_REPLACED) {
-            observedPID = observation.observed_pid > 0 ? observation.observed_pid : targetPID;
-            event(@"target_process_changed", HengeAuthError(TargetProcessChanged)); return 1;
+        if (outcome == HENGE_AUTH_QUIT_UNKNOWN) {
+            // Even at the quit deadline this remains unknown, not an exit or
+            // an invitation to repeat the operation or start another process.
+            processEvent(@"process_identity_unavailable", processObservationError(&progress.observation), &progress); return 1;
         }
-        if (processState == HENGE_AUTH_PROCESS_UNAVAILABLE) {
-            event(@"process_identity_unavailable", processObservationError(&observation)); return 1;
-        }
-        if (processState != HENGE_AUTH_PROCESS_EXITED) { event(quitTimeout, HengeAuthError(QuitTimeout)); return 1; }
+        if (outcome == HENGE_AUTH_QUIT_REFUSED) { processEvent(quitRefused, HengeAuthError(QuitRefused), &progress); return 1; }
+        if (outcome != HENGE_AUTH_QUIT_EXITED) { processEvent(quitTimeout, HengeAuthError(QuitTimeout), &progress); return 1; }
         observedPID = 0;
-        if (actionRequested) event(quitCompleted, nil);
-        // An exiting app may have updated itself. Revalidate the exact
-        // target without turning the static loading prediction into a gate.
-        if (!HengeAuthTargetIdentity(target, NO, &error)) {
+        if (progress.operation_invoked) processEvent(quitCompleted, nil, &progress);
+        // An exiting app may have updated itself. Retain the complete signature
+        // check; fixed start/end evidence makes its duration independently clear.
+        memset(&progress.observation, 0, sizeof(progress.observation));
+        progress.state = 0;
+        progress.phase = HENGE_AUTH_PHASE_POST_EXIT_SIGNATURE;
+        progress.phase_started = HengeAuthMonotonic();
+        if (progress.phase_started >= started + 75) { processEvent(@"launch_timeout", HengeAuthError(LaunchTimeout), &progress); return 1; }
+        processEvent(@"post_exit_signature_started", nil, &progress);
+        BOOL validSignature = HengeAuthTargetIdentity(target, NO, &error);
+        processEvent(@"post_exit_signature_completed", validSignature ? nil : error, &progress);
+        if (!validSignature) {
             NSString *stage = [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity
                 ? @"target_identity_mismatch" : @"target_signature_invalid";
-            event(stage, error); return 1;
+            processEvent(stage, error, &progress); return 1;
         }
+        if (HengeAuthMonotonic() >= started + 75) { processEvent(@"launch_timeout", HengeAuthError(LaunchTimeout), &progress); return 1; }
     }
     state = HengeAuthReadState(&error);
     if (!authorizationMatches(state, session, launchID, mode, action)) {
@@ -922,17 +975,27 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     // A complete bounded kernel scan, rather than an AppKit cache, establishes
     // that no matching main remains. A new instance is never terminated here.
     HengeAuthProcessIdentity remaining[2] = {0};
-    HengeAuthProcessObservation remainingObservation = {0};
+    memset(&progress.observation, 0, sizeof(progress.observation));
+    progress.state = 0;
+    progress.phase = HENGE_AUTH_PHASE_POST_EXIT_CENSUS;
+    progress.phase_started = HengeAuthMonotonic();
+    if (progress.phase_started >= started + 75) { processEvent(@"launch_timeout", HengeAuthError(LaunchTimeout), &progress); return 1; }
+    processEvent(@"post_exit_census_started", nil, &progress);
     size_t remainingCount = 0;
     NSString *executable = [NSBundle bundleWithPath:target].executablePath;
     HengeAuthProcessState remainingState = HengeAuthProcessListMatching(executable.fileSystemRepresentation,
-        geteuid(), remaining, 2, &remainingCount, &remainingObservation);
+        geteuid(), remaining, 2, &remainingCount, &progress.observation);
+    progress.state = remainingState;
+    if (remainingCount) observedPID = remaining[0].pid;
+    NSError *censusError = remainingState != HENGE_AUTH_PROCESS_ALIVE && remainingState != HENGE_AUTH_PROCESS_EXITED
+        ? processObservationError(&progress.observation) : nil;
+    processEvent(@"post_exit_census_completed", censusError, &progress);
     if (remainingState != HENGE_AUTH_PROCESS_ALIVE && remainingState != HENGE_AUTH_PROCESS_EXITED) {
-        event(@"process_identity_unavailable", processObservationError(&remainingObservation)); return 1;
+        processEvent(@"process_identity_unavailable", censusError, &progress); return 1;
     }
     if (remainingCount) {
         observedPID = remaining[0].pid;
-        event(@"target_reappeared", HengeAuthError(TargetReappeared)); return 1;
+        processEvent(@"target_reappeared", HengeAuthError(TargetReappeared), &progress); return 1;
     }
     // The kernel census is bounded but can take several seconds on a busy VM.
     // Recheck authorization after it so revocation during the scan cannot

@@ -58,7 +58,7 @@ struct HelperHealthSnapshot: Equatable {
     var isConnected: Bool { valid && !session.isEmpty && helperProtocol == 4 && agentSeenSeconds >= 0 && agentSeenSeconds < 30 }
     var supportsAuthExperiment: Bool { isConnected && helperVersion > 0 && authExperimentProtocol >= 1 }
     var supportsAuthColdStart: Bool { isConnected && helperVersion >= 9 && authExperimentProtocol >= 2 }
-    var supportsVerifiedExit: Bool { isConnected && helperVersion >= 10 && authExperimentProtocol >= 3 }
+    var supportsVerifiedExit: Bool { isConnected && helperVersion >= 11 && authExperimentProtocol >= 4 }
     var supportsAuthForceQuit: Bool { supportsVerifiedExit }
     func permitsVerifiedExit(forSession expected: String) -> Bool {
         supportsVerifiedExit && !expected.isEmpty && UUID(uuidString: expected) != nil &&
@@ -71,8 +71,8 @@ struct HelperHealthSnapshot: Equatable {
         isConnected && ((helperVersion > 0 && helperVersion < 9) || authExperimentProtocol == 1)
     }
     var requiresVerifiedExitUpdate: Bool {
-        isConnected && ((helperVersion > 0 && helperVersion < 10) ||
-            (authExperimentProtocol > 0 && authExperimentProtocol < 3))
+        isConnected && ((helperVersion > 0 && helperVersion < 11) ||
+            (authExperimentProtocol > 0 && authExperimentProtocol < 4))
     }
     var connectionTitle: String {
         if !valid { return "Status unavailable" }

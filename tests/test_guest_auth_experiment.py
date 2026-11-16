@@ -26,6 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKERS = (b"SYNTHETIC_TOKEN_DO_NOT_LOG", b"SYNTHETIC_SIGNATURE_DO_NOT_LOG",
            b"SYNTHETIC_CHALLENGE_DO_NOT_LOG", b"SYNTHETIC_CHAT_TEXT_DO_NOT_LOG",
            b"SYNTHETIC_COOKIE_DO_NOT_LOG")
+PROCESS_FIELDS = {"processPhase": (0, 6), "processSource": (0, 12), "processState": (0, 4),
+                  "processFlags": (0, 15), "processStatus": (0, 255), "processRetries": (0, 25),
+                  "processSampleMs": (0, 300000), "operationInvoked": (0, 1),
+                  "operationResult": (-1, 1), "phaseElapsedMs": (0, 300000)}
 
 
 def command(arguments: list[str], *, env: dict[str, str], timeout: int = 90, expected: int | None = 0):
@@ -73,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         service = self.server
-        if self.path != "/.henge/v1/auth/state?capability=3":
+        if self.path != "/.henge/v1/auth/state?capability=4":
             return self.send_json({"protocol": 1, "error": "not_found"}, 404)
         state = {"protocol": 1, "enabled": not service.revoked, "session": service.session,
                  "launch_id": service.launch_id, "mode": service.mode}
@@ -96,8 +100,16 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/.henge/v1/auth/event":
                 expected = {"protocol", "launch_id", "request_id", "stage", "errorDomain", "errorCode",
                             "elapsedMs", "inputBytes", "resultBytes"}
-                if not expected <= set(body) or set(body) - expected - {"targetPid", "observedPid"}:
+                if not expected <= set(body) or set(body) - expected - {"targetPid", "observedPid"} - PROCESS_FIELDS.keys():
                     raise ValueError("event_schema")
+                if set(body) & PROCESS_FIELDS.keys():
+                    if not PROCESS_FIELDS.keys() <= set(body):
+                        raise ValueError("process_evidence_incomplete")
+                    for key, (low, high) in PROCESS_FIELDS.items():
+                        if type(body[key]) is not int or not low <= body[key] <= high:
+                            raise ValueError("process_evidence_numeric")
+                    if (body["operationInvoked"] == 0) != (body["operationResult"] == -1):
+                        raise ValueError("operation_result_without_invocation")
                 for key in ("targetPid", "observedPid"):
                     if key in body and (type(body[key]) is not int or not 0 <= body[key] <= 2147483647):
                         raise ValueError("event_pid")
@@ -312,6 +324,29 @@ def main() -> int:
                 events = [json.loads(line) for line in local_events.splitlines()]
                 stages = {event["stage"] for event in events}
                 server_stages = {event["stage"] for event in service.events}
+                returned = [event for event in events if event["stage"] == "quit_operation_returned"]
+                if len(returned) > 1 or any(event.get("operationInvoked") != 1 or
+                                            event.get("operationResult") not in (0, 1) for event in returned):
+                    raise AssertionError("OS operation was repeated or return evidence was not truthful")
+                for event in events:
+                    if event["stage"] in {"quit_requested", "force_quit_requested"} and (
+                            event.get("operationInvoked") != 0 or event.get("operationResult") != -1):
+                        raise AssertionError("pre-operation intent was misreported as a dispatched operation")
+                    if event["stage"] in {"quit_completed", "force_quit_completed"} and (
+                            len(returned) != 1 or event.get("operationInvoked") != 1 or event.get("processState") != 2):
+                        raise AssertionError("quit completion lacked a single dispatch and positive kernel exit")
+                if "post_exit_signature_started" in stages:
+                    if "post_exit_signature_completed" not in stages:
+                        raise AssertionError("owned successful revalidation lacks its completion timing")
+                    for event in events:
+                        if event["stage"].startswith("post_exit_signature_") and event.get("processPhase") != 5:
+                            raise AssertionError("signature timing is not separated from process waiting")
+                if "post_exit_census_started" in stages:
+                    if "post_exit_census_completed" not in stages:
+                        raise AssertionError("owned successful census lacks its completion timing")
+                    for event in events:
+                        if event["stage"].startswith("post_exit_census_") and event.get("processPhase") != 6:
+                            raise AssertionError("fresh census timing is not separated from signature checking")
                 if scenario in {"identity_mismatch", "force_requires_authorization"}:
                     if any(stage.startswith(("target_process_", "policy_")) for stage in stages):
                         raise AssertionError("unverified target was reported as a validated process/policy observation")
@@ -411,7 +446,7 @@ def main() -> int:
                             raise AssertionError("launcher did not preserve old/new identity or attempted another quit")
                 if scenario != "force_quit_restart" and any(stage.startswith("force_quit_") for stage in stages):
                     raise AssertionError("normal/default/cancelled action silently escalated to force quit")
-                if scenario == "force_quit_restart" and any(stage.startswith("quit_") for stage in stages):
+                if scenario == "force_quit_restart" and any(stage.startswith("quit_") and stage != "quit_operation_returned" for stage in stages):
                     raise AssertionError("explicit force action silently used another action")
                 if service.mode == "public_token" and (service.operations["baa_data"] or service.operations["baa_dictionary"]):
                     raise AssertionError("public mode crossed into host BAA signing")

@@ -48,7 +48,7 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
 RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
 
 # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
-$(B)/henge-agent: tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h tools/helper-version.h tools/helper-app.m tools/helper-app.h
+$(B)/henge-agent: tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h tools/helper-version.h tools/helper-app.m tools/helper-app.h tools/guest-auth-exit-wait.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework Network -framework ServiceManagement -framework Security -lproc tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-process.m tools/guest-chat-diagnostics.m tools/helper-health.m tools/helper-app.m -o $@
 	codesign -f -s - $@
@@ -77,8 +77,8 @@ $(B)/test_helper_health: tests/test_helper_health.m tools/helper-health.m tools/
 $(B)/share.o: host/share.c host/share.h host/helper-install-script.inc host/device_auth_http.inc host/device_auth.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/device_auth.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/device_auth.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/net_capture.o $(B)/dns_proxy.o $(B)/share.o $(B)/device_auth.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/net_capture.o $(B)/dns_proxy.o $(B)/share.o $(B)/device_auth.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
@@ -110,12 +110,20 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/device_auth.o $(B)/usb_host.o
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/net_capture.o $(B)/dns_proxy.o $(B)/share.o $(B)/device_auth.o $(B)/usb_host.o
 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
 	$(B)/test_vm_lifecycle
 .PHONY: test-vm-lifecycle
+
+# Portable production parser/capture tests; no Apple SDK or guest VM required.
+$(B)/test_net_capture: tests/test_net_capture.c host/net_capture.c host/net_capture.h | $(B)
+	$(CC) $(CFLAGS) -pthread tests/test_net_capture.c -o $@
+
+test-net-capture: $(B)/test_net_capture
+	$(B)/test_net_capture
+.PHONY: test-net-capture
 
 $(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -fobjc-arc $^ $(METAL_LIBS) -o $@
@@ -149,7 +157,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
 IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/dns_proxy.c host/share.c host/device_auth.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/net_capture.c host/dns_proxy.c host/share.c host/device_auth.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
@@ -233,12 +241,12 @@ test-jit-advice: $(B)/test_jit_advice
 .PHONY: test-jit-advice
 
 # Session-only guest adapter and launcher; the helper archive preserves their signatures.
-$(B)/henge-auth-launcher: tools/henge-auth-launcher.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h
+$(B)/henge-auth-launcher: tools/henge-auth-launcher.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h tools/guest-auth-exit-wait.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -fblocks -Wall -Wextra -O2 -framework Foundation -framework AppKit -framework Security -lproc tools/henge-auth-launcher.m tools/guest-auth-experiment.m tools/guest-auth-process.m -o $@
 	codesign -f -s - --identifier com.henge.auth-launcher $@
 
-$(B)/henge-auth-adapter.dylib: tools/henge-auth-adapter.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h
+$(B)/henge-auth-adapter.dylib: tools/henge-auth-adapter.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h tools/guest-auth-exit-wait.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -fblocks -Wall -Wextra -O2 -dynamiclib -framework Foundation -framework AppKit -framework Security -lproc tools/henge-auth-adapter.m tools/guest-auth-experiment.m tools/guest-auth-process.m -o $@
 	codesign -f -s - --identifier com.henge.auth-adapter $@

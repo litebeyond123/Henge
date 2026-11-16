@@ -4,4 +4,5 @@
 #include "hvsparse.h"
 #include "share.h"
 #include "device_auth.h"
+#include "net_capture.h"
 #include "Native/HengeAuthBridge.h"

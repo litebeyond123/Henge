@@ -1,6 +1,6 @@
 # Henge 0.4 test packages
 
-The test release is version **0.4.0**, build **4011**. This build setup starts
+The test release is version **0.4.0**, build **4012**. This build setup starts
 from the successful `2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f` workflow and
 keeps its `xcode-27` runner and dependency build procedure. It does not contain
 a prebuilt 0.4 app. A successful macOS build is required to produce one.
@@ -18,7 +18,7 @@ TrollStore **Henge.tipa** first, and uploads it with a JSON manifest and SHA-256
 checksum. Select `include_ipa` only if an additional sideloading IPA is needed.
 On `litebeyond123/Henge`, a successful push build of
 `work/0.4-ipados17-test` also publishes the validated package as the
-`v0.4.0-test10` prerelease. The publication job checks the package digest,
+`v0.4.0-test11` prerelease. The publication job checks the package digest,
 version, build and full source commit against this run's manifest before
 uploading it. That separate job alone has repository write permission.
 Other repositories and branches only receive build artifacts. The workflow
@@ -54,7 +54,7 @@ macOS fixture exercises cold restart, a declined quit, cancellation, and adapter
 handshake failures. Test 10 verifies the actual target PID, executable and birth
 time, allows up to 30 seconds for a normal quit, and offers a separately authorized
 forced-quit retry for the verified original main process. It does not escalate a
-normal quit automatically. Current usage and limits are in `docs/release-test10.md`.
+normal quit automatically. Test 11 uses the remaining quit budget for a precisely observed kernel exit transition, persists fixed process observations, and automatically captures bounded payload-free guest NIC headers into the same diagnostic report. It also gives explicit manual guest log collection a longer bounded deadline. Current usage and limits are in `docs/release-test11.md`.
 
 ## Local checks
 
@@ -78,7 +78,7 @@ installer receipts and helper startup transitions immediately in the native log;
 see `docs/release-test4.1.md`.
 
 Validate an actual downloaded build against the full source commit used by its
-workflow. The default expected version/build are 0.4.0/4011:
+workflow. The default expected version/build are 0.4.0/4012:
 
 ```sh
 python3 ci/validate-package.py /path/to/Henge.tipa \

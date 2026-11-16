@@ -1,5 +1,6 @@
 #import "../tools/guest-chat-diagnostics.h"
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 
 static NSData *json(id value) { return [NSJSONSerialization dataWithJSONObject:value options:0 error:NULL]; }
@@ -26,7 +27,17 @@ int main(void) {
             assert(!HengeChatDiagnosticsValidateRequest(json(request), now, NO));
         }
         [request removeObjectForKey:@"collect"]; // Legacy hosts omit this field and retain existing behavior.
-        assert(HengeChatDiagnosticsValidateRequest(json(request), now, YES));
+        assert([HengeChatDiagnosticsValidateRequest(json(request), now, YES)[@"collection_mode"] isEqual:@"automatic"]);
+        request[@"collection_mode"] = @"manual";
+        assert([HengeChatDiagnosticsValidateRequest(json(request), now, YES)[@"collection_mode"] isEqual:@"manual"]);
+        request[@"collect"] = @NO;
+        assert(!HengeChatDiagnosticsValidateRequest(json(request), now, YES)); // A mode never upgrades heartbeat permission.
+        [request removeObjectForKey:@"collect"];
+        for (id invalid in @[@YES, @1, @"live_stream", @"MANUAL", NSNull.null]) {
+            request[@"collection_mode"] = invalid;
+            assert(!HengeChatDiagnosticsValidateRequest(json(request), now, NO));
+        }
+        [request removeObjectForKey:@"collection_mode"];
         request[@"task"] = @"run_command";
         assert(!HengeChatDiagnosticsValidateRequest(json(request), now, YES));
         request[@"task"] = @"chat_error_summary";
@@ -133,6 +144,70 @@ int main(void) {
         parsed = HengeChatDiagnosticsTestLogCommand(@"/usr/bin/printf", @[@"%s", @"{\"finished\":true}\n"], 2, @"ChatGPT", nil);
         assert([parsed[@"log_counts_status"] isEqual:@"complete"] && [parsed[@"log_event_count"] isEqual:@0]);
         assert([parsed[@"classification"] isEqual:@"no_known_error_observed"]);
+
+        NSDictionary *manualPlan = HengeChatDiagnosticsTestBudgetPlan(@"manual", 60);
+        NSDictionary *automaticPlan = HengeChatDiagnosticsTestBudgetPlan(@"automatic", 60);
+        assert([manualPlan[@"collection_budget_ms"] isEqual:@35000] && [manualPlan[@"log_command_budget_ms"] isEqual:@30000]);
+        assert([automaticPlan[@"collection_budget_ms"] isEqual:@10000] && [automaticPlan[@"log_command_budget_ms"] isEqual:@8000]);
+        assert([manualPlan[@"signature_display_budget_ms"] isEqual:@3000] && [manualPlan[@"signature_verify_budget_ms"] isEqual:@0]);
+        assert([HengeChatDiagnosticsTestBudgetPlan(@"manual", 20)[@"collection_effective_budget_ms"] isEqual:@18000]);
+        assert([HengeChatDiagnosticsTestBudgetPlan(@"manual", 2)[@"collection_effective_budget_ms"] isEqual:@0]);
+        assert([HengeChatDiagnosticsTestBudgetPlan(@"manual", NAN)[@"collection_effective_budget_ms"] isEqual:@0]);
+        assert(!HengeChatDiagnosticsTestBudgetPlan(@"arbitrary", 60));
+        // Exercise the actual profile + production child runner. This complete event only
+        // becomes available after the old eight-second budget, and must now be retained.
+        NSString *slowEvidence = [NSString stringWithFormat:@"/bin/sleep 9; printf '%%s\\n' '%@'; printf '%%s\\n' '{\"finished\":true}'", line];
+        parsed = HengeChatDiagnosticsTestPlannedLogCommand(@"manual", 60, @"/bin/sh", @[@"-c", slowEvidence],
+                                                          @"CodexFixture", @"com.openai.codex.fixture");
+        assert([parsed[@"log_command_status"] isEqual:@"complete"] && [parsed[@"log_counts_status"] isEqual:@"complete"]);
+        assert([parsed[@"collection_elapsed_ms"] unsignedIntegerValue] >= 8500);
+        assert([parsed[@"log_event_count"] isEqual:@1] && [parsed[@"error_devicecheck_unsupported_count"] isEqual:@1]);
+        assert([parsed[@"log_command_effective_budget_ms"] unsignedIntegerValue] > 8000 &&
+               [parsed[@"log_command_effective_budget_ms"] unsignedIntegerValue] <= 30000);
+        assert(![[[NSString alloc] initWithData:json(parsed) encoding:NSUTF8StringEncoding] containsString:secret]);
+        parsed = HengeChatDiagnosticsTestPlannedLogCommand(@"manual", 2.75, @"/bin/sh", @[@"-c", delayed], @"CodexFixture", nil);
+        assert([parsed[@"log_command_status"] isEqual:@"timed_out"] && [parsed[@"log_counts_status"] isEqual:@"partial"]);
+        assert([parsed[@"error_devicecheck_unsupported_count"] isEqual:@1]);
+        assert([parsed[@"collection_effective_budget_ms"] isEqual:@750]);
+        assert([parsed[@"log_command_effective_budget_ms"] unsignedIntegerValue] <= 750);
+        parsed = HengeChatDiagnosticsTestPlannedLogCommand(@"manual", 2.25, @"/bin/sleep", @[@"5"], @"ChatGPT", nil);
+        assert([parsed[@"log_counts_status"] isEqual:@"unavailable"] && [parsed[@"classification"] isEqual:@"logs_unavailable"]);
+        parsed = HengeChatDiagnosticsTestPlannedLogCommand(@"manual", 2, @"/usr/bin/true", @[], @"ChatGPT", nil);
+        assert([parsed[@"log_command_status"] isEqual:@"not_run_budget"] && ![parsed[@"log_command_started"] boolValue]);
+
+        NSFileManager *files = NSFileManager.defaultManager;
+        NSString *folder = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"henge-electron-metadata-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        NSString *app = [folder stringByAppendingPathComponent:@"Fixture.app"];
+        NSString *framework = [app stringByAppendingPathComponent:@"Contents/Frameworks/Electron Framework.framework"];
+        NSString *resources = [framework stringByAppendingPathComponent:@"Versions/A/Resources"];
+        assert([files createDirectoryAtPath:resources withIntermediateDirectories:YES attributes:nil error:NULL]);
+        assert([HengeChatDiagnosticsTestElectronMetadata(nil)[@"electron_framework_metadata_status"] isEqual:@"not_found"]);
+        assert([HengeChatDiagnosticsTestElectronMetadata(app)[@"electron_framework_metadata_status"] isEqual:@"not_found"]);
+        NSString *plistPath = [resources stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *plist = @{@"CFBundleShortVersionString": @"42.0.0-beta.2", @"ArbitrarySecret": secret};
+        NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:plist format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+        assert([plistData writeToFile:plistPath atomically:YES]);
+        NSDictionary *electron = HengeChatDiagnosticsTestElectronMetadata(app);
+        assert([electron[@"electron_framework_metadata_status"] isEqual:@"complete"] && [electron[@"electron_framework_version"] isEqual:@"42.0.0-beta.2"]);
+        assert(electron.count == 2 && ![[[NSString alloc] initWithData:json(electron) encoding:NSUTF8StringEncoding] containsString:secret]);
+        NSString *resourceLink = [framework stringByAppendingPathComponent:@"Resources"];
+        assert([files createSymbolicLinkAtPath:resourceLink withDestinationPath:@"Versions/A/Resources" error:NULL]);
+        assert([HengeChatDiagnosticsTestElectronMetadata(app)[@"electron_framework_version"] isEqual:@"42.0.0-beta.2"]);
+        for (id invalid in @[secret, @"42.0.0?token=secret", @"42.0", @YES]) {
+            plistData = [NSPropertyListSerialization dataWithPropertyList:@{@"CFBundleShortVersionString": invalid}
+                format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+            assert([plistData writeToFile:plistPath atomically:YES]);
+            electron = HengeChatDiagnosticsTestElectronMetadata(app);
+            assert([electron[@"electron_framework_metadata_status"] isEqual:@"invalid"] && !electron[@"electron_framework_version"]);
+        }
+        assert([[NSMutableData dataWithLength:65537] writeToFile:plistPath atomically:YES]);
+        assert([HengeChatDiagnosticsTestElectronMetadata(app)[@"electron_framework_metadata_status"] isEqual:@"unavailable"]);
+        assert([files removeItemAtPath:resourceLink error:NULL]);
+        assert([files createSymbolicLinkAtPath:resourceLink withDestinationPath:folder error:NULL]);
+        assert([plistData writeToFile:[folder stringByAppendingPathComponent:@"Info.plist"] atomically:YES]);
+        assert([HengeChatDiagnosticsTestElectronMetadata(app)[@"electron_framework_metadata_status"] isEqual:@"unavailable"]);
+        assert([files removeItemAtPath:folder error:NULL]);
+        puts("PASS: manual 35s/30s budget retains delayed synthetic evidence; TTL clamps, partial results and fixed Electron metadata");
         puts("PASS: guest request bounds, fixed error categories, NDJSON partial evidence, privacy, child-output cap and independent deadline");
     }
     return 0;

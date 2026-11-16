@@ -150,7 +150,9 @@ struct DeviceAuthProgress {
             else {
                 // These phases only move forward for one launch. A late quit or
                 // launch_requested delivery must not undo a later spawn observation.
-                last = ["launch_started", "force_quit_completed", "quit_completed", "force_quit_requested", "quit_requested", "launch_requested", "host_bridge_enabled"]
+                last = ["launch_started", "post_exit_census_completed", "post_exit_census_started",
+                        "post_exit_signature_completed", "post_exit_signature_started", "force_quit_completed", "quit_completed",
+                        "process_exit_pending", "quit_operation_returned", "force_quit_requested", "quit_requested", "launch_requested", "host_bridge_enabled"]
                     .first { progressStages.contains($0) } ?? "host_bridge_enabled"
             }
         }
@@ -162,12 +164,12 @@ struct DeviceAuthProgress {
             }
             if state["launch_action"] != nil && !helper.permitsVerifiedExit(forSession: state["session"] as? String ?? "") {
                 if helper.requiresVerifiedExitUpdate {
-                    return result("helper_update_required", "Update the Mac helper for this test", "Run Install / Repair once for Helper 10, then start a new test. Both startup actions need its verified process-exit support.")
+                    return result("helper_update_required", "Update the Mac helper for this test", "Run Install / Repair once for Helper 11, then start a new test. Both startup actions need its verified process-exit support.")
                 }
-                return result("helper_capability_unconfirmed", "Helper startup capability unconfirmed", "A current Helper 10 connection to this Mac has not been confirmed. Check Sharing below and wait for the connection.")
+                return result("helper_capability_unconfirmed", "Helper startup capability unconfirmed", "A current Helper 11 connection to this Mac has not been confirmed. Check Sharing below and wait for the connection.")
             }
             if helper.requiresAuthColdStartUpdate {
-                return result("helper_update_required", "Update the Mac helper for this test", "This helper reports the earlier startup capability. Run Install / Repair once for Helper 10, then Stop and start a new test.")
+                return result("helper_update_required", "Update the Mac helper for this test", "This helper reports the earlier startup capability. Run Install / Repair once for Helper 11, then Stop and start a new test.")
             }
             if !helper.supportsAuthColdStart {
                 return result("helper_capability_unconfirmed", "Helper authentication capability unconfirmed", "Run Install / Repair once to update the Mac helper. Its actual version and authentication capability will appear here.")
@@ -179,7 +181,7 @@ struct DeviceAuthProgress {
         case "target_identity_mismatch", "target_signature_invalid", "adapter_target_rejected":
             return result("target_verification_failed", "ChatGPT verification failed", "The installed app's identity or signature did not match. The report records the verification stage.", last)
         case "signature_policy_blocked":
-            return result(last, "Earlier helper stopped at signing preflight", "This is the earlier helper's static prediction, before an actual adapter launch. Update to Helper 10 and start a new test to let macOS decide. No protection setting is changed.", last)
+            return result(last, "Earlier helper stopped at signing preflight", "This is the earlier helper's static prediction, before an actual adapter launch. Update to Helper 11 and start a new test to let macOS decide. No protection setting is changed.", last)
         case "already_running":
             return result(last, "A running ChatGPT process prevented startup", "The helper did not launch another copy. Check ChatGPT in the Mac, then Stop and start a new test.", last)
         case "process_identity_unavailable":
@@ -188,6 +190,12 @@ struct DeviceAuthProgress {
             return result(last, "The verified ChatGPT process changed", "The process identity changed during the quit attempt. The helper stopped instead of terminating a different instance.", last)
         case "target_reappeared":
             return result(last, "Another ChatGPT process appeared", "Another matching main process was observed before launch. The helper stopped and will not repeatedly terminate new instances.", last)
+        case "quit_operation_returned", "process_exit_pending":
+            return result("waiting_for_process_exit", "Checking that ChatGPT has exited", "The quit operation has returned. The helper is checking the original process within the existing timeout before starting one new instance.", last)
+        case "post_exit_signature_started", "post_exit_signature_completed":
+            return result("verifying_after_exit", "Checking ChatGPT before a new launch", "The previous process has exited. The helper is verifying the original app; the duration is recorded in the report.", last)
+        case "post_exit_census_started", "post_exit_census_completed":
+            return result("checking_before_launch", "Checking for another ChatGPT process", "The helper checks once more before launching. A newly appeared process is recorded instead of being terminated automatically.", last)
         case "force_quit_requested":
             return result("waiting_for_force_quit", "Waiting for the requested force quit", "This attempt was explicitly started with Force quit. The helper is checking that the verified main process has ended before one new launch.", last)
         case "force_quit_completed":

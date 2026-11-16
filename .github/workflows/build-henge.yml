@@ -28,7 +28,7 @@ env:
   HENGE_PACKAGE_OUTPUT_DIR: ${{ github.workspace }}/packages
   HENGE_BUILD_LOG_DIR: ${{ github.workspace }}/build-logs
   HENGE_EXPECTED_VERSION: '0.4.0'
-  HENGE_EXPECTED_BUILD: '4011'
+  HENGE_EXPECTED_BUILD: '4012'
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
@@ -103,6 +103,10 @@ jobs:
           sh tests/run_guest_auth_process.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/device-auth-process-tests.log"
           python3 tests/test_guest_auth_experiment.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/device-auth-guest-tests.log"
 
+      - name: Test bounded guest network header capture
+        working-directory: Henge
+        run: python3 tests/test_net_capture.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/network-capture-tests.log"
+
       - name: Test host services
         # The Apple runner supports the actual Unix listener. Keep the
         # socketpair/courier alternative for restricted local test environments.
@@ -120,7 +124,7 @@ jobs:
           make build/test_helper_health build/henge-agent.gz build/henge-helper.app.tar.gz 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-health-compile.log"
           build/test_helper_health 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-health-tests.log"
           codesign --verify --strict build/henge-agent
-          test "$(build/henge-agent --version)" = "henge-agent 10"
+          test "$(build/henge-agent --version)" = "henge-agent 11"
           xcrun --sdk macosx swiftc -swift-version 5 ios/Henge/Sharing.swift tests/test_helper_status.swift \
             -o "$RUNNER_TEMP/henge-test-helper-status" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-status-compile.log"
           "$RUNNER_TEMP/henge-test-helper-status" 2>&1 | tee "$HENGE_BUILD_LOG_DIR/helper-status-tests.log"
@@ -242,7 +246,7 @@ jobs:
       - name: Upload validated TIPA and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4011-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4012-tipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.tipa.manifest.json
@@ -266,7 +270,7 @@ jobs:
         if: ${{ success() && inputs.include_ipa }}
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-0.4.0-4011-ipa-${{ github.sha }}
+          name: Henge-0.4.0-4012-ipa-${{ github.sha }}
           path: |
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa
             ${{ env.HENGE_PACKAGE_OUTPUT_DIR }}/Henge.ipa.manifest.json
@@ -284,8 +288,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  publish-test10:
-    name: Publish the validated Test 10 prerelease
+  publish-test11:
+    name: Publish the validated Test 11 prerelease
     needs: build
     if: ${{ success() && github.repository == 'litebeyond123/Henge' && github.ref == 'refs/heads/work/0.4-ipados17-test' }}
     runs-on: ubuntu-latest
@@ -299,13 +303,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          sparse-checkout: docs/release-test10.md
+          sparse-checkout: docs/release-test11.md
           sparse-checkout-cone-mode: false
 
       - name: Download the validated package from this run
         uses: actions/download-artifact@v4
         with:
-          name: Henge-0.4.0-4011-tipa-${{ github.sha }}
+          name: Henge-0.4.0-4012-tipa-${{ github.sha }}
           path: validated-package
 
       - name: Verify and name release assets
@@ -320,28 +324,28 @@ jobs:
           digest = hashlib.sha256(package.read_bytes()).hexdigest()
           assert manifest['source']['henge_commit'] == os.environ['BUILT_COMMIT'], 'Source commit mismatch'
           assert manifest['application']['version'] == '0.4.0', 'Version mismatch'
-          assert manifest['application']['build'] == '4011', 'Build mismatch'
+          assert manifest['application']['build'] == '4012', 'Build mismatch'
           assert manifest['package']['sha256'] == digest, 'Package digest mismatch'
           out = pathlib.Path('release-assets')
           out.mkdir()
-          name = 'Henge-0.4.0-test10.tipa'
+          name = 'Henge-0.4.0-test11.tipa'
           shutil.copyfile(package, out / name)
           manifest['package']['filename'] = name
-          (out / 'Henge-0.4.0-test10.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-          (out / 'Henge-0.4.0-test10.sha256').write_text(f'{digest}  {name}\n')
-          print(f'Validated Test 10 package: {digest}')
+          (out / 'Henge-0.4.0-test11.manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          (out / 'Henge-0.4.0-test11.sha256').write_text(f'{digest}  {name}\n')
+          print(f'Validated Test 11 package: {digest}')
           PY
 
-      - name: Publish Test 10 as a prerelease
+      - name: Publish Test 11 as a prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BUILT_COMMIT: ${{ github.sha }}
         run: |
-          gh release create v0.4.0-test10 \
+          gh release create v0.4.0-test11 \
             --target "$BUILT_COMMIT" --prerelease --latest=false \
-            --title "Henge 0.4 Test 10 (4011)" \
-            --notes-file docs/release-test10.md \
-            release-assets/Henge-0.4.0-test10.tipa \
-            release-assets/Henge-0.4.0-test10.manifest.json \
-            release-assets/Henge-0.4.0-test10.sha256
+            --title "Henge 0.4 Test 11 (4012)" \
+            --notes-file docs/release-test11.md \
+            release-assets/Henge-0.4.0-test11.tipa \
+            release-assets/Henge-0.4.0-test11.manifest.json \
+            release-assets/Henge-0.4.0-test11.sha256

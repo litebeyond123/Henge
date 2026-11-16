@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <poll.h>
 #include <signal.h>
@@ -68,6 +69,8 @@ NSDictionary *HengeChatDiagnosticsValidateRequest(NSData *data, NSDate *now, BOO
     if (collectValue && (![collectValue isKindOfClass:NSNumber.class] ||
         CFGetTypeID((__bridge CFTypeRef)collectValue) != CFBooleanGetTypeID())) return nil;
     BOOL shouldCollect = collectValue ? [collectValue boolValue] : YES;
+    id mode = json[@"collection_mode"] ?: @"automatic";
+    if (![@[@"automatic", @"manual"] containsObject:mode]) return nil;
     NSDate *created = dateValue(json[@"created_utc"]), *expires = dateValue(json[@"expires_utc"]);
     NSTimeInterval duration = [expires timeIntervalSinceDate:created ?: now];
     if (!created || !expires || duration < 1 || duration > 90) return nil;
@@ -76,7 +79,22 @@ NSDictionary *HengeChatDiagnosticsValidateRequest(NSData *data, NSDate *now, BOO
     return @{@"schema_version": @1, @"task": @"chat_error_summary",
              @"vm_session_id": [json[@"vm_session_id"] uppercaseString],
              @"request_id": [json[@"request_id"] uppercaseString],
-             @"created_utc": utc(created), @"expires_utc": utc(expires), @"collect": @(shouldCollect)};
+             @"created_utc": utc(created), @"expires_utc": utc(expires), @"collect": @(shouldCollect),
+             @"collection_mode": mode};
+}
+
+// Only an explicitly manual request receives the longer budget. Leave two seconds
+// of the request lifetime for the final authorization read and bounded report upload.
+static NSDictionary *collectionPlan(NSString *mode, double remainingSeconds) {
+    if (![@[@"automatic", @"manual"] containsObject:mode ?: @""]) return nil;
+    BOOL manual = [mode isEqual:@"manual"];
+    NSUInteger total = manual ? 35000 : 10000;
+    double available = isfinite(remainingSeconds) ? MAX(0, MIN((double)total, (remainingSeconds - 2.0) * 1000)) : 0;
+    return @{@"collection_mode": mode, @"collection_budget_ms": @(total),
+             @"collection_effective_budget_ms": @((NSUInteger)available),
+             @"log_command_budget_ms": @(manual ? 30000 : 8000),
+             @"signature_display_budget_ms": @(manual ? 3000 : 1500),
+             @"signature_verify_budget_ms": @0};
 }
 
 static NSArray<NSString *> *countKeys(void) {
@@ -367,6 +385,20 @@ static NSDictionary *logResult(HengeLogLines *lines, HengeCommandResult *command
     return result;
 }
 
+static NSDictionary *runLogQuery(NSString *path, NSArray<NSString *> *arguments,
+                                double overallDeadline, NSUInteger budgetMilliseconds,
+                                NSString *executable, NSString *bundleID) {
+    double now = mono(), deadline = MIN(overallDeadline, now + budgetMilliseconds / 1000.0);
+    NSUInteger effective = (NSUInteger)MAX(0, floor((deadline - now) * 1000));
+    HengeLogLines *lines = [[HengeLogLines alloc] initWithExecutable:executable bundleID:bundleID];
+    lines.processingDeadline = deadline - 0.10;
+    HengeCommandResult *command = runCommand(path, arguments, deadline, 2 * 1024 * 1024, NO,
+                                           ^BOOL(NSData *chunk) { return [lines append:chunk]; });
+    NSMutableDictionary *result = [logResult(lines, command) mutableCopy];
+    result[@"log_command_effective_budget_ms"] = @(effective);
+    return result;
+}
+
 #ifdef HENGE_CHAT_DIAGNOSTICS_TEST
 NSData *HengeChatDiagnosticsTestCommand(NSString *path, NSArray<NSString *> *arguments,
                                       double seconds, NSUInteger limit, NSString **status) {
@@ -382,6 +414,20 @@ NSDictionary *HengeChatDiagnosticsTestLogCommand(NSString *path, NSArray<NSStrin
     HengeCommandResult *command = runCommand(path, arguments, deadline, 2 * 1024 * 1024, NO,
                                            ^BOOL(NSData *chunk) { return [lines append:chunk]; });
     return logResult(lines, command);
+}
+NSDictionary *HengeChatDiagnosticsTestBudgetPlan(NSString *mode, double remainingSeconds) {
+    return collectionPlan(mode, remainingSeconds);
+}
+NSDictionary *HengeChatDiagnosticsTestPlannedLogCommand(NSString *mode, double remainingSeconds,
+    NSString *path, NSArray<NSString *> *arguments, NSString *executable, NSString *bundleID) {
+    double started = mono();
+    NSMutableDictionary *report = [collectionPlan(mode, remainingSeconds) mutableCopy];
+    if (!report) return nil;
+    double deadline = started + [report[@"collection_effective_budget_ms"] doubleValue] / 1000.0;
+    [report addEntriesFromDictionary:runLogQuery(path, arguments, deadline,
+        [report[@"log_command_budget_ms"] unsignedIntegerValue], executable, bundleID)];
+    report[@"collection_elapsed_ms"] = @((NSUInteger)((mono() - started) * 1000));
+    return report;
 }
 #endif
 
@@ -408,6 +454,46 @@ static void safeField(NSMutableDictionary *report, NSString *key, id value, NSSt
     if (matches(value, pattern, limit)) report[key] = value;
 }
 
+static NSString *const electronVersionPattern = @"[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,6}(-(alpha|beta|rc|nightly)\\.[0-9]{1,12})?";
+
+// Read only the known framework's bounded Info.plist. This is version metadata,
+// not proof that a NetLog switch is supported, enabled, or accepted by this client.
+static NSDictionary *electronMetadata(NSString *clientApp) {
+    if (!clientApp) return @{@"electron_framework_metadata_status": @"not_found"};
+    char *canonicalApp = realpath(clientApp.fileSystemRepresentation, NULL);
+    if (!canonicalApp) return @{@"electron_framework_metadata_status": @"unavailable"};
+    NSString *app = [NSString stringWithUTF8String:canonicalApp];
+    free(canonicalApp);
+    if (!app) return @{@"electron_framework_metadata_status": @"unavailable"};
+    NSString *root = [app stringByAppendingPathComponent:@"Contents/Frameworks/Electron Framework.framework"];
+    NSString *prefix = [root stringByAppendingString:@"/"];
+    for (NSString *suffix in @[@"Resources/Info.plist", @"Versions/A/Resources/Info.plist"]) {
+        NSString *path = [root stringByAppendingPathComponent:suffix];
+        struct stat info;
+        if (lstat(path.fileSystemRepresentation, &info)) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;
+            return @{@"electron_framework_metadata_status": @"unavailable"};
+        }
+        char *resolved = realpath(path.fileSystemRepresentation, NULL);
+        NSString *canonical = resolved ? [NSString stringWithUTF8String:resolved] : nil;
+        free(resolved);
+        if (!canonical || ![canonical hasPrefix:prefix])
+            return @{@"electron_framework_metadata_status": @"unavailable"};
+        NSData *data = readSmallFile(canonical, 64 * 1024);
+        if (!data) return @{@"electron_framework_metadata_status": @"unavailable"};
+        id plist = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL];
+        id version = [plist isKindOfClass:NSDictionary.class] ? plist[@"CFBundleShortVersionString"] : nil;
+        if (!matches(version, electronVersionPattern, 48))
+            return @{@"electron_framework_metadata_status": @"invalid"};
+        return @{@"electron_framework_metadata_status": @"complete", @"electron_framework_version": version};
+    }
+    return @{@"electron_framework_metadata_status": @"not_found"};
+}
+
+#ifdef HENGE_CHAT_DIAGNOSTICS_TEST
+NSDictionary *HengeChatDiagnosticsTestElectronMetadata(NSString *clientApp) { return electronMetadata(clientApp); }
+#endif
+
 static NSString *sysctlText(const char *name) {
     char text[128] = {0};
     size_t length = sizeof text;
@@ -417,13 +503,16 @@ static NSString *sysctlText(const char *name) {
 }
 
 static NSDictionary *collect(NSDictionary *request) {
-    double started = mono(), deadline = started + 10.0;
+    double started = mono();
+    NSDictionary *plan = collectionPlan(request[@"collection_mode"], [dateValue(request[@"expires_utc"]) timeIntervalSinceNow]);
+    double deadline = started + [plan[@"collection_effective_budget_ms"] doubleValue] / 1000.0;
     NSMutableDictionary *report = [NSMutableDictionary dictionaryWithDictionary:
         @{@"schema_version": @1, @"collector_version": @1,
           @"vm_session_id": request[@"vm_session_id"], @"request_id": request[@"request_id"],
           @"request_created_utc": request[@"created_utc"], @"request_expires_utc": request[@"expires_utc"],
           @"log_window_seconds": @900, @"privacy_mode": @"error_categories_only", @"client_found": @NO,
           @"client_signature_kind": @"unavailable", @"client_signature_check": @"not_found"}];
+    [report addEntriesFromDictionary:plan];
     // Fixed metadata queries use in-process APIs. Starting four external utilities could consume
     // the evidence budget before log show launches on a slowly emulated Mac.
     NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
@@ -448,6 +537,7 @@ static NSDictionary *collect(NSDictionary *request) {
         safeField(report, @"client_build", plist[@"CFBundleVersion"], @"[0-9]{1,12}(\\.[0-9]{1,12}){0,5}([a-z][0-9]{0,4})?", 64);
         break;
     }
+    [report addEntriesFromDictionary:electronMetadata(clientApp)];
     report[@"metadata_status"] = report[@"os_build"] && report[@"hardware_model"] && ![report[@"architecture"] isEqual:@"unknown"] ? @"complete" : @"partial";
     report[@"metadata_elapsed_ms"] = @((NSUInteger)((mono() - started) * 1000));
 
@@ -455,19 +545,20 @@ static NSDictionary *collect(NSDictionary *request) {
     // NDJSON lets a timeout retain complete observed events without retaining incomplete fragments.
     NSString *executable = report[@"client_executable"] ?: @"ChatGPT", *bundleID = report[@"client_bundle_id"];
     NSString *predicate = HengeChatDiagnosticsLogPredicate(executable, bundleID);
-    HengeLogLines *lines = [[HengeLogLines alloc] initWithExecutable:executable bundleID:bundleID];
-    lines.processingDeadline = MIN(deadline, started + 8.0) - 0.10;
-    HengeCommandResult *log = runCommand(@"/usr/bin/log",
+    [report addEntriesFromDictionary:runLogQuery(@"/usr/bin/log",
         @[@"show", @"--last", @"15m", @"--style", @"ndjson", @"--info", @"--debug", @"--predicate", predicate],
-        MIN(deadline, started + 8.0), 2 * 1024 * 1024, NO, ^BOOL(NSData *chunk) { return [lines append:chunk]; });
-    [report addEntriesFromDictionary:logResult(lines, log)];
+        deadline, [plan[@"log_command_budget_ms"] unsignedIntegerValue], executable, bundleID)];
 
     // Signature metadata is supplementary, never a prerequisite for getting Chat error evidence.
-    // Each step has its own small budget, inside the unchanged overall ten-second deadline.
+    // Do not repeat the authentication launcher's signature validation inside a log query.
+    // Displaying signing metadata is not verification; preserve that distinction explicitly.
     HengeCommandResult *display = [HengeCommandResult new], *verify = [HengeCommandResult new];
     display.status = verify.status = @"not_found";
+    report[@"signature_display_effective_budget_ms"] = @0;
     if (clientApp) {
-        display = runCommand(@"/usr/bin/codesign", @[@"-d", @"--verbose=2", clientApp], MIN(deadline, mono() + 0.75), 16384, YES, nil);
+        double now = mono(), displayDeadline = MIN(deadline, now + [plan[@"signature_display_budget_ms"] doubleValue] / 1000.0);
+        report[@"signature_display_effective_budget_ms"] = @((NSUInteger)MAX(0, floor((displayDeadline - now) * 1000)));
+        display = runCommand(@"/usr/bin/codesign", @[@"-d", @"--verbose=2", clientApp], displayDeadline, 16384, YES, nil);
         NSString *signature = display.data ? [[NSString alloc] initWithData:display.data encoding:NSUTF8StringEncoding] : nil;
         if (signature) {
             report[@"client_signature_kind"] = contains(signature, @"Signature=adhoc") ? @"adhoc" : @"signed";
@@ -475,8 +566,8 @@ static NSDictionary *collect(NSDictionary *request) {
                 if ([line hasPrefix:@"TeamIdentifier="]) safeField(report, @"client_team_identifier", [line substringFromIndex:15], @"[A-Z0-9]{10}", 10);
             }
         }
-        verify = runCommand(@"/usr/bin/codesign", @[@"--verify", @"--strict", clientApp], MIN(deadline, mono() + 0.75), 4096, NO, nil);
-        report[@"client_signature_check"] = verify.data ? @"valid_main_bundle" : ([verify.status isEqual:@"timed_out"] ? @"timed_out" : @"not_verified");
+        verify.status = @"not_requested";
+        report[@"client_signature_check"] = @"not_verified";
     }
     commandFields(report, @"signature_display", display);
     commandFields(report, @"signature_verify", verify);
@@ -487,7 +578,9 @@ static NSDictionary *collect(NSDictionary *request) {
 }
 
 static BOOL sameRequest(NSDictionary *a, NSDictionary *b) {
-    return a && b && [a[@"request_id"] isEqual:b[@"request_id"]] && [a[@"vm_session_id"] isEqual:b[@"vm_session_id"]];
+    return a && b && [a[@"request_id"] isEqual:b[@"request_id"]] && [a[@"vm_session_id"] isEqual:b[@"vm_session_id"]] &&
+        [a[@"collection_mode"] isEqual:b[@"collection_mode"]] && [a[@"collect"] isEqual:b[@"collect"]] &&
+        [a[@"created_utc"] isEqual:b[@"created_utc"]] && [a[@"expires_utc"] isEqual:b[@"expires_utc"]];
 }
 
 static int pollOnce(HengeChatTransport transport) {
@@ -495,15 +588,19 @@ static int pollOnce(HengeChatTransport transport) {
     NSData *bytes = transport(@"GET", requestPath, nil, 4096, &status);
     NSDictionary *request = status == 200 ? HengeChatDiagnosticsValidateRequest(bytes, NSDate.date, NO) : nil;
     if (!request) return 1;
-    if (![readySession isEqual:request[@"vm_session_id"]] || mono() - lastReady >= 15.0) {
+    BOOL fresh = HengeChatDiagnosticsValidateRequest(bytes, NSDate.date, YES) != nil;
+    NSString *key = [NSString stringWithFormat:@"%@/%@", request[@"vm_session_id"], request[@"request_id"]];
+    // Refresh readiness before a new long manual query. A heartbeat aged almost
+    // 15 seconds must not appear stale merely because this bounded query runs 35s.
+    BOOL newManual = fresh && [request[@"collection_mode"] isEqual:@"manual"] && ![handledRequest isEqual:key];
+    if (![readySession isEqual:request[@"vm_session_id"]] || mono() - lastReady >= 15.0 || newManual) {
         NSData *ready = [NSJSONSerialization dataWithJSONObject:
             @{@"schema_version": @1, @"collector_version": @1, @"vm_session_id": request[@"vm_session_id"], @"seen_utc": utc(NSDate.date)} options:0 error:NULL];
         transport(@"PUT", readyPath, ready, 1024, &status);
         if (status == 200 || status == 201 || status == 204) { readySession = request[@"vm_session_id"]; lastReady = mono(); }
     }
     if (![request[@"collect"] boolValue]) { pendingReport = nil; return 0; } // Explicit heartbeat-only request, regardless of clock skew.
-    if (!HengeChatDiagnosticsValidateRequest(bytes, NSDate.date, YES)) return 0; // Enabled, waiting for a fresh host request.
-    NSString *key = [NSString stringWithFormat:@"%@/%@", request[@"vm_session_id"], request[@"request_id"]];
+    if (!fresh) return 0; // Enabled, waiting for a fresh host request.
     if (![handledRequest isEqual:key]) {
         NSDictionary *report = collect(request);
         pendingReport = [NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingSortedKeys error:NULL];

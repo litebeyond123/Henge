@@ -9,6 +9,7 @@
    virtio-net device on the CPU thread (hv_net_poll), which may only take them
    when the guest has posted receive buffers. */
 #include "net_slirp.h"
+#include "net_capture.h"
 #include "dns_proxy.h"
 #include "share.h"
 
@@ -254,6 +255,8 @@ static void dns_send(const uint8_t *frame, uint32_t len, int guest) {
 static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
     (void)opaque;
     hv_net_tx_frames++;
+    /* Capture once at the guest boundary, including DNS intercepted below. */
+    hv_net_capture_record(HV_NET_CAPTURE_TX, frame, len);
     log_frame("tx", frame, len);
     if (hv_dns_proxy_take(frame, len, dns_send)) return;
     if (push(&to_host, frame, len)) {
@@ -263,6 +266,7 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
 }
 
 void hv_net_poll(void) {
+    hv_net_capture_tick(); /* enforce the time limit even when the NIC is idle */
     if (!net) return;
     for (;;) {
         pthread_mutex_lock(&to_guest.mu);
@@ -270,7 +274,12 @@ void hv_net_poll(void) {
         if (to_guest.head != to_guest.tail) f = to_guest.f[to_guest.head % QUEUE];
         pthread_mutex_unlock(&to_guest.mu);
         if (!f.data) return;
+        uint64_t delivered_before = net->rx_frames;
         if (!hv_virtio_net_receive(net, f.data, f.len)) return; /* no buffer posted yet: try again later */
+        /* receive also returns 1 for an undersized guest buffer. Such a frame
+           was dropped, not delivered; never put it in the RX PCAP as success. */
+        if (net->rx_frames != delivered_before) hv_net_capture_record(HV_NET_CAPTURE_RX, f.data, f.len);
+        else hv_net_capture_note_rx_drop();
         hv_net_rx_frames++;
         pthread_mutex_lock(&to_guest.mu);
         to_guest.head++;
@@ -327,6 +336,7 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
 }
 
 void hv_net_detach(void) {
+    hv_net_capture_stop(HV_NET_CAPTURE_STOP_VM_STOP);
     atomic_store(&stopping, 1);
     hv_dns_proxy_stop();
     if (thread_started) {
