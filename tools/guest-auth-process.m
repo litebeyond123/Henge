@@ -89,6 +89,54 @@ HengeAuthProcessState HengeAuthProcessCompare(const HengeAuthProcessIdentity *ex
     return observed(HENGE_AUTH_PROCESS_ALIVE, sample, 0, observation);
 }
 
+#if defined(__APPLE__) || defined(HENGE_AUTH_PROCESS_RESAMPLE_TESTING)
+static double monotonic(void) {
+    struct timespec time;
+    if (clock_gettime(CLOCK_MONOTONIC, &time)) return -1;
+    return (double)time.tv_sec + time.tv_nsec / 1e9;
+}
+
+static int pathExitRace(const HengeAuthProcessSample *sample) {
+    /* readSampleOnce has already mapped BSD ESRCH to ABSENT. This retained
+     * ESRCH has a complete, unchanged live BSD identity but no executable path.
+     * It is still unknown, never evidence of exit by itself. */
+    return sample->kind == HENGE_AUTH_PROCESS_SAMPLE_UNAVAILABLE &&
+        sample->error_number == ESRCH && validNumbers(&sample->identity) &&
+        !sample->zombie && !sample->identity.executable_path[0];
+}
+
+typedef void (*SampleReader)(void *context, HengeAuthProcessSample *sample);
+static void readSettledSample(SampleReader reader, void *context,
+    const HengeAuthProcessIdentity *expected, HengeAuthProcessSample *sample) {
+    reader(context, sample);
+    if (expected && validNumbers(&sample->identity) && !sameLifetime(expected, &sample->identity)) {
+        sample->kind = HENGE_AUTH_PROCESS_SAMPLE_CHANGED_DURING_READ;
+        return; // Never resample away a replacement already seen on Check's first read.
+    }
+    if (!pathExitRace(sample)) return;
+    HengeAuthProcessIdentity first = sample->identity;
+    double started = monotonic();
+    if (started < 0) return;
+    const double deadline = started + 0.250;
+    /* XNU clears p_textvp before setting SZOMB. Let that narrow transition
+     * settle, while retaining the first lifetime across every observation.
+     * Only a later BSD absence/zombie can establish exit. Persistent ESRCH,
+     * access failures, and other unreadable state remain UNAVAILABLE. */
+    for (unsigned attempt = 0; attempt < 25; attempt++) {
+        double now = monotonic();
+        if (now < 0 || now >= deadline) return;
+        struct timespec delay = {0, 10000000};
+        if (nanosleep(&delay, NULL) && errno != EINTR) return;
+        HengeAuthProcessSample next;
+        reader(context, &next);
+        if (validNumbers(&next.identity) && !sameLifetime(&first, &next.identity))
+            next.kind = HENGE_AUTH_PROCESS_SAMPLE_CHANGED_DURING_READ;
+        *sample = next;
+        if (!pathExitRace(sample)) return;
+    }
+}
+#endif
+
 #if defined(__APPLE__)
 /* PROC_PIDTBSDINFO is a kernel snapshot. Reading it on both sides of the path
  * read detects a PID replacement or credential change during that read. It is
@@ -115,7 +163,7 @@ static void copyBSD(const struct proc_bsdinfo *info, HengeAuthProcessSample *sam
     sample->zombie = info->pbi_status == SZOMB;
 }
 
-static void readSample(pid_t pid, uid_t expectedUID, const char *candidatePath,
+static void readSampleOnce(pid_t pid, uid_t expectedUID, const char *candidatePath,
     HengeAuthProcessSample *sample) {
     memset(sample, 0, sizeof(*sample));
     sample->kind = HENGE_AUTH_PROCESS_SAMPLE_UNAVAILABLE;
@@ -175,6 +223,17 @@ static void readSample(pid_t pid, uid_t expectedUID, const char *candidatePath,
     sample->kind = HENGE_AUTH_PROCESS_SAMPLE_PRESENT;
 }
 
+typedef struct { pid_t pid; uid_t uid; const char *candidate_path; } SampleRequest;
+static void readRequestedSample(void *context, HengeAuthProcessSample *sample) {
+    const SampleRequest *request = context;
+    readSampleOnce(request->pid, request->uid, request->candidate_path, sample);
+}
+static void readSample(pid_t pid, uid_t expectedUID, const char *candidatePath,
+    const HengeAuthProcessIdentity *expected, HengeAuthProcessSample *sample) {
+    SampleRequest request = {pid, expectedUID, candidatePath};
+    readSettledSample(readRequestedSample, &request, expected, sample);
+}
+
 static int canonicalExpected(const char *path, uid_t uid,
     char canonical[HENGE_AUTH_PROCESS_PATH_CAPACITY]) {
     if (uid != geteuid() || getuid() != geteuid()) return EINVAL;
@@ -188,7 +247,7 @@ HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedExe
     int error = pid > 0 && outIdentity ? canonicalExpected(expectedExecutablePath, expectedUID, expectedCanonicalExe) : EINVAL;
     if (error) return observed(HENGE_AUTH_PROCESS_UNAVAILABLE, NULL, error, observation);
     HengeAuthProcessSample sample;
-    readSample(pid, expectedUID, NULL, &sample);
+    readSample(pid, expectedUID, NULL, NULL, &sample);
     if (sample.kind == HENGE_AUTH_PROCESS_SAMPLE_ABSENT)
         return observed(HENGE_AUTH_PROCESS_EXITED, NULL, 0, observation);
     if (sample.kind == HENGE_AUTH_PROCESS_SAMPLE_UNAVAILABLE)
@@ -211,14 +270,8 @@ HengeAuthProcessState HengeAuthProcessCheck(const HengeAuthProcessIdentity *iden
         identity->uid != geteuid() || identity->real_uid != geteuid() || getuid() != geteuid())
         return observed(HENGE_AUTH_PROCESS_UNAVAILABLE, NULL, EINVAL, observation);
     HengeAuthProcessSample sample;
-    readSample(identity->pid, identity->uid, NULL, &sample);
+    readSample(identity->pid, identity->uid, NULL, identity, &sample);
     return HengeAuthProcessCompare(identity, &sample, observation);
-}
-
-static double monotonic(void) {
-    struct timespec time;
-    if (clock_gettime(CLOCK_MONOTONIC, &time)) return -1;
-    return (double)time.tv_sec + time.tv_nsec / 1e9;
 }
 
 HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedExecutablePath,
@@ -257,7 +310,7 @@ HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedExecutabl
         for (size_t i = 0; i < (size_t)bytes / sizeof(*pids); i++) {
             if (monotonic() >= deadline) { error = ETIMEDOUT; goto failed; }
             if (pids[i] <= 0) continue;
-            readSample(pids[i], expectedUID, expectedCanonicalExe, &last);
+            readSample(pids[i], expectedUID, expectedCanonicalExe, NULL, &last);
             if (last.kind == HENGE_AUTH_PROCESS_SAMPLE_ABSENT) continue;
             if (last.kind != HENGE_AUTH_PROCESS_SAMPLE_PRESENT) { error = last.error_number ?: EAGAIN; goto failed; }
             if (last.identity.uid != expectedUID || last.identity.real_uid != expectedUID) continue;

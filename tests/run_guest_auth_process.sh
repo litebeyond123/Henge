@@ -13,6 +13,10 @@ trap 'rm -rf "$build"' EXIT HUP INT TERM
 
 if [ "$(uname -s)" = Darwin ]; then
     xcrun --sdk macosx clang -std=gnu11 -Wall -Wextra -Werror -O1 \
+        -mmacosx-version-min=13.0 "$repo/tests/test_guest_auth_process_resample.c" \
+        -lproc -o "$build/process-resample-tests"
+    "$build/process-resample-tests"
+    xcrun --sdk macosx clang -std=gnu11 -Wall -Wextra -Werror -O1 \
         -mmacosx-version-min=13.0 -I"$repo/tools" \
         "$repo/tools/guest-auth-process.m" "$repo/tests/test_guest_auth_process.c" \
         "$repo/tests/guest_auth_process_foundation.m" \
@@ -20,6 +24,9 @@ if [ "$(uname -s)" = Darwin ]; then
     cp "$build/process-tests" "$build/unrelated-owned-fixture"
     "$build/process-tests" "$build/unrelated-owned-fixture" "$build/unrelated-renamed-fixture"
 else
+    "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -O1 \
+        "$repo/tests/test_guest_auth_process_resample.c" -o "$build/process-resample-tests"
+    "$build/process-resample-tests"
     "${CC:-cc}" -x c -std=gnu11 -Wall -Wextra -Werror -O1 -I"$repo/tools" \
         "$repo/tools/guest-auth-process.m" "$repo/tests/test_guest_auth_process.c" \
         -o "$build/process-tests"
