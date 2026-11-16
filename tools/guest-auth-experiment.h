@@ -35,6 +35,10 @@ BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **e
 BOOL HengeAuthCurrentProcessMatches(NSString *bundlePath, NSError **error);
 void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
                    NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes);
+// Only bounded numeric process identifiers are added to lifecycle observations.
+// Zero means absent; no executable path or arbitrary process text is logged.
+void HengeAuthProcessEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
+                          NSError *error, double elapsedSeconds, int targetPID, int observedPID);
 // Only the short-lived launcher drains before exiting. Native adapter callbacks
 // never wait for diagnostic delivery; the drain is bounded to 2.5 seconds.
 void HengeAuthFlushEvents(void);

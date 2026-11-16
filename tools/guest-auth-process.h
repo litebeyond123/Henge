@@ -1,0 +1,78 @@
+#ifndef HENGE_GUEST_AUTH_PROCESS_H
+#define HENGE_GUEST_AUTH_PROCESS_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define HENGE_AUTH_PROCESS_PATH_CAPACITY 4096u
+
+typedef enum {
+    HENGE_AUTH_PROCESS_ALIVE = 1,
+    HENGE_AUTH_PROCESS_EXITED,
+    HENGE_AUTH_PROCESS_REPLACED,
+    HENGE_AUTH_PROCESS_UNAVAILABLE
+} HengeAuthProcessState;
+
+/* This path is used only for comparison. Never serialize it to diagnostics. */
+typedef struct {
+    pid_t pid;
+    uid_t uid, real_uid;
+    uint64_t start_seconds, start_microseconds;
+    char executable_path[HENGE_AUTH_PROCESS_PATH_CAPACITY];
+} HengeAuthProcessIdentity;
+
+/* Fixed numeric observations only; errno is not an app/Apple error code. */
+typedef struct {
+    HengeAuthProcessState state;
+    int error_number;
+    pid_t observed_pid;
+    uid_t observed_uid, observed_real_uid;
+    uint64_t observed_start_seconds, observed_start_microseconds;
+    uint32_t observed_status;
+    int identity_available, zombie;
+} HengeAuthProcessObservation;
+
+/* The caller first validates the original app's complete signature and exact
+ * executable path. Only ALIVE fills outIdentity. Unknown never means absent. */
+HengeAuthProcessState HengeAuthProcessCapture(pid_t pid, const char *expectedCanonicalExe,
+    uid_t expectedUID, HengeAuthProcessIdentity *outIdentity, HengeAuthProcessObservation *observation);
+HengeAuthProcessState HengeAuthProcessCheck(const HengeAuthProcessIdentity *identity,
+    HengeAuthProcessObservation *observation);
+
+/* A bounded kernel census of the current UID, not an AppKit cache. ALIVE means
+ * count > 0; EXITED means a complete scan found no matching live instance.
+ * UNAVAILABLE (including truncation) must never authorize a new launch.
+ * Results are a snapshot, not a process handle: recheck immediately before
+ * requesting termination of the original NSRunningApplication. This module
+ * never sends a signal and never chooses a replacement instance to terminate. */
+HengeAuthProcessState HengeAuthProcessListMatching(const char *expectedCanonicalExe,
+    uid_t expectedUID, HengeAuthProcessIdentity *outIdentities, size_t capacity,
+    size_t *count, HengeAuthProcessObservation *observation);
+
+/* Deterministic comparison seam. No test hooks or PID/path overrides are
+ * compiled into the kernel reader. A sample may represent an absent process,
+ * an unavailable read, a zombie, or a complete live identity. */
+typedef enum {
+    HENGE_AUTH_PROCESS_SAMPLE_PRESENT = 1,
+    HENGE_AUTH_PROCESS_SAMPLE_ABSENT,
+    HENGE_AUTH_PROCESS_SAMPLE_UNAVAILABLE,
+    HENGE_AUTH_PROCESS_SAMPLE_CHANGED_DURING_READ
+} HengeAuthProcessSampleKind;
+typedef struct {
+    HengeAuthProcessSampleKind kind;
+    HengeAuthProcessIdentity identity;
+    uint32_t process_status;
+    int zombie, error_number;
+} HengeAuthProcessSample;
+HengeAuthProcessState HengeAuthProcessCompare(const HengeAuthProcessIdentity *expected,
+    const HengeAuthProcessSample *sample, HengeAuthProcessObservation *observation);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

@@ -37,8 +37,8 @@ def main() -> int:
         records = [line for line in result.stderr.splitlines() if line.startswith(b"[device-auth] action=enable ")]
         record_pattern = re.compile(
             rb"\[device-auth\] action=enable attempt=(\d+) successes=(\d+) failures=(\d+) "
-            rb"mode=(public_token|baa|invalid) result=(ok|launch_required|invalid_request|internal_error|host_inactive|mode_conflict|launch_reused|launch_limit) "
-            rb"backend_registered=[01] enabled=[01] running=([01]) foreground=([01]) fresh=([01]) active=([01]) state_age_ms=(-1|\d+)"
+            rb"mode=(public_token|baa|invalid) result=(ok|launch_required|invalid_request|internal_error|host_inactive|mode_conflict|action_conflict|launch_reused|launch_limit) "
+            rb"backend_registered=[01] enabled=[01] running=([01]) foreground=([01]) fresh=([01]) active=([01]) state_age_ms=(-1|\d+) launch_action=(?:normal_quit|force_quit|invalid)"
         )
         if exercised is None or len(records) != int(exercised[1]):
             print("FAIL an enable call did not produce exactly one fixed diagnostic record", file=sys.stderr)

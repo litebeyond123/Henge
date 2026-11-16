@@ -52,6 +52,15 @@ int main(int argc, char **argv) {
             int running, foreground;
             if (sscanf(line + 8, "%d %d", &running, &foreground) != 2) return 2;
             hv_share_host_publish(running, foreground, 0, 0.5, 0.25);
+        } else if (!strncmp(line, "enable-action ", 14)) {
+            char mode[32], action[32], launch[37], extra;
+            if (sscanf(line + 14, "%31s %31s %36s %c", mode, action, launch, &extra) != 3) return 2;
+            HvDeviceAuthMode value = !strcmp(mode, "public_token") ? HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN :
+                !strcmp(mode, "baa") ? HV_DEVICE_AUTH_MODE_BAA : HV_DEVICE_AUTH_MODE_NONE;
+            HvDeviceAuthAction operation = !strcmp(action, "normal_quit") ? HV_DEVICE_AUTH_ACTION_NORMAL_QUIT :
+                !strcmp(action, "force_quit") ? HV_DEVICE_AUTH_ACTION_FORCE_QUIT : HV_DEVICE_AUTH_ACTION_INVALID;
+            printf("enabled %s\n", hv_device_auth_error_name(hv_device_auth_enable_with_action(value, operation, launch)));
+            fflush(stdout); continue;
         } else if (!strncmp(line, "enable ", 7)) {
             char mode[32], launch[37], extra;
             if (sscanf(line + 7, "%31s %36s %c", mode, launch, &extra) != 2) return 2;

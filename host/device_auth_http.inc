@@ -3,13 +3,13 @@
 typedef struct {
     unsigned fields;
     char operation[32], launch[37], request[37], stage[64], domain[128];
-    long long protocol, error_code, elapsed_ms, input_bytes, result_bytes;
+    long long protocol, error_code, elapsed_ms, input_bytes, result_bytes, target_pid, observed_pid;
 } AuthJSON;
 
 enum {
     AJ_PROTOCOL=1u<<0, AJ_OPERATION=1u<<1, AJ_LAUNCH=1u<<2, AJ_REQUEST=1u<<3,
     AJ_PAYLOAD=1u<<4, AJ_STAGE=1u<<5, AJ_DOMAIN=1u<<6, AJ_CODE=1u<<7,
-    AJ_ELAPSED=1u<<8, AJ_INPUT=1u<<9, AJ_RESULT=1u<<10
+    AJ_ELAPSED=1u<<8, AJ_INPUT=1u<<9, AJ_RESULT=1u<<10, AJ_TARGET_PID=1u<<11, AJ_OBSERVED_PID=1u<<12
 };
 
 static int auth_string(const char **cursor, char *out, size_t cap, int base64) {
@@ -61,6 +61,8 @@ static int auth_json(const char *json, AuthJSON *out, int event) {
         else if (!strcmp(key,"elapsedMs")) { bit=AJ_ELAPSED; number=&out->elapsed_ms; }
         else if (!strcmp(key,"inputBytes")) { bit=AJ_INPUT; number=&out->input_bytes; }
         else if (!strcmp(key,"resultBytes")) { bit=AJ_RESULT; number=&out->result_bytes; }
+        else if (!strcmp(key,"targetPid")) { bit=AJ_TARGET_PID; number=&out->target_pid; }
+        else if (!strcmp(key,"observedPid")) { bit=AJ_OBSERVED_PID; number=&out->observed_pid; }
         else return 0;
         if (out->fields&bit) return 0;
         out->fields|=bit;
@@ -70,11 +72,12 @@ static int auth_json(const char *json, AuthJSON *out, int event) {
         if (*p++!=',') return 0;
     }
     unsigned required=AJ_PROTOCOL|AJ_LAUNCH|AJ_REQUEST|(event?AJ_STAGE:AJ_OPERATION);
-    unsigned allowed=required|(event?(AJ_DOMAIN|AJ_CODE|AJ_ELAPSED|AJ_INPUT|AJ_RESULT):AJ_PAYLOAD);
+    unsigned allowed=required|(event?(AJ_DOMAIN|AJ_CODE|AJ_ELAPSED|AJ_INPUT|AJ_RESULT|AJ_TARGET_PID|AJ_OBSERVED_PID):AJ_PAYLOAD);
     if ((out->fields&required)!=required || (out->fields&~allowed) || out->protocol!=1 ||
         !host_uuid(out->launch) || !host_uuid(out->request)) return 0;
     if (event && (out->error_code<INT32_MIN || out->error_code>INT32_MAX || out->elapsed_ms<0 || out->elapsed_ms>300000 ||
-        out->input_bytes<0 || out->input_bytes>HV_DEVICE_AUTH_BODY_MAX || out->result_bytes<0 || out->result_bytes>HV_DEVICE_AUTH_RESPONSE_MAX)) return 0;
+        out->input_bytes<0 || out->input_bytes>HV_DEVICE_AUTH_BODY_MAX || out->result_bytes<0 || out->result_bytes>HV_DEVICE_AUTH_RESPONSE_MAX ||
+        out->target_pid<0 || out->target_pid>INT32_MAX || out->observed_pid<0 || out->observed_pid>INT32_MAX)) return 0;
     return 1;
 }
 
@@ -83,29 +86,34 @@ static void auth_add_events(Text *json, const HvDeviceAuthEvent *events, size_t 
         const HvDeviceAuthEvent *e=&events[i];
         if (i) adds(json,",");
         addf(json,"{\"sequence\":%llu,\"age_ms\":%llu,\"from_guest\":%s,\"request_id\":\"%s\",\"launch_id\":\"%s\","
-            "\"stage\":\"%s\",\"errorDomain\":\"%s\",\"errorCode\":%lld,\"elapsedMs\":%u,\"inputBytes\":%u,\"resultBytes\":%u}",
+            "\"stage\":\"%s\",\"errorDomain\":\"%s\",\"errorCode\":%lld,\"elapsedMs\":%u,\"inputBytes\":%u,\"resultBytes\":%u,\"targetPid\":%d,\"observedPid\":%d}",
             (unsigned long long)e->sequence,(unsigned long long)e->age_ms,e->from_guest?"true":"false",e->request_id,e->launch_id,
             hv_device_auth_stage_name(e->stage),hv_device_auth_domain_name(e->error_domain),(long long)e->error_code,
-            e->elapsed_ms,e->input_bytes,e->result_bytes);
+            e->elapsed_ms,e->input_bytes,e->result_bytes,e->target_pid,e->observed_pid);
     }
 }
 
-char *hv_share_auth_state(void) {
+static char *auth_state_json(int supports_force_quit) {
     HvDeviceAuthState state;
     hv_device_auth_snapshot(&state);
+    /* Old helpers do not understand launch_action. Hide claimable force launches
+       from them without modifying the real state or the host's diagnostic view. */
+    if (!supports_force_quit && state.enabled && state.launch_action==HV_DEVICE_AUTH_ACTION_FORCE_QUIT)
+        return strdup("{\"protocol\":1,\"enabled\":false}\n");
     Text json={0};
-    addf(&json,"{\"protocol\":1,\"session\":\"%s\",\"launch_id\":\"%s\",\"mode\":\"%s\","
+    addf(&json,"{\"protocol\":1,\"session\":\"%s\",\"launch_id\":\"%s\",\"mode\":\"%s\",\"launch_action\":\"%s\","
         "\"enabled\":%s,\"running\":%s,\"foreground\":%s,\"fresh\":%s,\"active\":%s,\"busy\":%s,"
         "\"state_age_ms\":%lld,\"accepted_requests\":%llu,\"completed_requests\":%llu,\"refused_requests\":%llu,"
         "\"enable_attempts\":%llu,\"enable_successes\":%llu,\"enable_failures\":%llu,"
-        "\"last_enable_error\":\"%s\",\"last_enable_mode\":\"%s\",\"backend_registered\":%s,\"last_enable_backend_registered\":%s,\"events\":[",
-        state.session,state.launch_id,hv_device_auth_mode_name(state.mode),state.enabled?"true":"false",state.running?"true":"false",
+        "\"last_enable_error\":\"%s\",\"last_enable_mode\":\"%s\",\"last_enable_action\":\"%s\",\"backend_registered\":%s,\"last_enable_backend_registered\":%s,\"events\":[",
+        state.session,state.launch_id,hv_device_auth_mode_name(state.mode),hv_device_auth_action_name(state.launch_action),state.enabled?"true":"false",state.running?"true":"false",
         state.foreground?"true":"false",state.fresh?"true":"false",state.active?"true":"false",state.busy?"true":"false",
         (long long)state.state_age_ms,(unsigned long long)state.accepted_requests,(unsigned long long)state.completed_requests,
         (unsigned long long)state.refused_requests,
         (unsigned long long)state.enable_attempts,(unsigned long long)state.enable_successes,(unsigned long long)state.enable_failures,
         state.enable_attempts?hv_device_auth_error_name(state.last_enable_error):"not_attempted",
         !state.enable_attempts?"not_attempted":state.last_enable_mode==HV_DEVICE_AUTH_MODE_NONE?"invalid":hv_device_auth_mode_name(state.last_enable_mode),
+        !state.enable_attempts?"not_attempted":hv_device_auth_action_name(state.last_enable_action),
         state.backend_registered?"true":"false",state.last_enable_backend_registered?"true":"false");
     auth_add_events(&json,state.events,state.event_count);
     adds(&json,"],\"startup_events\":[");
@@ -113,6 +121,8 @@ char *hv_share_auth_state(void) {
     adds(&json,"],\"serverAcceptanceVerified\":false}\n");
     return json.s;
 }
+
+char *hv_share_auth_state(void) { return auth_state_json(1); }
 
 static int auth_service_error(Conn *c, Request *r, HvDeviceAuthError error) {
     return host_error(c,r,hv_device_auth_http_status(error),hv_device_auth_error_name(error));
@@ -123,11 +133,12 @@ static void auth_erase_free(void *data, size_t length) {
 }
 
 static int serve_device_auth(Conn *c, Request *r, const char *what) {
-    if (r->query[0]) return host_error(c,r,400,"unexpected_query");
+    int capability3=!strcmp(what,"state") && !strcmp(r->query,"capability=3");
+    if (r->query[0] && !capability3) return host_error(c,r,400,"unexpected_query");
     if (!strcmp(what,"state")) {
         if (strcmp(r->method,"GET")) return host_error(c,r,405,"get_required");
         if (r->length) return host_error(c,r,400,"unexpected_body");
-        char *state=hv_share_auth_state();
+        char *state=auth_state_json(capability3);
         if (!state) return host_error(c,r,503,"state_unavailable");
         int result=respond(c,r,200,"OK",host_json_headers,state,strlen(state));
         free(state); return result;
@@ -162,6 +173,7 @@ static int serve_device_auth(Conn *c, Request *r, const char *what) {
         entry.error_domain=hv_device_auth_domain_from_name(values.domain);
         entry.error_code=values.error_code; entry.elapsed_ms=(uint32_t)values.elapsed_ms;
         entry.input_bytes=(uint32_t)values.input_bytes; entry.result_bytes=(uint32_t)values.result_bytes;
+        entry.target_pid=(int32_t)values.target_pid; entry.observed_pid=(int32_t)values.observed_pid;
         HvDeviceAuthError error=hv_device_auth_record_event(r->host_session,values.launch,&entry);
         auth_erase_free(body,capacity+1);
         if (error!=HV_DEVICE_AUTH_OK) return auth_service_error(c,r,error);

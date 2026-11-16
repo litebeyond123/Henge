@@ -145,6 +145,64 @@ import Foundation
         state["enabled"] = true; state["events"] = [["launch_id": launch, "stage": "PRIVATE-TOKEN-FIXTURE"]]
         let safe = try DeviceAuthProgress.read(state: state, helper: helper()).diagnostics
         check(!String(decoding: try JSONSerialization.data(withJSONObject: safe), as: UTF8.self).contains("PRIVATE-TOKEN-FIXTURE"), "summary has fixed categories only")
+
+        // Test10 binds the action to this launch. Both buttons use the same verified-exit
+        // capability gate; a Helper9 cold-start heartbeat remains valid historical evidence.
+        state["events"] = []; state["session"] = health["session"]
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).launchAction == "normal_quit", "missing legacy action defaults to normal")
+        state["launch_action"] = "normal_quit"
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_update_required", "Helper9 cannot start a Test10 normal attempt")
+        state["launch_action"] = "force_quit"
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_update_required", "Helper9 cannot start a force attempt")
+        health["helper_version"] = 10; health["auth_experiment_protocol"] = 3
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "waiting_for_adapter", "new capable helper waits for real evidence")
+        state["session"] = UUID().uuidString
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "helper_capability_unconfirmed", "another VM helper cannot explain this launch")
+        state["session"] = (health["session"] as! String).lowercased()
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "waiting_for_adapter", "session UUID matching is case insensitive")
+        state["events"] = [event("force_quit_requested")]
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == "waiting_for_force_quit", "force quit is separate from normal quit")
+        state["events"] = [event("force_quit_completed"), event("force_quit_requested")]
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).stage == "force_quit_completed", "late request cannot undo verified exit")
+        state["events"] = [event("launch_started"), event("force_quit_completed")]
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).stage == "launch_started", "late exit cannot undo spawn")
+        for failure in ["force_quit_refused", "force_quit_timeout", "process_identity_unavailable", "target_process_changed", "target_reappeared"] {
+            var observation = event(failure, code: 1023, domain: "HengeAuthBridge", sequence: 44)
+            observation["targetPid"] = 321; observation["observedPid"] = 654
+            state["startup_events"] = [observation]
+            state["events"] = [event("launch_requested", sequence: 45), event("probe_result", sequence: 77)]
+            let failed = DeviceAuthProgress.read(state: state, helper: .unavailable)
+            check(failed.classification == failure && failed.launchAction == "force_quit", "fixed force/process failure survives reordered events and heartbeat loss")
+            check(failed.targetPID == 321 && failed.observedPID == 654, "PID observations survive ring churn")
+            state["enabled"] = false
+            check(try DeviceAuthProgress.read(state: state, helper: helper()).classification == failure, "force/process failure survives Stop")
+            state["enabled"] = true
+        }
+        state.removeValue(forKey: "startup_events")
+        var reappeared = event("target_reappeared"); reappeared["observedPid"] = 654
+        state["events"] = [reappeared]
+        let newProcess = try DeviceAuthProgress.read(state: state, helper: helper())
+        check(newProcess.targetPID == 0 && newProcess.observedPID == 654, "a new process can appear without a previous one")
+        check(!newProcess.detail.contains("original process ended"), "do not invent a prior quit")
+        for malformed in [true, -1, Int64(Int32.max) + 1, 1.5, "123", NSNull()] as [Any] {
+            var invalid = event("force_quit_requested"); invalid["targetPid"] = malformed; invalid["observedPid"] = malformed
+            state["events"] = [invalid]
+            let bounded = try DeviceAuthProgress.read(state: state, helper: helper())
+            check(bounded.targetPID == 0 && bounded.observedPID == 0, "malformed PID metadata is not displayed")
+        }
+        var maximum = event("force_quit_completed", sequence: 2)
+        maximum["targetPid"] = Int32.max; maximum["observedPid"] = 0
+        var otherLaunch = event("target_reappeared", sequence: 3)
+        otherLaunch["launch_id"] = UUID().uuidString; otherLaunch["targetPid"] = 888; otherLaunch["observedPid"] = 999
+        state["events"] = [maximum, otherLaunch]
+        let bounded = try DeviceAuthProgress.read(state: state, helper: helper())
+        check(bounded.targetPID == Int(Int32.max) && bounded.observedPID == 0, "positive int32 bounds and launch isolation")
+        check(bounded.diagnostics["target_pid"] as? Int == Int(Int32.max), "PID fields remain ordinary fixed metadata")
+        state["launch_action"] = "PRIVATE-TOKEN-FIXTURE"
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).launchAction == "unknown", "unknown actions do not leak arbitrary text")
+        state["launch_action"] = "normal_quit"
+        check(try DeviceAuthProgress.read(state: state, helper: helper()).launchAction == "normal_quit", "normal action never escalates from a prior observation")
+        check(DeviceAuthControlAction.startBlockedHelper.rawValue == "start_blocked_helper", "rejected local attempts have a fixed diagnostic category")
         for bad in [true, -1, 65536, 1.5, "8", NSNull()] as [Any] {
             health["helper_version"] = bad
             check(try !helper().valid, "invalid version is rejected")

@@ -24,13 +24,36 @@ import Foundation
         value["helper_version"] = 9; value["auth_experiment_protocol"] = 2
         let current = try decode(value)
         check(current.supportsAuthExperiment && current.supportsAuthColdStart && !current.requiresAuthColdStartUpdate)
+        check(!current.supportsVerifiedExit && current.requiresVerifiedExitUpdate)
+        check(!current.permitsVerifiedExit(forSession: current.session))
         check(current.diagnostics["auth_cold_start_capability_confirmed"] as? Bool == true)
+        value["helper_version"] = 10; value["auth_experiment_protocol"] = 3
+        let verifiedExit = try decode(value)
+        check(verifiedExit.supportsVerifiedExit && verifiedExit.supportsAuthForceQuit && !verifiedExit.requiresVerifiedExitUpdate)
+        check(verifiedExit.permitsVerifiedExit(forSession: verifiedExit.session.lowercased()))
+        check(verifiedExit.permitsForceQuit(forSession: verifiedExit.session))
+        check(!verifiedExit.permitsVerifiedExit(forSession: UUID().uuidString))
+        check(!verifiedExit.permitsVerifiedExit(forSession: "") && !verifiedExit.permitsVerifiedExit(forSession: "invalid"))
+        check(verifiedExit.diagnostics["auth_verified_exit_capability_confirmed"] as? Bool == true)
+        value["agent_seen_s"] = 30
+        check(try !decode(value).permitsVerifiedExit(forSession: verifiedExit.session))
+        value["agent_seen_s"] = 2
+        value["helper_version"] = 9
+        check(try !decode(value).permitsVerifiedExit(forSession: verifiedExit.session)) // Capability alone is insufficient.
+        value["helper_version"] = 10; value["auth_experiment_protocol"] = 2
+        check(try !decode(value).permitsVerifiedExit(forSession: verifiedExit.session)) // Version alone is insufficient.
+        value["auth_experiment_protocol"] = 3
         value.removeValue(forKey: "helper_version")
         let versionMissing = try decode(value)
         check(!versionMissing.supportsAuthColdStart && !versionMissing.requiresAuthColdStartUpdate)
+        check(!versionMissing.supportsVerifiedExit && !versionMissing.requiresVerifiedExitUpdate)
         value["helper_version"] = 9; value.removeValue(forKey: "auth_experiment_protocol")
         let capabilityMissing = try decode(value)
         check(!capabilityMissing.supportsAuthColdStart && !capabilityMissing.requiresAuthColdStartUpdate)
+        value["helper_version"] = 10
+        let currentCapabilityMissing = try decode(value)
+        check(!currentCapabilityMissing.supportsVerifiedExit && !currentCapabilityMissing.requiresVerifiedExitUpdate)
+        value["helper_version"] = 9
         value["auth_experiment_protocol"] = 1
         check(try decode(value).requiresAuthColdStartUpdate) // An explicit earlier capability is evidence.
         value["auth_experiment_protocol"] = 2

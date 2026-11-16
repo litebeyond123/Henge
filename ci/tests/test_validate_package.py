@@ -93,7 +93,7 @@ def guest_app_archive(binary=None, extra=None, build=validator.EXPECTED_HELPER_B
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4010",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4011",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }

@@ -29,7 +29,7 @@ BANNED_ENTITLEMENTS = frozenset({
     "com.apple.private.skip-library-validation",
 })
 APP = "Payload/Henge.app/"
-EXPECTED_HELPER_BUILD = "9"
+EXPECTED_HELPER_BUILD = "10"
 REQUIRED = (
     "Helpers/henge-auth-signer", "Info.plist", "Henge", "henge-jit.js", "henge-agent.gz", "henge-helper.app.tar.gz", "guest-chat-diagnostics.command",
     "PlugIns/HengeJITHelper.appex/Info.plist",
@@ -257,7 +257,7 @@ def inspect_guest_app(data):
         raise InvalidPackage("Invalid compressed guest application") from exc
 
 
-def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4010",
+def validate_package(package, expected_commit, expected_version="0.4.0", expected_build="4011",
                      kind=None, maximum_ios="17.0", husk_commit=None, run_url=None):
     package = Path(package)
     require(bool(re.fullmatch(r"[0-9a-f]{40}", expected_commit)), "Expected commit must be a full git SHA-1")
@@ -369,7 +369,7 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-version", default="0.4.0")
-    parser.add_argument("--expected-build", default="4010")
+    parser.add_argument("--expected-build", default="4011")
     parser.add_argument("--kind", choices=("ipa", "tipa"))
     parser.add_argument("--maximum-ios", default="17.0")
     parser.add_argument("--husk-commit")

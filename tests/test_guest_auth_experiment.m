@@ -73,6 +73,16 @@ static int unitTests(void) {
     NSMutableDictionary *state = [@{@"protocol": @1, @"enabled": @YES, @"session": session,
                                      @"launch_id": launch, @"mode": @"public_token"} mutableCopy];
     check(HengeAuthValidateState(json(state)) != nil, "current launch state accepted");
+    check([HengeAuthValidateState(json(state))[@"launch_action"] isEqual:@"normal_quit"],
+          "missing launch action remains normal quit for older hosts");
+    state[@"launch_action"] = @"force_quit";
+    check([HengeAuthValidateState(json(state))[@"launch_action"] isEqual:@"force_quit"],
+          "explicit force action is preserved by state validation");
+    for (id action in @[@YES, @1, @"force", NSNull.null]) {
+        state[@"launch_action"] = action;
+        check(!HengeAuthValidateState(json(state)), "malformed or unknown launch action is rejected");
+    }
+    [state removeObjectForKey:@"launch_action"];
     state[@"protocol"] = @YES;
     check(HengeAuthValidateState(json(state)) == nil, "boolean protocol rejected");
     state[@"protocol"] = @1; state[@"mode"] = @"future";
@@ -243,7 +253,7 @@ static int injectedFixture(void) {
     } else {
         [device generateTokenWithCompletionHandler:^(NSData *t, NSError *e) { token = t; error = e; dispatch_semaphore_signal(done); }];
         ok &= waitFor(done) && originalTokens == 0;
-        if ([scenario isEqual:@"public_success"] || [scenario isEqual:@"closed_window_restart"]) {
+        if ([@[@"public_success", @"closed_window_restart", @"delayed_normal_quit", @"force_quit_restart"] containsObject:scenario]) {
             ok &= !error && [token isEqual:[@"SYNTHETIC_TOKEN_DO_NOT_LOG" dataUsingEncoding:NSUTF8StringEncoding]];
             __block id signature;
             [DCBAASigner.sharedSigner signatureForData:[NSData dataWithBytes:"x" length:1] completion:^(id s, id a, NSError *e) {
@@ -272,20 +282,50 @@ static int injectedFixture(void) {
 }
 @interface HengeQuitFixtureDelegate : NSObject <NSApplicationDelegate>
 @property BOOL refuseQuit;
+@property NSTimeInterval quitDelay;
+@property(copy) NSString *replacementMarker;
+@property(strong) NSTask *replacement;
 @end
 @implementation HengeQuitFixtureDelegate
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
-    (void)sender;
+    if (self.replacementMarker) {
+        // A real second instance of our owned, signed main executable starts
+        // before this original process exits. The launcher must leave it alone.
+        self.replacement = [NSTask new];
+        self.replacement.executableURL = NSBundle.mainBundle.executableURL;
+        self.replacement.arguments = @[@"--hold-closed-window", self.replacementMarker];
+        self.replacement.standardInput = NSFileHandle.fileHandleWithNullDevice;
+        self.replacement.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+        self.replacement.standardError = NSFileHandle.fileHandleWithNullDevice;
+        if (![self.replacement launchAndReturnError:NULL]) return NSTerminateCancel;
+        double deadline = HengeAuthMonotonic() + 6;
+        while (self.replacement.running && ![NSFileManager.defaultManager fileExistsAtPath:self.replacementMarker] &&
+               HengeAuthMonotonic() < deadline)
+            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        NSDictionary *marker = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:self.replacementMarker] ?: [NSData data]
+                                                                options:0 error:NULL];
+        if (![marker[@"window_closed"] boolValue] || [marker[@"pid"] intValue] != self.replacement.processIdentifier)
+            return NSTerminateCancel;
+        return NSTerminateNow;
+    }
+    if (self.quitDelay > 0) {
+        [NSTimer scheduledTimerWithTimeInterval:self.quitDelay repeats:NO block:^(__unused NSTimer *timer) {
+            [sender replyToApplicationShouldTerminate:YES];
+        }];
+        return NSTerminateLater;
+    }
     return self.refuseQuit ? NSTerminateCancel : NSTerminateNow;
 }
 @end
-static int closedWindowFixture(NSString *marker, BOOL refuseQuit) {
+static int closedWindowFixture(NSString *marker, BOOL refuseQuit, NSTimeInterval quitDelay, NSString *replacementMarker) {
     // Only our owned fixture uses this entry point. Close a real AppKit window,
     // keep the main process running, and exit cooperatively when the test asks.
     NSApplication *application = NSApplication.sharedApplication;
     [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
     __attribute__((objc_precise_lifetime)) HengeQuitFixtureDelegate *delegate = [HengeQuitFixtureDelegate new];
     delegate.refuseQuit = refuseQuit;
+    delegate.quitDelay = quitDelay;
+    delegate.replacementMarker = replacementMarker;
     application.delegate = delegate;
     [application finishLaunching];
     NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 120, 80)
@@ -302,12 +342,13 @@ static int closedWindowFixture(NSString *marker, BOOL refuseQuit) {
     NSData *data = windowMarker(window.visible, getpid());
     if (![data writeToFile:marker options:NSDataWritingAtomic error:NULL]) return 2;
     NSString *stop = [marker stringByAppendingString:@".stop"];
-    double deadline = HengeAuthMonotonic() + 60;
+    double deadline = HengeAuthMonotonic() + 120;
     __block BOOL timedOut = NO;
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
         BOOL stopped = [NSFileManager.defaultManager fileExistsAtPath:stop];
         if (stopped || HengeAuthMonotonic() >= deadline) {
             timedOut = !stopped;
+            if (stopped) [[NSData data] writeToFile:[marker stringByAppendingString:@".stopped"] atomically:YES];
             [timer invalidate];
             [application stop:nil];
             NSEvent *wake = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint
@@ -334,9 +375,13 @@ int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 2 && !strcmp(argv[1], "--unit")) return unitTests();
         if (argc == 3 && !strcmp(argv[1], "--hold-closed-window"))
-            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], NO);
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], NO, 0, nil);
         if (argc == 3 && !strcmp(argv[1], "--refuse-quit-closed-window"))
-            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], YES);
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], YES, 0, nil);
+        if (argc == 3 && !strcmp(argv[1], "--delay-quit-closed-window"))
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], NO, 12, nil);
+        if (argc == 4 && !strcmp(argv[1], "--replace-on-quit"))
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], NO, 0, [NSString stringWithUTF8String:argv[3]]);
         NSDictionary *info = NSBundle.mainBundle.infoDictionary;
         NSString *scenario = info[@"HengeFixtureScenario"];
         if ([@[@"hardened_policy_observation", @"early_exit", @"error_ready", @"loaded_then_exit"] containsObject:scenario ?: @""])

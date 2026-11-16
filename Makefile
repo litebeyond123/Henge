@@ -48,9 +48,9 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
 RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
 
 # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
-$(B)/henge-agent: tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h tools/helper-version.h tools/helper-app.m tools/helper-app.h
+$(B)/henge-agent: tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h tools/guest-chat-diagnostics.m tools/guest-chat-diagnostics.h tools/helper-health.m tools/helper-health.h tools/helper-version.h tools/helper-app.m tools/helper-app.h
 	@mkdir -p $(B)
-	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework Network -framework ServiceManagement -framework Security tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-chat-diagnostics.m tools/helper-health.m tools/helper-app.m -o $@
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework Network -framework ServiceManagement -framework Security -lproc tools/henge-agent.m tools/guest-auth-experiment.m tools/guest-auth-process.m tools/guest-chat-diagnostics.m tools/helper-health.m tools/helper-app.m -o $@
 	codesign -f -s - $@
 
 # Compressed in the app: tools that sign an IPA would try to sign a bare Mach-O too.
@@ -233,14 +233,14 @@ test-jit-advice: $(B)/test_jit_advice
 .PHONY: test-jit-advice
 
 # Session-only guest adapter and launcher; the helper archive preserves their signatures.
-$(B)/henge-auth-launcher: tools/henge-auth-launcher.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h
+$(B)/henge-auth-launcher: tools/henge-auth-launcher.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h
 	@mkdir -p $(B)
-	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -fblocks -Wall -Wextra -O2 -framework Foundation -framework AppKit -framework Security tools/henge-auth-launcher.m tools/guest-auth-experiment.m -o $@
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -fblocks -Wall -Wextra -O2 -framework Foundation -framework AppKit -framework Security -lproc tools/henge-auth-launcher.m tools/guest-auth-experiment.m tools/guest-auth-process.m -o $@
 	codesign -f -s - --identifier com.henge.auth-launcher $@
 
-$(B)/henge-auth-adapter.dylib: tools/henge-auth-adapter.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h
+$(B)/henge-auth-adapter.dylib: tools/henge-auth-adapter.m tools/guest-auth-experiment.m tools/guest-auth-experiment.h tools/guest-auth-process.m tools/guest-auth-process.h
 	@mkdir -p $(B)
-	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -fblocks -Wall -Wextra -O2 -dynamiclib -framework Foundation -framework AppKit -framework Security tools/henge-auth-adapter.m tools/guest-auth-experiment.m -o $@
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -fblocks -Wall -Wextra -O2 -dynamiclib -framework Foundation -framework AppKit -framework Security -lproc tools/henge-auth-adapter.m tools/guest-auth-experiment.m tools/guest-auth-process.m -o $@
 	codesign -f -s - --identifier com.henge.auth-adapter $@
 
 # Private BAA calls are isolated from Henge's VM process. No Apple calls at build time.

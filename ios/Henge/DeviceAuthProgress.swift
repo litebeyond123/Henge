@@ -13,6 +13,9 @@ struct DeviceAuthProgress {
     let signingPolicy: [String: Bool]
     let signingPrediction: String
     let adapterReadiness: String
+    let launchAction: String
+    let targetPID: Int
+    let observedPID: Int
 
     private enum Readiness { case confirmed, failed, unconfirmed }
     private static func readiness(_ event: [String: Any]) -> Readiness {
@@ -32,7 +35,7 @@ struct DeviceAuthProgress {
                   value.compare(NSNumber(value: UInt64.max)) != .orderedDescending else { return nil }
             return value.uint64Value
         }
-        let saved = Array((state["startup_events"] as? [[String: Any]] ?? []).prefix(40))
+        let saved = Array((state["startup_events"] as? [[String: Any]] ?? []).prefix(48))
         let recent = Array((state["events"] as? [[String: Any]] ?? []).prefix(32))
         var merged: [(event: [String: Any], sequence: UInt64?, order: Int)] = []
         var indexBySequence: [UInt64: Int] = [:]
@@ -57,7 +60,19 @@ struct DeviceAuthProgress {
     static func read(state: [String: Any], helper: HelperHealthSnapshot) -> DeviceAuthProgress {
         let launch = state["launch_id"] as? String ?? ""
         let enabled = state["enabled"] as? Bool == true
+        let launchAction = state["launch_action"] == nil ? "normal_quit" :
+            (state["launch_action"] as? String).flatMap(DeviceAuthLaunchAction.init(rawValue:))?.rawValue ?? "unknown"
         let current = currentEvents(state, launch: launch)
+        func lastPID(_ key: String) -> Int {
+            for event in current.reversed() {
+                guard let value = event[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+                      value.doubleValue.isFinite, value.doubleValue.rounded(.towardZero) == value.doubleValue,
+                      value.doubleValue > 0, value.doubleValue <= Double(Int32.max) else { continue }
+                return value.intValue
+            }
+            return 0
+        }
+        let targetPID = lastPID("targetPid"), observedPID = lastPID("observedPid")
         let stages = current.compactMap { $0["stage"] as? String }
         let process = stages.reversed().first { ["target_process_running", "target_process_not_running"].contains($0) }
         let processObservation = process == "target_process_running" ? "running" : process == "target_process_not_running" ? "not_running" : "not_recorded"
@@ -83,7 +98,8 @@ struct DeviceAuthProgress {
         func result(_ code: String, _ title: String, _ detail: String, _ stage: String = "none") -> Self {
             Self(classification: code, title: title, detail: detail, stage: stage,
                  permissionEnabled: enabled, processObservation: processObservation, signingPolicy: policy,
-                 signingPrediction: signingPrediction, adapterReadiness: adapterReadiness)
+                 signingPrediction: signingPrediction, adapterReadiness: adapterReadiness,
+                 launchAction: launchAction, targetPID: targetPID, observedPID: observedPID)
         }
         guard state["protocol"] as? Int == 1 else {
             return result("state_unavailable", "Authentication status unavailable", "Tap Start to record a fresh startup attempt.")
@@ -91,7 +107,8 @@ struct DeviceAuthProgress {
         // Independent HTTP event deliveries can arrive out of order. Preserve a concrete
         // launch failure even after a late launch_requested event or permission revocation.
         let failurePriority = ["target_identity_mismatch", "target_signature_invalid", "adapter_target_rejected",
-            "target_not_found", "quit_refused", "quit_timeout", "adapter_abi_mismatch", "adapter_initialization_failed",
+            "target_not_found", "process_identity_unavailable", "target_process_changed", "target_reappeared",
+            "force_quit_refused", "force_quit_timeout", "quit_refused", "quit_timeout", "adapter_abi_mismatch", "adapter_initialization_failed",
             "target_exited_before_adapter", "signature_policy_blocked", "already_running", "launch_failed",
             "launch_timeout", "adapter_not_loaded"]
         let failure = failurePriority.first {
@@ -133,7 +150,7 @@ struct DeviceAuthProgress {
             else {
                 // These phases only move forward for one launch. A late quit or
                 // launch_requested delivery must not undo a later spawn observation.
-                last = ["launch_started", "quit_completed", "quit_requested", "launch_requested", "host_bridge_enabled"]
+                last = ["launch_started", "force_quit_completed", "quit_completed", "force_quit_requested", "quit_requested", "launch_requested", "host_bridge_enabled"]
                     .first { progressStages.contains($0) } ?? "host_bridge_enabled"
             }
         }
@@ -143,8 +160,14 @@ struct DeviceAuthProgress {
             if !helper.isConnected {
                 return result("waiting_for_helper", "Waiting for the Mac helper", "The test is enabled. Keep Henge in the foreground; check the Sharing section for the helper connection.")
             }
+            if state["launch_action"] != nil && !helper.permitsVerifiedExit(forSession: state["session"] as? String ?? "") {
+                if helper.requiresVerifiedExitUpdate {
+                    return result("helper_update_required", "Update the Mac helper for this test", "Run Install / Repair once for Helper 10, then start a new test. Both startup actions need its verified process-exit support.")
+                }
+                return result("helper_capability_unconfirmed", "Helper startup capability unconfirmed", "A current Helper 10 connection to this Mac has not been confirmed. Check Sharing below and wait for the connection.")
+            }
             if helper.requiresAuthColdStartUpdate {
-                return result("helper_update_required", "Update the Mac helper for this test", "This helper reports the earlier startup capability. Run Install / Repair once for Helper 9, then Stop and start a new test.")
+                return result("helper_update_required", "Update the Mac helper for this test", "This helper reports the earlier startup capability. Run Install / Repair once for Helper 10, then Stop and start a new test.")
             }
             if !helper.supportsAuthColdStart {
                 return result("helper_capability_unconfirmed", "Helper authentication capability unconfirmed", "Run Install / Repair once to update the Mac helper. Its actual version and authentication capability will appear here.")
@@ -156,15 +179,27 @@ struct DeviceAuthProgress {
         case "target_identity_mismatch", "target_signature_invalid", "adapter_target_rejected":
             return result("target_verification_failed", "ChatGPT verification failed", "The installed app's identity or signature did not match. The report records the verification stage.", last)
         case "signature_policy_blocked":
-            return result(last, "Earlier helper stopped at signing preflight", "This is the earlier helper's static prediction, before an actual adapter launch. Update to Helper 9 and start a new test to let macOS decide. No protection setting is changed.", last)
+            return result(last, "Earlier helper stopped at signing preflight", "This is the earlier helper's static prediction, before an actual adapter launch. Update to Helper 10 and start a new test to let macOS decide. No protection setting is changed.", last)
         case "already_running":
             return result(last, "A running ChatGPT process prevented startup", "The helper did not launch another copy. Check ChatGPT in the Mac, then Stop and start a new test.", last)
+        case "process_identity_unavailable":
+            return result(last, "ChatGPT process identity could not be confirmed", "The helper stopped without guessing which process to terminate. The fixed process observations are saved in the report.", last)
+        case "target_process_changed":
+            return result(last, "The verified ChatGPT process changed", "The process identity changed during the quit attempt. The helper stopped instead of terminating a different instance.", last)
+        case "target_reappeared":
+            return result(last, "Another ChatGPT process appeared", "Another matching main process was observed before launch. The helper stopped and will not repeatedly terminate new instances.", last)
+        case "force_quit_requested":
+            return result("waiting_for_force_quit", "Waiting for the requested force quit", "This attempt was explicitly started with Force quit. The helper is checking that the verified main process has ended before one new launch.", last)
+        case "force_quit_completed":
+            return result("waiting_for_adapter", "Force quit confirmed; preparing a new launch", "The verified main process has ended. The helper will start the original app once with the temporary adapter.", last)
+        case "force_quit_refused", "force_quit_timeout":
+            return result(last, last == "force_quit_refused" ? "The force-quit request was not accepted" : "Force quit was not confirmed in time", "The requested attempt stopped before a replacement launch. It will not retry termination automatically.", last)
         case "quit_requested":
             return result("waiting_for_quit", "Waiting for ChatGPT to quit normally", "Check the Mac for a save or quit prompt. The helper waits for the process to exit and does not force-quit it.", last)
         case "quit_completed":
             return result("waiting_for_adapter", "ChatGPT quit; preparing a new launch", "The prior process has exited. The helper will start the original app once with the temporary adapter.", last)
         case "quit_refused", "quit_timeout":
-            return result(last, last == "quit_refused" ? "ChatGPT did not accept the quit request" : "ChatGPT did not quit in time", "Check the Mac for a save or quit prompt. No replacement process was started and the helper did not force-quit the app. Stop and start a new test after resolving the prompt.", last)
+            return result(last, last == "quit_refused" ? "ChatGPT did not accept the quit request" : "ChatGPT did not quit in time", "Save any unfinished input in ChatGPT. You can then choose Force quit ChatGPT and retry below; that separate action may discard unsent input. This normal attempt did not force-quit the app or start a replacement.", last)
         case "target_exited_before_adapter":
             return result(last, "ChatGPT exited before the adapter was ready", "The newly started process exited before a successful handshake. This observation alone does not identify why it exited; the report preserves the exact stage.", last)
         case "adapter_initialization_failed":
@@ -194,6 +229,7 @@ struct DeviceAuthProgress {
         ["classification": classification, "diagnostic_stage": stage, "permission_enabled": permissionEnabled,
          "target_process_at_preflight": processObservation, "signing_policy_observed": signingPolicy,
          "signing_policy_prediction": signingPrediction, "adapter_readiness": adapterReadiness,
+         "launch_action": launchAction, "target_pid": targetPID, "observed_pid": observedPID,
          "server_acceptance_verified": false]
     }
 }
@@ -203,4 +239,10 @@ enum DeviceAuthControlAction: String {
     case startRequested = "start_requested"
     case startCompleted = "start_completed"
     case stopCompleted = "stop_completed"
+    case startBlockedHelper = "start_blocked_helper"
+}
+
+enum DeviceAuthLaunchAction: String {
+    case normalQuit = "normal_quit"
+    case forceQuit = "force_quit"
 }

@@ -13,7 +13,7 @@
 // writes the target bundle, patches system services, changes sysctl values, or
 // substitutes an invented token. Every successful callback contains material
 // returned by the current, explicitly enabled host session.
-static NSString *sessionID, *launchID, *experimentMode;
+static NSString *sessionID, *launchID, *experimentMode, *launchAction;
 static NSObject *stateLock;
 static BOOL hostSupported, active;
 static double stateAt, probeAt;
@@ -28,7 +28,8 @@ static void event(NSString *request, NSString *stage, NSError *error, double sta
 }
 static BOOL stateMatches(NSDictionary *state) {
     return [state[@"enabled"] boolValue] && [state[@"session"] isEqual:sessionID] &&
-           [state[@"launch_id"] isEqual:launchID] && [state[@"mode"] isEqual:experimentMode];
+           [state[@"launch_id"] isEqual:launchID] && [state[@"mode"] isEqual:experimentMode] &&
+           [state[@"launch_action"] isEqual:launchAction];
 }
 static BOOL cachedActive(void) {
     @synchronized (stateLock) { return active && HengeAuthMonotonic() - stateAt <= 5; }
@@ -169,6 +170,7 @@ __attribute__((constructor)) static void initializeAdapter(void) {
         sessionID = [environmentString("HENGE_AUTH_SESSION") copy];
         launchID = [environmentString("HENGE_AUTH_LAUNCH_ID") copy];
         experimentMode = [environmentString("HENGE_AUTH_MODE") copy];
+        launchAction = [environmentString("HENGE_AUTH_LAUNCH_ACTION") copy] ?: @"normal_quit";
         // Do this before any target code can create Electron subprocesses.
         NSMutableArray<NSString *> *keys = [NSMutableArray array];
         for (char **entry = *_NSGetEnviron(); entry && *entry; entry++) {
@@ -179,7 +181,8 @@ __attribute__((constructor)) static void initializeAdapter(void) {
         }
         for (NSString *key in keys) unsetenv(key.UTF8String);
         if (![[NSUUID alloc] initWithUUIDString:sessionID] || ![[NSUUID alloc] initWithUUIDString:launchID] ||
-            ![@[@"public_token", @"baa"] containsObject:experimentMode ?: @""] || !target) return;
+            ![@[@"public_token", @"baa"] containsObject:experimentMode ?: @""] ||
+            ![@[@"normal_quit", @"force_quit"] containsObject:launchAction] || !target) return;
         NSError *error = nil;
         NSString *request = NSUUID.UUID.UUIDString;
         if (!HengeAuthCurrentProcessMatches(target, &error)) {

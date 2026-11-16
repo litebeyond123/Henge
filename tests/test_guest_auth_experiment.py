@@ -47,6 +47,7 @@ class Service(ThreadingHTTPServer):
         self.session = str(uuid.uuid4()).upper()
         self.launch_id = str(uuid.uuid4()).upper()
         self.mode = "baa" if scenario.startswith("baa") else "public_token"
+        self.launch_action = "force_quit" if scenario == "force_quit_restart" else "normal_quit"
         self.operations: Counter[str] = Counter()
         self.events: list[dict] = []
         self.failures: list[str] = []
@@ -72,10 +73,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         service = self.server
-        if self.path != "/.henge/v1/auth/state":
+        if self.path != "/.henge/v1/auth/state?capability=3":
             return self.send_json({"protocol": 1, "error": "not_found"}, 404)
-        self.send_json({"protocol": 1, "enabled": not service.revoked, "session": service.session,
-                        "launch_id": service.launch_id, "mode": service.mode})
+        state = {"protocol": 1, "enabled": not service.revoked, "session": service.session,
+                 "launch_id": service.launch_id, "mode": service.mode}
+        if service.scenario != "quit_refused":  # Explicit legacy normal-action compatibility case.
+            state["launch_action"] = service.launch_action
+        self.send_json(state)
 
     def do_POST(self):
         service = self.server
@@ -92,8 +96,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/.henge/v1/auth/event":
                 expected = {"protocol", "launch_id", "request_id", "stage", "errorDomain", "errorCode",
                             "elapsedMs", "inputBytes", "resultBytes"}
-                if set(body) != expected:
+                if not expected <= set(body) or set(body) - expected - {"targetPid", "observedPid"}:
                     raise ValueError("event_schema")
+                for key in ("targetPid", "observedPid"):
+                    if key in body and (type(body[key]) is not int or not 0 <= body[key] <= 2147483647):
+                        raise ValueError("event_pid")
                 service.events.append(body)
                 if service.scenario == "quit_cancelled" and body["stage"] == "quit_requested":
                     service.revoked = True
@@ -160,9 +167,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="henge-auth-test-") as temporary:
         folder = Path(temporary)
         common = str(ROOT / "tools/guest-auth-experiment.m")
+        process_identity = str(ROOT / "tools/guest-auth-process.m")
         flags = ["xcrun", "--sdk", "macosx", "clang", "-fobjc-arc", "-fblocks", "-O1",
                  "-mmacosx-version-min=13.0", "-Werror=implicit-function-declaration", "-Werror=return-type",
-                 "-framework", "Foundation", "-framework", "AppKit", "-framework", "Security"]
+                 "-framework", "Foundation", "-framework", "AppKit", "-framework", "Security", "-lproc", process_identity]
         # Compile production binaries too. No mock endpoint or target identity
         # can be selected in either of these production builds.
         production_launcher = folder / "production-launcher"
@@ -189,13 +197,13 @@ def main() -> int:
         sys.stdout.buffer.write(unit.stdout)
         sys.stdout.flush()
         routed = {"public_success", "unsupported", "token_error", "empty_token", "mismatched_response",
-                  "session_revoked", "baa_success", "baa_bad_input", "closed_window_restart"}
-        held = {"closed_window_restart", "quit_refused", "quit_cancelled"}
+                  "session_revoked", "baa_success", "baa_bad_input", "closed_window_restart", "delayed_normal_quit", "force_quit_restart"}
+        held = {"closed_window_restart", "quit_refused", "quit_cancelled", "delayed_normal_quit", "force_quit_restart", "force_requires_authorization", "target_reappeared"}
         outcomes = {"hardened_policy_observation", "early_exit", "error_ready", "loaded_then_exit"}
         scenarios = ["public_success", "unsupported", "token_error", "empty_token", "mismatched_response",
                      "session_revoked", "baa_success", "baa_bad_input", "identity_mismatch",
                      "hardened_policy_observation", "closed_window_restart", "quit_refused", "quit_cancelled",
-                     "early_exit", "error_ready", "loaded_then_exit"]
+                     "early_exit", "error_ready", "loaded_then_exit", "delayed_normal_quit", "force_quit_restart", "force_requires_authorization", "target_reappeared"]
         for scenario in scenarios:
             case = folder / scenario
             application = case / "Fixture.app"
@@ -230,6 +238,7 @@ def main() -> int:
             holder = None
             holder_pid = None
             window_marker = case / "window-closed.json"
+            replacement_marker = case / "replacement-window.json"
             try:
                 child_env = dict(env, HENGE_AUTH_TEST_PORT=str(service.server_port),
                                  HENGE_AUTH_TEST_APP=str(application), HENGE_AUTH_TEST_LOG_DIRECTORY=str(case / "logs"))
@@ -237,7 +246,12 @@ def main() -> int:
                           for path in application.rglob("*") if path.is_file()}
                 if scenario in held:
                     option = "--hold-closed-window" if scenario == "closed_window_restart" else "--refuse-quit-closed-window"
-                    holder = subprocess.Popen([str(macos / "HengeAuthFixture"), option, str(window_marker)],
+                    if scenario == "delayed_normal_quit":
+                        option = "--delay-quit-closed-window"
+                    holder_arguments = [str(macos / "HengeAuthFixture"), option, str(window_marker)]
+                    if scenario == "target_reappeared":
+                        holder_arguments = [str(macos / "HengeAuthFixture"), "--replace-on-quit", str(window_marker), str(replacement_marker)]
+                    holder = subprocess.Popen(holder_arguments,
                                               env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     holder_pid = holder.pid
                     deadline = time.monotonic() + 10
@@ -256,11 +270,13 @@ def main() -> int:
                         raise AssertionError("owned fixture did not confirm its closed window and exact main PID")
                 invocation = [str(case_launcher), "--session", service.session, "--launch-id", service.launch_id,
                               "--mode", service.mode]
+                if scenario != "quit_refused":
+                    invocation += ["--launch-action", "force_quit" if scenario == "force_requires_authorization" else service.launch_action]
                 # The real OS, not the static predictor, decides whether this
                 # self-owned ad-hoc signed app loads the adapter. Verify either
                 # result against its actual fixed handshake/backend evidence.
                 expected = None if scenario == "hardened_policy_observation" else (0 if scenario in routed else 1)
-                run = command(invocation, env=child_env, timeout=50, expected=expected)
+                run = command(invocation, env=child_env, timeout=105, expected=expected)
                 if scenario == "hardened_policy_observation" and run.returncode not in {0, 1}:
                     raise AssertionError(f"hardened fixture launcher failed unexpectedly ({run.returncode})")
                 if (scenario in routed or scenario in outcomes - {"hardened_policy_observation"} or
@@ -281,10 +297,11 @@ def main() -> int:
                                                                   sort_keys=True), flush=True)
                         print("fixture backend operations " + json.dumps(dict(service.operations), sort_keys=True), flush=True)
                         raise AssertionError(f"{scenario}: fixture assertions failed: {result}")
-                    if scenario == "closed_window_restart":
+                    if scenario in {"closed_window_restart", "delayed_normal_quit", "force_quit_restart"}:
                         if type(result.get("pid")) is not int or result["pid"] == holder_pid:
                             raise AssertionError("closed-window target was reused rather than cold-started")
-                        if holder.wait(timeout=3) != 0:
+                        exit_status = holder.wait(timeout=3)
+                        if scenario != "force_quit_restart" and exit_status != 0:
                             raise AssertionError("normal quit did not finish cleanly before cold launch")
                 elif scenario not in outcomes and result_path.exists():
                     raise AssertionError("a refused/revoked/identity-mismatched launch executed the target")
@@ -295,11 +312,12 @@ def main() -> int:
                 events = [json.loads(line) for line in local_events.splitlines()]
                 stages = {event["stage"] for event in events}
                 server_stages = {event["stage"] for event in service.events}
-                if scenario == "identity_mismatch":
+                if scenario in {"identity_mismatch", "force_requires_authorization"}:
                     if any(stage.startswith(("target_process_", "policy_")) for stage in stages):
                         raise AssertionError("unverified target was reported as a validated process/policy observation")
-                    if "target_identity_mismatch" not in stages or "target_identity_mismatch" not in server_stages:
-                        raise AssertionError("identity rejection did not reach both fixed event paths")
+                    required = "target_identity_mismatch" if scenario == "identity_mismatch" else "session_inactive"
+                    if required not in stages or required not in server_stages:
+                        raise AssertionError("identity/action rejection did not reach both fixed event paths")
                 else:
                     observations = {"target_process_running" if scenario in held else "target_process_not_running",
                                     "policy_runtime_on", "policy_library_exception_on",
@@ -320,8 +338,18 @@ def main() -> int:
                     ready = [event for event in events if event["stage"] == "adapter_ready"]
                     if not ready or any(type(event["errorCode"]) is not int or event["errorCode"] != 0 or event["errorDomain"] != "" for event in ready):
                         raise AssertionError("success was reported without an explicit zero-error handshake")
-                    if scenario == "closed_window_restart" and not {"quit_requested", "quit_completed"} <= stages:
-                        raise AssertionError("closed-window process was not normally quit before the cold launch")
+                    if scenario in {"closed_window_restart", "delayed_normal_quit", "force_quit_restart"}:
+                        prefix = "force_quit" if scenario == "force_quit_restart" else "quit"
+                        if not {prefix + "_requested", prefix + "_completed"} <= stages:
+                            raise AssertionError("closed-window process was not stopped by its explicitly authorized action")
+                        for event in events:
+                            if event["stage"] in {prefix + "_requested", prefix + "_completed"} and event.get("targetPid") != holder_pid:
+                                raise AssertionError("quit event did not identify the original verified main PID")
+                        if scenario == "delayed_normal_quit":
+                            elapsed = {event["stage"]: event["elapsedMs"] for event in events}
+                            interval = elapsed["quit_completed"] - elapsed["quit_requested"]
+                            if not 8000 < interval < 30000:
+                                raise AssertionError("delayed normal quit did not exercise the extended bounded wait")
                 elif scenario in outcomes:
                     if "launch_started" not in stages:
                         raise AssertionError(f"{scenario}: did not perform one actual OS launch")
@@ -362,6 +390,29 @@ def main() -> int:
                         required = {"quit_refused", "quit_timeout"} if scenario == "quit_refused" else {"session_inactive"}
                         if not required & stages or not required & server_stages or "quit_completed" in stages:
                             raise AssertionError("quit refusal/cancellation was not acknowledged without relaunch")
+                    elif scenario == "force_requires_authorization":
+                        if holder.poll() is not None or any(stage.startswith(("quit_", "force_quit_")) for stage in stages):
+                            raise AssertionError("CLI force flag acted without matching current host authorization")
+                    elif scenario == "target_reappeared":
+                        if not {"quit_requested", "quit_completed", "target_reappeared"} <= stages:
+                            raise AssertionError("replacement instance did not stop the cold launch after original quit")
+                        if holder.wait(timeout=3) != 0 or not replacement_marker.exists():
+                            raise AssertionError("original target did not normally quit after starting its replacement")
+                        replacement = json.loads(replacement_marker.read_text())
+                        replacement_pid = replacement.get("pid")
+                        if (replacement.get("window_closed") is not True or type(replacement_pid) is not int or
+                                replacement_pid <= 0 or replacement_pid == holder_pid):
+                            raise AssertionError("replacement was not a distinct live owned main process")
+                        os.kill(replacement_pid, 0)  # Read-only existence check; never signals another instance.
+                        reappeared = [event for event in events if event["stage"] == "target_reappeared"]
+                        if (len(reappeared) != 1 or reappeared[0].get("targetPid") != holder_pid or
+                                reappeared[0].get("observedPid") != replacement_pid or
+                                sum(event["stage"] == "quit_requested" for event in events) != 1):
+                            raise AssertionError("launcher did not preserve old/new identity or attempted another quit")
+                if scenario != "force_quit_restart" and any(stage.startswith("force_quit_") for stage in stages):
+                    raise AssertionError("normal/default/cancelled action silently escalated to force quit")
+                if scenario == "force_quit_restart" and any(stage.startswith("quit_") for stage in stages):
+                    raise AssertionError("explicit force action silently used another action")
                 if service.mode == "public_token" and (service.operations["baa_data"] or service.operations["baa_dictionary"]):
                     raise AssertionError("public mode crossed into host BAA signing")
                 if service.mode == "baa" and service.operations["dc_token"]:
@@ -375,7 +426,7 @@ def main() -> int:
                         raise AssertionError("synthetic secret or target output leaked to experiment logs")
                 if service.failures:
                     raise AssertionError(f"fixture transport rejected request: {service.failures}")
-                if scenario == "public_success":
+                if scenario in {"public_success", "force_quit_restart"}:
                     # Separate launcher processes model helper restart. Reusing
                     # the current UUID must not append stages or reexecute target.
                     time.sleep(0.3)
@@ -387,6 +438,7 @@ def main() -> int:
                     if (events_file.read_bytes() != previous_events or result_path.read_bytes() != previous_result or
                             dict(service.operations) != previous_operations):
                         raise AssertionError("replayed launch UUID performed another action or overwrote its outcome")
+                if scenario == "public_success":
                     # A malformed persisted record is an actual failure, never
                     # treated as an empty first-run state that permits a quit.
                     (case / "logs/AuthExperiment.launch-claim").write_bytes(b"partial")
@@ -401,12 +453,27 @@ def main() -> int:
                     if holder.wait(timeout=5) != 0:
                         raise AssertionError("owned refusal fixture did not exit cooperatively during test cleanup")
                 holder = None
+                if replacement_marker.exists():
+                    Path(str(replacement_marker) + ".stop").write_bytes(b"")
+                    deadline = time.monotonic() + 5
+                    while not Path(str(replacement_marker) + ".stopped").exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if not Path(str(replacement_marker) + ".stopped").exists():
+                        raise AssertionError("owned replacement did not acknowledge cooperative test cleanup")
                 after = {str(path.relative_to(application)): hashlib.sha256(path.read_bytes()).digest()
                          for path in application.rglob("*") if path.is_file()}
                 if before != after:
                     raise AssertionError("launcher or adapter changed the signed target bundle")
                 print(f"PASS real DYLD fixture {scenario}; fixed logs only", flush=True)
             finally:
+                if replacement_marker.exists():
+                    # Only our native fixture knows this per-test marker. Ask
+                    # its replacement to stop cooperatively; never kill a PID
+                    # that could have changed since the above observation.
+                    Path(str(replacement_marker) + ".stop").write_bytes(b"")
+                    deadline = time.monotonic() + 5
+                    while not Path(str(replacement_marker) + ".stopped").exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
                 if holder and holder.poll() is None:
                     Path(str(window_marker) + ".stop").write_bytes(b"")
                     try:

@@ -41,12 +41,14 @@ static struct {
     int init_error;
     char session[HV_DEVICE_AUTH_UUID_SIZE], launch_id[HV_DEVICE_AUTH_UUID_SIZE];
     HvDeviceAuthMode mode;
+    HvDeviceAuthAction launch_action;
     int enabled, running, foreground, published;
     uint64_t published_ms, next_ticket, next_sequence;
     uint64_t accepted, completed, refused;
     uint64_t enable_attempts, enable_successes, enable_failures;
     HvDeviceAuthError last_enable_error;
     HvDeviceAuthMode last_enable_mode;
+    HvDeviceAuthAction last_enable_action;
     int last_enable_backend_registered;
     char used_launches[LAUNCH_HISTORY_MAX][HV_DEVICE_AUTH_UUID_SIZE];
     size_t launch_count;
@@ -153,12 +155,12 @@ static int active_locked(uint64_t now) {
 
 static int startup_stage(HvDeviceAuthStage stage) {
     return (stage >= HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED && stage <= HV_DEVICE_AUTH_STAGE_ADAPTER_READY) ||
-        (stage >= HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING && stage <= HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED) ||
+        (stage >= HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING && stage <= HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED) ||
         stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED || stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_DISABLED;
 }
 
 _Static_assert((HV_DEVICE_AUTH_STAGE_ADAPTER_READY - HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED + 1) +
-    (HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED - HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING + 1) + 2 <=
+    (HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED - HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING + 1) + 2 <=
     HV_DEVICE_AUTH_STARTUP_EVENT_COUNT, "startup cache must hold every allowed stage");
 
 static void reset_startup_locked(void) {
@@ -292,12 +294,14 @@ void hv_device_auth_begin(const char *session) {
     if (!valid) service.session[0] = 0;
     memset(service.launch_id, 0, sizeof(service.launch_id));
     service.mode = HV_DEVICE_AUTH_MODE_NONE;
+    service.launch_action = HV_DEVICE_AUTH_ACTION_NORMAL_QUIT;
     service.running = service.foreground = service.published = 0;
     service.published_ms = 0;
     service.accepted = service.completed = service.refused = 0;
     service.enable_attempts = service.enable_successes = service.enable_failures = 0;
     service.last_enable_error = HV_DEVICE_AUTH_OK;
     service.last_enable_mode = HV_DEVICE_AUTH_MODE_NONE;
+    service.last_enable_action = HV_DEVICE_AUTH_ACTION_NORMAL_QUIT;
     service.last_enable_backend_registered = 0;
     memset(service.used_launches, 0, sizeof(service.used_launches));
     service.launch_count = 0;
@@ -317,6 +321,7 @@ void hv_device_auth_end(void) {
     service.session[0] = service.launch_id[0] = 0;
     reset_startup_locked();
     service.mode = HV_DEVICE_AUTH_MODE_NONE;
+    service.launch_action = HV_DEVICE_AUTH_ACTION_NORMAL_QUIT;
     service.running = service.foreground = service.published = 0;
     notify_locked();
     pthread_mutex_unlock(&service.mutex);
@@ -337,21 +342,28 @@ void hv_device_auth_publish(int running, int foreground) {
 }
 
 HvDeviceAuthError hv_device_auth_enable(HvDeviceAuthMode mode, const char *launch_id) {
+    return hv_device_auth_enable_with_action(mode, HV_DEVICE_AUTH_ACTION_NORMAL_QUIT, launch_id);
+}
+
+HvDeviceAuthError hv_device_auth_enable_with_action(HvDeviceAuthMode mode, HvDeviceAuthAction action,
+                                                   const char *launch_id) {
     char launch[HV_DEVICE_AUTH_UUID_SIZE] = {0};
     int valid_launch = uuid_copy(launch, launch_id);
     int valid_mode = mode == HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN || mode == HV_DEVICE_AUTH_MODE_BAA;
+    int valid_action = action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT || action == HV_DEVICE_AUTH_ACTION_FORCE_QUIT;
     lock_service();
     uint64_t now = now_ms();
     /* Invalid arguments used to return before refresh. Keep that behavior: an
        invalid diagnostic attempt must not revoke or replace existing authority. */
-    if (valid_launch && valid_mode) refresh_locked(now);
+    if (valid_launch && valid_mode && valid_action) refresh_locked(now);
     HvDeviceAuthError error = !valid_launch ? HV_DEVICE_AUTH_LAUNCH_REQUIRED :
-        !valid_mode ? HV_DEVICE_AUTH_INVALID_REQUEST : HV_DEVICE_AUTH_OK;
+        (!valid_mode || !valid_action) ? HV_DEVICE_AUTH_INVALID_REQUEST : HV_DEVICE_AUTH_OK;
     if (error != HV_DEVICE_AUTH_OK) { /* Record the same argument error below. */ }
     else if (service.init_error) error = HV_DEVICE_AUTH_INTERNAL_ERROR;
     else if (!active_locked(now)) error = HV_DEVICE_AUTH_HOST_INACTIVE;
     else if (service.enabled) {
         if (mode != service.mode || strcmp(launch, service.launch_id)) error = HV_DEVICE_AUTH_MODE_CONFLICT;
+        else if (action != service.launch_action) error = HV_DEVICE_AUTH_ACTION_CONFLICT;
     } else {
         for (size_t i = 0; i < service.launch_count; i++) {
             if (!strcmp(launch, service.used_launches[i])) { error = HV_DEVICE_AUTH_LAUNCH_REUSED; break; }
@@ -362,6 +374,7 @@ HvDeviceAuthError hv_device_auth_enable(HvDeviceAuthMode mode, const char *launc
             memcpy(service.used_launches[service.launch_count++], launch, sizeof(launch));
             memcpy(service.launch_id, launch, sizeof(launch));
             service.mode = mode;
+            service.launch_action = action;
             service.enabled = 1;
             reset_startup_locked();
             host_event_locked(HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED, HV_DEVICE_AUTH_OK, now, 0, 0);
@@ -372,16 +385,17 @@ HvDeviceAuthError hv_device_auth_enable(HvDeviceAuthMode mode, const char *launc
     else service.enable_failures++;
     service.last_enable_error = error;
     service.last_enable_mode = valid_mode ? mode : HV_DEVICE_AUTH_MODE_NONE;
+    service.last_enable_action = valid_action ? action : HV_DEVICE_AUTH_ACTION_INVALID;
     service.last_enable_backend_registered = service.wakeup != NULL;
     /* Exactly one fixed diagnostic record per call, including early argument
        errors. No supplied UUID, arbitrary text, or authentication material. */
     int64_t state_age = service.published && now >= service.published_ms ? (int64_t)(now - service.published_ms) : -1;
-    fprintf(stderr, "[device-auth] action=enable attempt=%llu successes=%llu failures=%llu mode=%s result=%s backend_registered=%d enabled=%d running=%d foreground=%d fresh=%d active=%d state_age_ms=%lld\n",
+    fprintf(stderr, "[device-auth] action=enable attempt=%llu successes=%llu failures=%llu mode=%s result=%s backend_registered=%d enabled=%d running=%d foreground=%d fresh=%d active=%d state_age_ms=%lld launch_action=%s\n",
         (unsigned long long)service.enable_attempts, (unsigned long long)service.enable_successes,
         (unsigned long long)service.enable_failures,
         valid_mode ? hv_device_auth_mode_name(mode) : "invalid", hv_device_auth_error_name(error),
         service.last_enable_backend_registered, service.enabled, service.running, service.foreground,
-        fresh_locked(now), active_locked(now), (long long)state_age);
+        fresh_locked(now), active_locked(now), (long long)state_age, hv_device_auth_action_name(service.last_enable_action));
     fflush(stderr);
     pthread_mutex_unlock(&service.mutex);
     return error;
@@ -402,6 +416,7 @@ void hv_device_auth_snapshot(HvDeviceAuthState *out) {
     memcpy(out->session, service.session, sizeof(out->session));
     memcpy(out->launch_id, service.launch_id, sizeof(out->launch_id));
     out->mode = service.mode;
+    out->launch_action = service.launch_action;
     out->enabled = service.enabled;
     out->running = service.running;
     out->foreground = service.foreground;
@@ -417,6 +432,7 @@ void hv_device_auth_snapshot(HvDeviceAuthState *out) {
     out->enable_failures = service.enable_failures;
     out->last_enable_error = service.last_enable_error;
     out->last_enable_mode = service.last_enable_mode;
+    out->last_enable_action = service.last_enable_action;
     out->backend_registered = service.wakeup != NULL;
     out->last_enable_backend_registered = service.last_enable_backend_registered;
     out->event_count = service.event_count;
@@ -688,7 +704,8 @@ HvDeviceAuthError hv_device_auth_record_event(const char *session, const char *l
     if (!event || !uuid_copy(copy.request_id, event->request_id)) return HV_DEVICE_AUTH_REQUEST_ID_REQUIRED;
     if (event->stage < HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED || event->stage > HV_DEVICE_AUTH_STAGE_SESSION_INACTIVE ||
         event->error_domain < HV_DEVICE_AUTH_DOMAIN_NONE || event->error_domain > HV_DEVICE_AUTH_DOMAIN_OTHER ||
-        event->elapsed_ms > 300000u || event->input_bytes > HV_DEVICE_AUTH_BODY_MAX || event->result_bytes > HV_DEVICE_AUTH_RESPONSE_MAX)
+        event->elapsed_ms > 300000u || event->input_bytes > HV_DEVICE_AUTH_BODY_MAX || event->result_bytes > HV_DEVICE_AUTH_RESPONSE_MAX ||
+        event->target_pid < 0 || event->observed_pid < 0)
         return HV_DEVICE_AUTH_INVALID_REQUEST;
     copy.stage = event->stage;
     copy.error_domain = event->error_domain;
@@ -696,6 +713,8 @@ HvDeviceAuthError hv_device_auth_record_event(const char *session, const char *l
     copy.elapsed_ms = event->elapsed_ms;
     copy.input_bytes = event->input_bytes;
     copy.result_bytes = event->result_bytes;
+    copy.target_pid = event->target_pid;
+    copy.observed_pid = event->observed_pid;
     lock_service();
     uint64_t now = now_ms();
     refresh_locked(now);
@@ -710,11 +729,11 @@ static const char *const error_names[] = {
     "body_too_large", "session_required", "session_changed", "launch_required", "launch_changed",
     "request_id_required", "host_inactive", "not_enabled", "mode_forbidden", "mode_conflict", "launch_reused",
     "launch_limit", "busy", "rate_limited", "timed_out", "backend_unavailable", "backend_failed",
-    "response_too_large", "no_memory", "cancelled", "internal_error"
+    "response_too_large", "no_memory", "cancelled", "internal_error", "action_conflict"
 };
 
 const char *hv_device_auth_error_name(HvDeviceAuthError error) {
-    return error >= HV_DEVICE_AUTH_OK && error <= HV_DEVICE_AUTH_INTERNAL_ERROR ? error_names[error] : "internal_error";
+    return error >= HV_DEVICE_AUTH_OK && error <= HV_DEVICE_AUTH_ACTION_CONFLICT ? error_names[error] : "internal_error";
 }
 
 int hv_device_auth_http_status(HvDeviceAuthError error) {
@@ -732,6 +751,7 @@ int hv_device_auth_http_status(HvDeviceAuthError error) {
     case HV_DEVICE_AUTH_HOST_INACTIVE:
     case HV_DEVICE_AUTH_NOT_ENABLED:
     case HV_DEVICE_AUTH_MODE_CONFLICT:
+    case HV_DEVICE_AUTH_ACTION_CONFLICT:
     case HV_DEVICE_AUTH_LAUNCH_REUSED:
     case HV_DEVICE_AUTH_CANCELLED: return 409;
     case HV_DEVICE_AUTH_BUSY:
@@ -751,6 +771,11 @@ const char *hv_device_auth_mode_name(HvDeviceAuthMode mode) {
     return mode == HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN ? "public_token" : mode == HV_DEVICE_AUTH_MODE_BAA ? "baa" : "none";
 }
 
+const char *hv_device_auth_action_name(HvDeviceAuthAction action) {
+    return action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT ? "normal_quit" :
+        action == HV_DEVICE_AUTH_ACTION_FORCE_QUIT ? "force_quit" : "invalid";
+}
+
 const char *hv_device_auth_operation_name(HvDeviceAuthOperation operation) {
     static const char *const names[] = { "probe", "dc_token", "baa_data", "baa_dictionary" };
     return operation >= HV_DEVICE_AUTH_PROBE && operation <= HV_DEVICE_AUTH_BAA_DICTIONARY ? names[operation] : "invalid";
@@ -767,6 +792,8 @@ static const char *const stage_names[] = {
     "policy_library_exception_on", "policy_library_exception_off",
     "policy_predicts_restriction", "policy_predicts_permission", "quit_requested", "quit_completed",
     "quit_refused", "quit_timeout", "target_exited_before_adapter", "adapter_initialization_failed",
+    "force_quit_requested", "force_quit_completed", "force_quit_refused", "force_quit_timeout",
+    "process_identity_unavailable", "target_process_changed", "target_reappeared",
     "session_inactive", "host_request_queued", "host_request_started", "host_request_completed", "host_request_failed",
     "host_request_cancelled", "host_bridge_enabled", "host_bridge_disabled"
 };

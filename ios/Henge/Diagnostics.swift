@@ -549,16 +549,19 @@ enum Diagnostics {
     }
 
     /// Retain UI attempts separately from successful bridge authorization. Fixed fields only.
-    static func recordAuthControl(_ action: DeviceAuthControlAction, mode: String, resultCode: Int? = nil) {
+    static func recordAuthControl(_ action: DeviceAuthControlAction, mode: String, resultCode: Int? = nil,
+                                  launchAction: String = "normal_quit") {
         let safeMode = ["public_token", "baa"].contains(mode) ? mode : "none"
+        let safeLaunchAction = DeviceAuthLaunchAction(rawValue: launchAction)?.rawValue ?? "unknown"
         let observed = ISO8601DateFormatter().string(from: Date())
         queue.async {
-            var interaction: [String: Any] = ["action": action.rawValue, "mode": safeMode, "observed_utc": observed]
+            var interaction: [String: Any] = ["action": action.rawValue, "mode": safeMode,
+                "launch_action": safeLaunchAction, "observed_utc": observed]
             if let resultCode { interaction["return_code"] = resultCode }
             var history = run["authentication_controls"] as? [[String: Any]] ?? []
             history.append(interaction)
             run["authentication_controls"] = Array(history.suffix(16))
-            HengeLog.log("device-auth-control", "action=\(action.rawValue) mode=\(safeMode) return_code=\(resultCode.map(String.init) ?? "not_returned")")
+            HengeLog.log("device-auth-control", "action=\(action.rawValue) mode=\(safeMode) launch_action=\(safeLaunchAction) return_code=\(resultCode.map(String.init) ?? "not_returned")")
             sample("authentication_\(action.rawValue)")
             scheduleReport(reason: "authentication_control")
         }

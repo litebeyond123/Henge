@@ -1,4 +1,5 @@
 #import "guest-auth-experiment.h"
+#import "guest-auth-process.h"
 #import <AppKit/AppKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
@@ -24,7 +25,9 @@ NSString *const HengeAuthBridgeErrorDomain = @"HengeAuthBridge";
 const NSUInteger HengeAuthResponseLimit = 96 * 1024;
 static const NSUInteger inputLimit = 32 * 1024, resultLimit = 64 * 1024, ringLimit = 64 * 1024;
 static const NSUInteger stateLimit = 32 * 1024;
-static NSString *const statePath = @"/.henge/v1/auth/state";
+// Only capability-3 clients may observe an explicitly authorized force action.
+// Never fall back to the legacy state URL if this request is rejected.
+static NSString *const statePath = @"/.henge/v1/auth/state?capability=3";
 static NSString *const requestPath = @"/.henge/v1/auth/request";
 static NSString *const eventPath = @"/.henge/v1/auth/event";
 
@@ -32,11 +35,17 @@ enum {
     InvalidState = 1001, SessionInactive, SessionMismatch, InvalidPayload, InvalidResponse,
     HostUnsupported, SignaturePolicy = 1010, SignatureInvalid, TargetIdentity, TargetMissing,
     AlreadyRunning, LaunchFailed, AdapterNotLoaded, ABIInvalid, LaunchTimeout,
-    QuitRefused, QuitTimeout, TargetExited, AdapterInitializationFailed
+    QuitRefused, QuitTimeout, TargetExited, AdapterInitializationFailed,
+    ProcessIdentityUnavailable, TargetProcessChanged, TargetReappeared
 };
 
 NSError *HengeAuthError(NSInteger code) {
     return [NSError errorWithDomain:HengeAuthBridgeErrorDomain code:code userInfo:nil];
+}
+static NSError *processObservationError(const HengeAuthProcessObservation *observation) {
+    return observation && observation->error_number > 0
+        ? [NSError errorWithDomain:NSPOSIXErrorDomain code:observation->error_number userInfo:nil]
+        : HengeAuthError(ProcessIdentityUnavailable);
 }
 double HengeAuthMonotonic(void) {
     struct timespec now;
@@ -70,9 +79,12 @@ NSDictionary *HengeAuthValidateState(NSData *data) {
     NSDictionary *raw = jsonDictionary(data, stateLimit);
     if (!raw || !integer(raw[@"protocol"], 1, 1) || !boolean(raw[@"enabled"])) return nil;
     if (![raw[@"enabled"] boolValue]) return @{@"enabled": @NO};
+    NSString *action = raw[@"launch_action"] ?: @"normal_quit";
     if (!uuid(raw[@"session"]) || !uuid(raw[@"launch_id"]) ||
-        ![@[@"public_token", @"baa"] containsObject:raw[@"mode"] ?: @""]) return nil;
-    return @{@"enabled": @YES, @"session": raw[@"session"], @"launch_id": raw[@"launch_id"], @"mode": raw[@"mode"]};
+        ![@[@"public_token", @"baa"] containsObject:raw[@"mode"] ?: @""] ||
+        ![@[@"normal_quit", @"force_quit"] containsObject:action]) return nil;
+    return @{@"enabled": @YES, @"session": raw[@"session"], @"launch_id": raw[@"launch_id"],
+             @"mode": raw[@"mode"], @"launch_action": action};
 }
 
 #ifdef HENGE_AUTH_TESTING
@@ -444,27 +456,37 @@ BOOL HengeAuthTargetIdentity(NSString *bundlePath, BOOL checkPolicy, NSError **e
     if (checkPolicy && !HengeAuthSignaturePolicy(info)) { if (error) *error = HengeAuthError(SignaturePolicy); return NO; }
     return YES;
 }
-static NSArray<NSRunningApplication *> *matchingMainApplications(NSString *bundlePath) {
-    NSString *canonicalBundle = bundlePath.stringByResolvingSymlinksInPath;
-    NSString *canonicalExecutable = [NSBundle bundleWithPath:canonicalBundle].executablePath.stringByResolvingSymlinksInPath;
-    NSMutableArray<NSRunningApplication *> *matches = [NSMutableArray array];
-    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:expectedIdentifier()]) {
-        // A closed window does not imply process exit. Match the validated
-        // main executable and bundle, never an Electron child or another copy.
-        if (!app.terminated && [app.bundleIdentifier isEqual:expectedIdentifier()] &&
-            [app.bundleURL.path.stringByResolvingSymlinksInPath isEqual:canonicalBundle] &&
-            [app.executableURL.path.stringByResolvingSymlinksInPath isEqual:canonicalExecutable]) {
-            [matches addObject:app];
-        }
-    }
-    return matches;
-}
-NSDictionary *HengeAuthTargetPreflight(NSString *bundlePath, NSError **error) {
+static NSDictionary *targetPreflight(NSString *bundlePath, HengeAuthProcessIdentity *identities, size_t *count,
+                                     BOOL *processFailure, NSError **error) {
+    if (processFailure) *processFailure = NO;
     NSDictionary *info = targetIdentityInformation(bundlePath, error);
     if (!info) return nil;
+    NSString *executable = [NSBundle bundleWithPath:bundlePath].executablePath.stringByResolvingSymlinksInPath;
+    HengeAuthProcessObservation observation = {0};
+    HengeAuthProcessState processState = HengeAuthProcessListMatching(executable.fileSystemRepresentation,
+        geteuid(), identities, 2, count, &observation);
+    if (processState != HENGE_AUTH_PROCESS_ALIVE && processState != HENGE_AUTH_PROCESS_EXITED) {
+        if (processFailure) *processFailure = YES;
+        if (error) *error = processObservationError(&observation);
+        return nil;
+    }
     NSMutableDictionary *facts = [HengeAuthSignaturePolicySnapshot(info) mutableCopy];
-    facts[@"main_process_running"] = matchingMainApplications(bundlePath).count ? @YES : @NO;
+    facts[@"main_process_running"] = *count ? @YES : @NO;
     return facts;
+}
+NSDictionary *HengeAuthTargetPreflight(NSString *bundlePath, NSError **error) {
+    HengeAuthProcessIdentity identities[2] = {0};
+    size_t count = 0;
+    return targetPreflight(bundlePath, identities, &count, NULL, error);
+}
+static NSRunningApplication *applicationForIdentity(NSString *bundlePath, const HengeAuthProcessIdentity *identity) {
+    NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:identity->pid];
+    if (application.processIdentifier != identity->pid || ![application.bundleIdentifier isEqual:expectedIdentifier()] ||
+        ![application.bundleURL.path.stringByResolvingSymlinksInPath isEqual:bundlePath.stringByResolvingSymlinksInPath] ||
+        ![application.executableURL.path.stringByResolvingSymlinksInPath isEqual:[NSString stringWithUTF8String:identity->executable_path]]) return nil;
+    // Kernel identity, checked immediately before action, is authoritative for
+    // liveness. AppKit's terminated flag may lag and must not authorize a kill.
+    return application;
 }
 BOOL HengeAuthCurrentProcessMatches(NSString *bundlePath, NSError **error) {
     if (error) *error = nil;
@@ -576,15 +598,18 @@ static void appendEvent(NSData *line) {
     (void)write(fd, line.bytes, line.length);
     flock(fd, LOCK_UN); close(fd);
 }
-void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
-                   NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes) {
-    if (!uuid(session) || !uuid(launchID) || !uuid(requestID)) return;
+static void recordAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
+                            NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes,
+                            int targetPID, int observedPID) {
+    if (!uuid(session) || !uuid(launchID) || !uuid(requestID) || targetPID < 0 || observedPID < 0) return;
     NSArray *stages = @[@"launch_requested", @"target_not_found", @"target_identity_mismatch", @"target_signature_invalid",
         @"target_process_running", @"target_process_not_running", @"policy_flags_unavailable",
         @"policy_runtime_on", @"policy_runtime_off", @"policy_library_flag_on", @"policy_library_flag_off",
         @"policy_dyld_env_allowed", @"policy_dyld_env_not_allowed", @"policy_library_exception_on", @"policy_library_exception_off",
         @"policy_predicts_restriction", @"policy_predicts_permission", @"quit_requested", @"quit_completed", @"quit_refused", @"quit_timeout",
         @"target_exited_before_adapter", @"adapter_initialization_failed",
+        @"force_quit_requested", @"force_quit_completed", @"force_quit_refused", @"force_quit_timeout",
+        @"process_identity_unavailable", @"target_process_changed", @"target_reappeared",
         @"signature_policy_blocked", @"already_running", @"launch_started", @"launch_failed", @"launch_timeout",
         @"adapter_loaded", @"adapter_not_loaded", @"adapter_target_rejected", @"adapter_abi_mismatch", @"adapter_ready",
         @"probe_requested", @"probe_result", @"token_requested", @"token_result", @"baa_data_requested", @"baa_data_result",
@@ -594,10 +619,12 @@ void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, 
         @"NSOSStatusErrorDomain", @"DCErrorDomain", @"DeviceCheckErrorDomain", @"NSCocoaErrorDomain",
         @"com.apple.devicecheck.error", @"com.apple.MobileActivation.ErrorDomain", @"IDSBAASignerErrorDomain"];
     NSString *safeDomain = error ? ([domains containsObject:error.domain] ? error.domain : @"other") : @"";
-    NSDictionary *event = @{@"protocol": @1, @"launch_id": launchID, @"request_id": requestID, @"stage": stage,
+    NSMutableDictionary *event = [@{@"protocol": @1, @"launch_id": launchID, @"request_id": requestID, @"stage": stage,
         @"errorDomain": safeDomain, @"errorCode": @(error ? MAX((NSInteger)INT32_MIN, MIN((NSInteger)INT32_MAX, error.code)) : 0),
         @"elapsedMs": @((NSUInteger)(fmin(fmax(isfinite(elapsedSeconds) ? elapsedSeconds : 0, 0), 300) * 1000)),
-        @"inputBytes": @(MIN(inputBytes, 128 * 1024)), @"resultBytes": @(MIN(resultBytes, HengeAuthResponseLimit))};
+        @"inputBytes": @(MIN(inputBytes, 128 * 1024)), @"resultBytes": @(MIN(resultBytes, HengeAuthResponseLimit))} mutableCopy];
+    if (targetPID) event[@"targetPid"] = @(targetPID);
+    if (observedPID) event[@"observedPid"] = @(observedPID);
     NSData *data = [NSJSONSerialization dataWithJSONObject:event options:NSJSONWritingSortedKeys error:NULL];
     if (!data.length || data.length > 2048) return;
     NSMutableData *line = [data mutableCopy]; [line appendBytes:"\n" length:1];
@@ -610,6 +637,14 @@ void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, 
             (void)HengeAuthHTTP(@"POST", eventPath, data, session, 4096, 2, &status, NULL);
         }
     });
+}
+void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
+                   NSError *error, double elapsedSeconds, NSUInteger inputBytes, NSUInteger resultBytes) {
+    recordAuthEvent(session, launchID, requestID, stage, error, elapsedSeconds, inputBytes, resultBytes, 0, 0);
+}
+void HengeAuthProcessEvent(NSString *session, NSString *launchID, NSString *requestID, NSString *stage,
+                          NSError *error, double elapsedSeconds, int targetPID, int observedPID) {
+    recordAuthEvent(session, launchID, requestID, stage, error, elapsedSeconds, 0, 0, targetPID, observedPID);
 }
 
 static NSString *findTarget(void) {
@@ -641,7 +676,7 @@ static NSMutableDictionary *launchEnvironment(void) {
 // A launch is an explicit, one-time request, including when an earlier attempt
 // failed. A stable lock inode serializes an atomically replaced last-pair record.
 // Neither helper restart nor simultaneous launchers may repeat a normal quit.
-static int claimLaunch(NSString *session, NSString *launchID, NSString *mode, NSError **error) {
+static int claimLaunch(NSString *session, NSString *launchID, NSString *mode, NSString *action, NSError **error) {
     NSString *directory = HengeAuthEventPath().stringByDeletingLastPathComponent;
     if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES
         attributes:@{NSFilePosixPermissions: @0700} error:error]) return -1;
@@ -684,7 +719,8 @@ static int claimLaunch(NSString *session, NSString *launchID, NSString *mode, NS
         // newer claim after the user has stopped/restarted the authorization.
         NSDictionary *state = readStateWithTimeout(2, error);
         if (![state[@"enabled"] boolValue] || ![state[@"session"] isEqual:session] ||
-            ![state[@"launch_id"] isEqual:launchID] || ![state[@"mode"] isEqual:mode]) {
+            ![state[@"launch_id"] isEqual:launchID] || ![state[@"mode"] isEqual:mode] ||
+            ![state[@"launch_action"] isEqual:action]) {
             if (error && !*error) *error = HengeAuthError(SessionInactive);
             goto done;
         }
@@ -708,9 +744,10 @@ done:
     if (result < 0 && error && !*error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved userInfo:nil];
     return result;
 }
-static BOOL authorizationMatches(NSDictionary *state, NSString *session, NSString *launchID, NSString *mode) {
+static BOOL authorizationMatches(NSDictionary *state, NSString *session, NSString *launchID, NSString *mode, NSString *action) {
     return [state[@"enabled"] boolValue] && [state[@"session"] isEqual:session] &&
-        [state[@"launch_id"] isEqual:launchID] && [state[@"mode"] isEqual:mode];
+        [state[@"launch_id"] isEqual:launchID] && [state[@"mode"] isEqual:mode] &&
+        [state[@"launch_action"] isEqual:action];
 }
 static void serviceMainRunLoop(double seconds) {
     if (seconds <= 0) return;
@@ -723,22 +760,27 @@ static void serviceMainRunLoop(double seconds) {
 }
 int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     HengeAuthCaptureTestConfiguration();
-    if (arguments.count != 6 || ![arguments[0] isEqual:@"--session"] || ![arguments[2] isEqual:@"--launch-id"] ||
+    if ((arguments.count != 6 && arguments.count != 8) || ![arguments[0] isEqual:@"--session"] || ![arguments[2] isEqual:@"--launch-id"] ||
         ![arguments[4] isEqual:@"--mode"] || !uuid(arguments[1]) || !uuid(arguments[3]) ||
         ![@[@"public_token", @"baa"] containsObject:arguments[5]]) return 64;
+    if (arguments.count == 8 && (![arguments[6] isEqual:@"--launch-action"] ||
+        ![@[@"normal_quit", @"force_quit"] containsObject:arguments[7]])) return 64;
+    NSString *action = arguments.count == 8 ? arguments[7] : @"normal_quit";
+    BOOL force = [action isEqual:@"force_quit"];
     NSString *session = arguments[1], *launchID = arguments[3], *mode = arguments[5], *requestID = NSUUID.UUID.UUIDString;
     double started = HengeAuthMonotonic();
+    __block int targetPID = 0, observedPID = 0;
     void (^event)(NSString *, NSError *) = ^(NSString *stage, NSError *error) {
-        HengeAuthEvent(session, launchID, requestID, stage, error, HengeAuthMonotonic() - started, 0, 0);
+        HengeAuthProcessEvent(session, launchID, requestID, stage, error, HengeAuthMonotonic() - started, targetPID, observedPID);
         fprintf(stdout, "henge-auth stage=%s errorCode=%ld\n", stage.UTF8String, (long)(error ? error.code : 0));
         fflush(stdout);
     };
     NSError *error = nil;
     NSDictionary *state = HengeAuthReadState(&error);
-    if (!authorizationMatches(state, session, launchID, mode)) {
+    if (!authorizationMatches(state, session, launchID, mode, action)) {
         event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
     }
-    int claim = claimLaunch(session, launchID, mode, &error);
+    int claim = claimLaunch(session, launchID, mode, action, &error);
     if (!claim) return 0; // Preserve the earlier attempt's result and process.
     if (claim < 0) {
         BOOL inactive = [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == SessionInactive;
@@ -747,12 +789,17 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     event(@"launch_requested", nil);
     NSString *target = findTarget();
     if (!target) { event(@"target_not_found", HengeAuthError(TargetMissing)); return 1; }
-    NSDictionary *preflight = HengeAuthTargetPreflight(target, &error);
+    HengeAuthProcessIdentity originalProcesses[2] = {0};
+    size_t originalCount = 0;
+    BOOL preflightProcessFailure = NO;
+    NSDictionary *preflight = targetPreflight(target, originalProcesses, &originalCount, &preflightProcessFailure, &error);
     if (!preflight) {
-        NSString *stage = [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity
-            ? @"target_identity_mismatch" : @"target_signature_invalid";
+        NSString *stage = preflightProcessFailure
+            ? @"process_identity_unavailable" : [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity
+                ? @"target_identity_mismatch" : @"target_signature_invalid";
         event(stage, error); return 1;
     }
+    if (originalCount == 1) targetPID = observedPID = originalProcesses[0].pid;
     event([preflight[@"main_process_running"] boolValue] ? @"target_process_running" : @"target_process_not_running", nil);
     if ([preflight[@"flags_known"] boolValue]) {
         event([preflight[@"hardened_runtime"] boolValue] ? @"policy_runtime_on" : @"policy_runtime_off", nil);
@@ -774,38 +821,75 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     if (adapterCode) CFRelease(adapterCode);
     if (adapterStatus != errSecSuccess) { event(@"launch_failed", [NSError errorWithDomain:NSOSStatusErrorDomain code:adapterStatus userInfo:nil]); return 1; }
     state = HengeAuthReadState(&error);
-    if (!authorizationMatches(state, session, launchID, mode)) {
+    if (!authorizationMatches(state, session, launchID, mode, action)) {
         event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
     }
-    NSArray<NSRunningApplication *> *running = matchingMainApplications(target);
-    if (running.count > 1) { event(@"quit_refused", HengeAuthError(QuitRefused)); return 1; }
-    if (running.count) {
-        NSRunningApplication *application = running.firstObject;
-        double quitDeadline = MIN(started + 35, HengeAuthMonotonic() + 8);
+    NSString *quitRequested = force ? @"force_quit_requested" : @"quit_requested";
+    NSString *quitCompleted = force ? @"force_quit_completed" : @"quit_completed";
+    NSString *quitRefused = force ? @"force_quit_refused" : @"quit_refused";
+    NSString *quitTimeout = force ? @"force_quit_timeout" : @"quit_timeout";
+    if (originalCount > 1) { event(quitRefused, HengeAuthError(QuitRefused)); return 1; }
+    if (originalCount == 1) {
+        const HengeAuthProcessIdentity *original = &originalProcesses[0];
+        HengeAuthProcessObservation observation = {0};
+        HengeAuthProcessState processState = HengeAuthProcessCheck(original, &observation);
+        double quitDeadline = MIN(started + 75, HengeAuthMonotonic() + (force ? 10 : 30));
         if (quitDeadline <= HengeAuthMonotonic()) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
-        event(@"quit_requested", nil);
-        // terminate is a normal quit request, not proof of exit. It may be
-        // refused, prompt to save work, or be cancelled by the application.
-        if (![application terminate] && !application.terminated) {
-            event(@"quit_refused", HengeAuthError(QuitRefused)); return 1;
+        BOOL actionRequested = NO;
+        if (processState == HENGE_AUTH_PROCESS_ALIVE) {
+            NSRunningApplication *application = applicationForIdentity(target, original);
+            if (!application) { event(@"process_identity_unavailable", HengeAuthError(ProcessIdentityUnavailable)); return 1; }
+            double authorizationBudget = quitDeadline - HengeAuthMonotonic();
+            if (authorizationBudget <= 0) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
+            state = readStateWithTimeout(MIN(2, authorizationBudget), &error);
+            if (!authorizationMatches(state, session, launchID, mode, action)) {
+                event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
+            }
+            // No normal-quit failure ever reaches forceTerminate. The explicit
+            // launch action and this exact PID/birth/UID/executable identity
+            // must both still match immediately before the one requested action.
+            processState = HengeAuthProcessCheck(original, &observation);
+            if (processState == HENGE_AUTH_PROCESS_ALIVE) {
+                event(quitRequested, nil);
+                // Fixed event I/O must not separate the final lifetime check
+                // from the OS operation on that original application.
+                processState = HengeAuthProcessCheck(original, &observation);
+                if (processState == HENGE_AUTH_PROCESS_ALIVE) {
+                    actionRequested = YES;
+                    BOOL sent = force ? [application forceTerminate] : [application terminate];
+                    processState = HengeAuthProcessCheck(original, &observation);
+                    if (!sent && processState == HENGE_AUTH_PROCESS_ALIVE) {
+                        event(quitRefused, HengeAuthError(QuitRefused)); return 1;
+                    }
+                }
+            }
         }
         double nextAuthorizationCheck = 0;
-        while (!application.terminated && HengeAuthMonotonic() < quitDeadline) {
+        while (processState == HENGE_AUTH_PROCESS_ALIVE && HengeAuthMonotonic() < quitDeadline) {
             double now = HengeAuthMonotonic();
             if (now >= nextAuthorizationCheck) {
                 state = readStateWithTimeout(MIN(2, quitDeadline - now), &error);
-                if (!authorizationMatches(state, session, launchID, mode)) {
+                if (!authorizationMatches(state, session, launchID, mode, action)) {
                     event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
                 }
                 nextAuthorizationCheck = HengeAuthMonotonic() + 0.5;
             }
-            // NSRunningApplication termination observations need the main run
-            // loop; a CLI usleep loop can otherwise report a false timeout.
+            // Service AppKit notifications without using its cached terminated
+            // property as the exit decision. The kernel identity remains final.
             serviceMainRunLoop(MIN(0.05, MAX(0, quitDeadline - HengeAuthMonotonic())));
+            processState = HengeAuthProcessCheck(original, &observation);
         }
-        if (!application.terminated) { event(@"quit_timeout", HengeAuthError(QuitTimeout)); return 1; }
-        event(@"quit_completed", nil);
-        // A normally quitting app may have updated itself. Revalidate the exact
+        if (processState == HENGE_AUTH_PROCESS_REPLACED) {
+            observedPID = observation.observed_pid > 0 ? observation.observed_pid : targetPID;
+            event(@"target_process_changed", HengeAuthError(TargetProcessChanged)); return 1;
+        }
+        if (processState == HENGE_AUTH_PROCESS_UNAVAILABLE) {
+            event(@"process_identity_unavailable", processObservationError(&observation)); return 1;
+        }
+        if (processState != HENGE_AUTH_PROCESS_EXITED) { event(quitTimeout, HengeAuthError(QuitTimeout)); return 1; }
+        observedPID = 0;
+        if (actionRequested) event(quitCompleted, nil);
+        // An exiting app may have updated itself. Revalidate the exact
         // target without turning the static loading prediction into a gate.
         if (!HengeAuthTargetIdentity(target, NO, &error)) {
             NSString *stage = [error.domain isEqual:HengeAuthBridgeErrorDomain] && error.code == TargetIdentity
@@ -814,17 +898,40 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
         }
     }
     state = HengeAuthReadState(&error);
-    if (!authorizationMatches(state, session, launchID, mode)) {
+    if (!authorizationMatches(state, session, launchID, mode, action)) {
         event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
     }
-    // Do not reuse or quit a newly appeared process after the one bounded quit.
-    if (matchingMainApplications(target).count) { event(@"already_running", HengeAuthError(AlreadyRunning)); return 1; }
-    if (HengeAuthMonotonic() - started > 35) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
+    // A complete bounded kernel scan, rather than an AppKit cache, establishes
+    // that no matching main remains. A new instance is never terminated here.
+    HengeAuthProcessIdentity remaining[2] = {0};
+    HengeAuthProcessObservation remainingObservation = {0};
+    size_t remainingCount = 0;
+    NSString *canonicalExecutable = [NSBundle bundleWithPath:target].executablePath.stringByResolvingSymlinksInPath;
+    HengeAuthProcessState remainingState = HengeAuthProcessListMatching(canonicalExecutable.fileSystemRepresentation,
+        geteuid(), remaining, 2, &remainingCount, &remainingObservation);
+    if (remainingState != HENGE_AUTH_PROCESS_ALIVE && remainingState != HENGE_AUTH_PROCESS_EXITED) {
+        event(@"process_identity_unavailable", processObservationError(&remainingObservation)); return 1;
+    }
+    if (remainingCount) {
+        observedPID = remaining[0].pid;
+        event(@"target_reappeared", HengeAuthError(TargetReappeared)); return 1;
+    }
+    // The kernel census is bounded but can take several seconds on a busy VM.
+    // Recheck authorization after it so revocation during the scan cannot
+    // authorize a later spawn using only the earlier state response.
+    double preSpawnBudget = started + 75 - HengeAuthMonotonic();
+    if (preSpawnBudget <= 0) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
+    state = readStateWithTimeout(MIN(2, preSpawnBudget), &error);
+    if (!authorizationMatches(state, session, launchID, mode, action)) {
+        event(@"session_inactive", error ?: HengeAuthError(SessionInactive)); return 1;
+    }
+    if (HengeAuthMonotonic() >= started + 75) { event(@"launch_timeout", HengeAuthError(LaunchTimeout)); return 1; }
     NSMutableDictionary *environment = launchEnvironment();
     environment[@"DYLD_INSERT_LIBRARIES"] = adapter;
     environment[@"HENGE_AUTH_SESSION"] = session;
     environment[@"HENGE_AUTH_LAUNCH_ID"] = launchID;
     environment[@"HENGE_AUTH_MODE"] = mode;
+    environment[@"HENGE_AUTH_LAUNCH_ACTION"] = action;
     environment[@"HENGE_AUTH_TARGET"] = target;
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:[NSBundle bundleWithPath:target].executablePath];
@@ -834,8 +941,9 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
     task.standardError = NSFileHandle.fileHandleWithNullDevice;
     if (![task launchAndReturnError:&error]) { event(@"launch_failed", error ?: HengeAuthError(LaunchFailed)); return 1; }
+    observedPID = task.processIdentifier;
     event(@"launch_started", nil);
-    double deadline = MIN(started + 40, HengeAuthMonotonic() + 30);
+    double deadline = MIN(started + 90, HengeAuthMonotonic() + 30);
     BOOL adapterLoaded = NO;
     while (HengeAuthMonotonic() < deadline) {
         NSArray *events = recordedLaunchEvents(launchID);
@@ -857,7 +965,7 @@ int HengeGuestAuthExperimentRun(NSArray<NSString *> *arguments) {
     }
     event(adapterLoaded ? @"adapter_initialization_failed" : @"adapter_not_loaded",
           HengeAuthError(adapterLoaded ? AdapterInitializationFailed : AdapterNotLoaded));
-    // Failure never force-quits the target. The user can close it normally.
+    // A failed new launch never triggers another quit or force-quit attempt.
     return 1;
 }
 void HengeGuestAuthExperimentPoll(HengeGuestAuthTransport transport) {
@@ -882,7 +990,8 @@ void HengeGuestAuthExperimentPoll(HengeGuestAuthTransport transport) {
                 }
                 NSTask *task = [NSTask new];
                 task.executableURL = [NSURL fileURLWithPath:path];
-                task.arguments = @[@"--session", state[@"session"], @"--launch-id", lastLaunch, @"--mode", state[@"mode"]];
+                task.arguments = @[@"--session", state[@"session"], @"--launch-id", lastLaunch, @"--mode", state[@"mode"],
+                                   @"--launch-action", state[@"launch_action"]];
                 task.environment = launchEnvironment();
                 task.standardInput = NSFileHandle.fileHandleWithNullDevice;
                 task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
@@ -892,7 +1001,7 @@ void HengeGuestAuthExperimentPoll(HengeGuestAuthTransport transport) {
                     HengeAuthEvent(state[@"session"], lastLaunch, requestID, @"launch_failed", error, HengeAuthMonotonic() - started, 0, 0);
                     return;
                 }
-                while (task.running && HengeAuthMonotonic() - started < 45) usleep(100000);
+                while (task.running && HengeAuthMonotonic() - started < 95) usleep(100000);
                 if (task.running) {
                     [task terminate]; // Only our launcher; never the ChatGPT process.
                     HengeAuthEvent(state[@"session"], lastLaunch, requestID, @"launch_timeout", HengeAuthError(LaunchTimeout),

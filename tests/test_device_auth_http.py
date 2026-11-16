@@ -84,8 +84,8 @@ class AuthServer(Server):
             raise AssertionError("Auth HTTP response was truncated")
         return HTTPResult(status, parsed, payload)
 
-    def auth_state(self):
-        response = self.request("GET", PREFIX + "state")
+    def auth_state(self, capability=False):
+        response = self.request("GET", PREFIX + "state" + ("?capability=3" if capability else ""))
         if response.status != 200:
             raise AssertionError(f"Cannot read auth state: HTTP {response.status}")
         return json.loads(response.body)
@@ -331,7 +331,9 @@ class DeviceAuthHTTPTests(unittest.TestCase):
                   "policy_dyld_env_allowed", "policy_dyld_env_not_allowed", "policy_library_exception_on",
                   "policy_library_exception_off", "policy_predicts_restriction", "policy_predicts_permission",
                   "quit_requested", "quit_completed", "quit_refused", "quit_timeout",
-                  "target_exited_before_adapter", "adapter_initialization_failed"]
+                  "target_exited_before_adapter", "adapter_initialization_failed", "force_quit_requested",
+                  "force_quit_completed", "force_quit_refused", "force_quit_timeout",
+                  "process_identity_unavailable", "target_process_changed", "target_reappeared"]
         event = {"protocol": 1, "launch_id": LAUNCH, "request_id": REQUEST,
                  "errorCode": 0, "elapsedMs": 0, "inputBytes": 0, "resultBytes": 0}
         for stage in stages:
@@ -351,12 +353,13 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         observed = state["events"][1:]
         self.assertEqual([entry["stage"] for entry in observed], stages + ["signature_policy_blocked"])
         allowed = {"sequence", "age_ms", "from_guest", "request_id", "launch_id", "stage", "errorDomain", "errorCode",
-                   "elapsedMs", "inputBytes", "resultBytes"}
+                   "elapsedMs", "inputBytes", "resultBytes", "targetPid", "observedPid"}
         for entry in observed:
             self.assertEqual(set(entry), allowed)
             self.assertTrue(entry["from_guest"])
             self.assertEqual((entry["request_id"], entry["launch_id"]), (REQUEST, LAUNCH))
             self.assertEqual((entry["elapsedMs"], entry["inputBytes"], entry["resultBytes"]), (0, 0, 0))
+            self.assertEqual((entry["targetPid"], entry["observedPid"]), (0, 0))
         self.assertTrue(all(entry["errorDomain"] == "" and entry["errorCode"] == 0 for entry in observed[:-1]))
         self.assertEqual((observed[-1]["errorDomain"], observed[-1]["errorCode"]), ("HengeAuthBridge", 1010))
         self.assertNotIn("SYNTHETIC_INPUT_MATERIAL", json.dumps(state))
@@ -374,10 +377,13 @@ class DeviceAuthHTTPTests(unittest.TestCase):
                   "policy_runtime_off", "policy_library_flag_on", "policy_library_flag_off", "policy_dyld_env_allowed",
                   "policy_dyld_env_not_allowed", "policy_library_exception_on", "policy_library_exception_off",
                   "policy_predicts_restriction", "policy_predicts_permission", "quit_requested", "quit_completed",
-                  "quit_refused", "quit_timeout", "target_exited_before_adapter", "adapter_initialization_failed"]
+                  "quit_refused", "quit_timeout", "target_exited_before_adapter", "adapter_initialization_failed",
+                  "force_quit_requested", "force_quit_completed", "force_quit_refused", "force_quit_timeout",
+                  "process_identity_unavailable", "target_process_changed", "target_reappeared"]
         event = {"protocol": 1, "launch_id": LAUNCH, "request_id": REQUEST,
                  "errorDomain": "com.apple.MobileActivation.ErrorDomain", "errorCode": -(2 ** 31),
-                 "elapsedMs": 300000, "inputBytes": 128 * 1024, "resultBytes": 96 * 1024}
+                 "elapsedMs": 300000, "inputBytes": 128 * 1024, "resultBytes": 96 * 1024,
+                 "targetPid": 2 ** 31 - 1, "observedPid": 2 ** 31 - 1}
         for stage in stages:
             self.assertEqual(self.server.auth_post(dict(event, stage=stage), "event").status, 200)
         for _ in range(70):
@@ -392,7 +398,10 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         sequence_age_growth = sum(40 - len(str(item["sequence"])) - len(str(item["age_ms"]))
                                   for item in state["events"] + state["startup_events"])
         stage_growth = 32 * (max(map(len, stages)) - len("probe_result"))
-        self.assertLess(len(response.body) + sequence_age_growth + stage_growth, 32 * 1024)
+        # Conservative fixed-header growth: every counter may reach uint64 width,
+        # age int64 width, error name up to 32 bytes, and booleans may become false.
+        header_growth = 6 * 20 + 20 + 32 + 16
+        self.assertLess(len(response.body) + sequence_age_growth + stage_growth + header_growth, 32 * 1024)
         self.assertEqual(len(state["events"]), 32)
         self.assertEqual({item["stage"] for item in state["events"]}, {"probe_result"})
         self.assertEqual([item["stage"] for item in state["startup_events"]], ["host_bridge_enabled"] + stages)
@@ -406,7 +415,9 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         self.assertEqual(self.server.control("disable"), "ok")
         stopped_response = self.server.request("GET", PREFIX + "state")
         self.assertEqual(stopped_response.status, 200)
-        self.assertLess(len(stopped_response.body) + sequence_age_growth + stage_growth + 40, 32 * 1024)
+        bounded_size = len(stopped_response.body) + sequence_age_growth + stage_growth + header_growth + 40
+        self.assertLess(bounded_size, 32 * 1024)
+        print(f"PASS auth state size: {len(stopped_response.body)} actual bytes; {bounded_size} conservative bytes; 32768-byte guest bound")
         stopped = json.loads(stopped_response.body)
         self.assertEqual(len(stopped["startup_events"]), len(stages) + 2)
         self.assertIn("adapter_ready", [item["stage"] for item in stopped["startup_events"]])
@@ -430,6 +441,68 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         self.server.control("publish 1 1")
         self.assert_error(self.server.auth_post(self.request_json()), 409, "not_enabled")
         self.assertEqual(self.server.auth_state()["completed_requests"], 0)
+
+    def test_launch_action_and_capability_query_keep_old_helpers_out_of_force_attempts(self):
+        self.enable()
+        normal = self.server.auth_state()
+        self.assertEqual((normal["launch_action"], normal["last_enable_action"]), ("normal_quit", "normal_quit"))
+        self.assertEqual(self.server.auth_state(capability=True)["launch_id"], LAUNCH)
+        self.assertEqual(self.server.control(f"enable-action public_token force_quit {LAUNCH}"),
+                         "enabled action_conflict")
+        unchanged = self.server.auth_state()
+        self.assertTrue(unchanged["enabled"])
+        self.assertEqual((unchanged["launch_id"], unchanged["launch_action"]), (LAUNCH, "normal_quit"))
+        self.assertEqual((unchanged["last_enable_action"], unchanged["last_enable_error"]),
+                         ("force_quit", "action_conflict"))
+        self.assertEqual(self.server.control("disable"), "ok")
+        self.assertEqual(self.server.control(f"enable-action public_token force_quit {LAUNCH_TWO}"), "enabled ok")
+        old = self.server.request("GET", PREFIX + "state")
+        self.assert_no_store(old)
+        self.assertEqual(json.loads(old.body), {"protocol": 1, "enabled": False})
+        capable = self.server.auth_state(capability=True)
+        self.assertEqual((capable["enabled"], capable["launch_id"], capable["launch_action"]),
+                         (True, LAUNCH_TWO, "force_quit"))
+        # Reading the old view must not revoke, change, or claim the current authorization.
+        self.assertEqual(self.server.control(f"enable-action public_token force_quit {LAUNCH_TWO}"), "enabled ok")
+        self.assertEqual(self.server.control(f"enable public_token {LAUNCH_TWO}"), "enabled action_conflict")
+        for query in ["capability=2", "capability=03", "capability=3&capability=3", "capability=3&x=1",
+                      "x=1", "capability=3%00", "capability=3?"]:
+            with self.subTest(query=query):
+                self.assert_error(self.server.request("GET", PREFIX + "state?" + query), 400, "unexpected_query")
+        for endpoint in ["request", "event"]:
+            self.assert_error(self.server.auth_post(self.request_json(), endpoint + "?capability=3"),
+                              400, "unexpected_query")
+        self.assertEqual(self.server.auth_state(capability=True)["launch_action"], "force_quit")
+        self.assertEqual(self.server.control("publish 1 0"), "ok")
+        revoked = self.server.auth_state(capability=True)
+        self.assertFalse(revoked["enabled"])
+        self.assertEqual(revoked["launch_action"], "force_quit")
+        # Once revoked there is no claimable force permission; diagnostics remain readable.
+        self.assertEqual(self.server.auth_state()["launch_action"], "force_quit")
+        self.assertEqual(self.server.control("begin " + OTHER), "ok")
+        reset = self.server.auth_state(capability=True)
+        self.assertEqual((reset["launch_action"], reset["last_enable_action"]), ("normal_quit", "not_attempted"))
+        self.assertEqual(reset["startup_events"], [])
+
+    def test_process_pid_fields_are_optional_fixed_int32_metadata(self):
+        self.enable()
+        event = {"protocol": 1, "launch_id": LAUNCH, "request_id": REQUEST, "stage": "target_process_running"}
+        self.assertEqual(self.server.auth_post(event, "event").status, 200)
+        last = self.server.auth_state()["events"][-1]
+        self.assertEqual((last["targetPid"], last["observedPid"]), (0, 0))
+        for target, observed in [(0, 0), (1, 0), (2 ** 31 - 1, 2 ** 31 - 1), (541, 812)]:
+            self.assertEqual(self.server.auth_post(dict(event, targetPid=target, observedPid=observed), "event").status, 200)
+            last = self.server.auth_state()["events"][-1]
+            self.assertEqual((last["targetPid"], last["observedPid"]), (target, observed))
+        for field in ["targetPid", "observedPid"]:
+            for invalid in [-1, 2 ** 31, True, 1.5, "123", None]:
+                with self.subTest(field=field, invalid=invalid):
+                    self.assert_error(self.server.auth_post(dict(event, **{field: invalid}), "event"),
+                                      400, "invalid_auth_json")
+            duplicate = json.dumps(dict(event, **{field: 123}))[:-1] + f',"{field}":124}}'
+            self.assert_error(self.server.auth_post(duplicate, "event"), 400, "invalid_auth_json")
+        self.assert_error(self.server.auth_post(self.request_json(targetPid=123)), 400, "invalid_auth_json")
+        self.assertEqual(self.server.control("stats"), "wakes 0 takes 0")
 
 
 if __name__ == "__main__":

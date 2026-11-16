@@ -15,7 +15,7 @@ extern "C" {
 #define HV_DEVICE_AUTH_TIMEOUT_DEFAULT_MS 12000u
 #define HV_DEVICE_AUTH_STATE_MAX_AGE_MS 5000u
 #define HV_DEVICE_AUTH_EVENT_COUNT 32u
-#define HV_DEVICE_AUTH_STARTUP_EVENT_COUNT 40u
+#define HV_DEVICE_AUTH_STARTUP_EVENT_COUNT 48u
 
 typedef enum {
     HV_DEVICE_AUTH_MODE_NONE = 0,
@@ -24,6 +24,12 @@ typedef enum {
     HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN = 1,
     HV_DEVICE_AUTH_MODE_BAA = 2
 } HvDeviceAuthMode;
+
+typedef enum {
+    HV_DEVICE_AUTH_ACTION_INVALID = -1,
+    HV_DEVICE_AUTH_ACTION_NORMAL_QUIT = 0,
+    HV_DEVICE_AUTH_ACTION_FORCE_QUIT = 1
+} HvDeviceAuthAction;
 
 typedef enum {
     HV_DEVICE_AUTH_PROBE = 0,
@@ -59,7 +65,8 @@ typedef enum {
     HV_DEVICE_AUTH_RESPONSE_TOO_LARGE,
     HV_DEVICE_AUTH_NO_MEMORY,
     HV_DEVICE_AUTH_CANCELLED,
-    HV_DEVICE_AUTH_INTERNAL_ERROR
+    HV_DEVICE_AUTH_INTERNAL_ERROR,
+    HV_DEVICE_AUTH_ACTION_CONFLICT
 } HvDeviceAuthError;
 
 typedef enum {
@@ -128,6 +135,13 @@ typedef enum {
     HV_DEVICE_AUTH_STAGE_QUIT_TIMEOUT,
     HV_DEVICE_AUTH_STAGE_TARGET_EXITED_BEFORE_ADAPTER,
     HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED,
+    HV_DEVICE_AUTH_STAGE_FORCE_QUIT_REQUESTED,
+    HV_DEVICE_AUTH_STAGE_FORCE_QUIT_COMPLETED,
+    HV_DEVICE_AUTH_STAGE_FORCE_QUIT_REFUSED,
+    HV_DEVICE_AUTH_STAGE_FORCE_QUIT_TIMEOUT,
+    HV_DEVICE_AUTH_STAGE_PROCESS_IDENTITY_UNAVAILABLE,
+    HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_CHANGED,
+    HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED,
     HV_DEVICE_AUTH_STAGE_SESSION_INACTIVE,
     /* Host-only stages cannot be submitted by the guest event route. */
     HV_DEVICE_AUTH_STAGE_HOST_REQUEST_QUEUED,
@@ -151,12 +165,14 @@ typedef struct {
     uint32_t elapsed_ms;
     uint32_t input_bytes;
     uint32_t result_bytes;
+    int32_t target_pid, observed_pid; /* 0 means not observed; fixed process metadata only. */
 } HvDeviceAuthEvent;
 
 typedef struct {
     char session[HV_DEVICE_AUTH_UUID_SIZE];
     char launch_id[HV_DEVICE_AUTH_UUID_SIZE];
     HvDeviceAuthMode mode;
+    HvDeviceAuthAction launch_action;
     int enabled, running, foreground, fresh, active, busy;
     int64_t state_age_ms;        /* -1 before the first publication. */
     uint64_t accepted_requests, completed_requests, refused_requests;
@@ -167,6 +183,7 @@ typedef struct {
     uint64_t enable_attempts, enable_successes, enable_failures;
     HvDeviceAuthError last_enable_error;
     HvDeviceAuthMode last_enable_mode;
+    HvDeviceAuthAction last_enable_action;
     int backend_registered, last_enable_backend_registered;
     size_t event_count;
     HvDeviceAuthEvent events[HV_DEVICE_AUTH_EVENT_COUNT]; /* Oldest first. */
@@ -222,7 +239,12 @@ int hv_device_auth_set_wakeup(HvDeviceAuthWakeup wakeup, void *context);
 void hv_device_auth_begin(const char *session);
 void hv_device_auth_end(void);
 void hv_device_auth_publish(int running, int foreground);
+/* Legacy callers authorize only a normal quit. A new active launch binds both
+   mode and action; neither may be changed under its UUID. Revocation never
+   upgrades a normal attempt or resumes a previous forced attempt. */
 HvDeviceAuthError hv_device_auth_enable(HvDeviceAuthMode mode, const char *launch_id);
+HvDeviceAuthError hv_device_auth_enable_with_action(HvDeviceAuthMode mode, HvDeviceAuthAction action,
+                                                   const char *launch_id);
 void hv_device_auth_disable(void);
 void hv_device_auth_snapshot(HvDeviceAuthState *out);
 
@@ -257,6 +279,7 @@ HvDeviceAuthError hv_device_auth_record_event(const char *session, const char *l
 const char *hv_device_auth_error_name(HvDeviceAuthError error);
 int hv_device_auth_http_status(HvDeviceAuthError error);
 const char *hv_device_auth_mode_name(HvDeviceAuthMode mode);
+const char *hv_device_auth_action_name(HvDeviceAuthAction action);
 const char *hv_device_auth_operation_name(HvDeviceAuthOperation operation);
 const char *hv_device_auth_stage_name(HvDeviceAuthStage stage);
 HvDeviceAuthStage hv_device_auth_stage_from_name(const char *name); /* Guest stages only. */

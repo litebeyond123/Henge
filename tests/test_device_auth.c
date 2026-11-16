@@ -35,6 +35,11 @@ static HvDeviceAuthError observed_enable(HvDeviceAuthMode mode, const char *laun
     return hv_device_auth_enable(mode, launch);
 }
 #define hv_device_auth_enable(mode, launch) observed_enable((mode), (launch))
+static HvDeviceAuthError observed_enable_action(HvDeviceAuthMode mode, HvDeviceAuthAction action, const char *launch) {
+    atomic_fetch_add(&enable_calls, 1);
+    return hv_device_auth_enable_with_action(mode, action, launch);
+}
+#define hv_device_auth_enable_with_action(mode, action, launch) observed_enable_action((mode), (action), (launch))
 
 static void sleep_ms(unsigned milliseconds) {
     struct timespec duration = { milliseconds / 1000, (long)(milliseconds % 1000) * 1000000L };
@@ -518,6 +523,13 @@ static void fixed_guest_preflight_observations(void) {
         {"quit_timeout", HV_DEVICE_AUTH_STAGE_QUIT_TIMEOUT},
         {"target_exited_before_adapter", HV_DEVICE_AUTH_STAGE_TARGET_EXITED_BEFORE_ADAPTER},
         {"adapter_initialization_failed", HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED},
+        {"force_quit_requested", HV_DEVICE_AUTH_STAGE_FORCE_QUIT_REQUESTED},
+        {"force_quit_completed", HV_DEVICE_AUTH_STAGE_FORCE_QUIT_COMPLETED},
+        {"force_quit_refused", HV_DEVICE_AUTH_STAGE_FORCE_QUIT_REFUSED},
+        {"force_quit_timeout", HV_DEVICE_AUTH_STAGE_FORCE_QUIT_TIMEOUT},
+        {"process_identity_unavailable", HV_DEVICE_AUTH_STAGE_PROCESS_IDENTITY_UNAVAILABLE},
+        {"target_process_changed", HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_CHANGED},
+        {"target_reappeared", HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED},
     };
     setup(idle_wakeup);
     HvDeviceAuthEvent event = {0};
@@ -592,6 +604,48 @@ static void startup_facts_survive_request_traffic_and_reset_only_with_new_launch
     CHECK(state.startup_event_count == 0);
 }
 
+static void launch_action_is_explicit_immutable_and_revocable(void) {
+    setup(idle_wakeup);
+    HvDeviceAuthState state;
+    hv_device_auth_snapshot(&state);
+    CHECK(state.launch_action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT);
+    CHECK(state.last_enable_action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT);
+    CHECK(hv_device_auth_enable_with_action(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, HV_DEVICE_AUTH_ACTION_FORCE_QUIT, LAUNCH) == HV_DEVICE_AUTH_ACTION_CONFLICT);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enabled && state.launch_action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT);
+    CHECK(state.last_enable_action == HV_DEVICE_AUTH_ACTION_FORCE_QUIT && state.last_enable_error == HV_DEVICE_AUTH_ACTION_CONFLICT);
+    CHECK(hv_device_auth_enable_with_action(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, (HvDeviceAuthAction)99, LAUNCH_TWO) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.enabled && state.launch_action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT && state.last_enable_action == HV_DEVICE_AUTH_ACTION_INVALID);
+    hv_device_auth_disable();
+    CHECK(hv_device_auth_enable_with_action(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, HV_DEVICE_AUTH_ACTION_FORCE_QUIT, LAUNCH_TWO) == HV_DEVICE_AUTH_OK);
+    CHECK(hv_device_auth_enable_with_action(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, HV_DEVICE_AUTH_ACTION_FORCE_QUIT, LAUNCH_TWO) == HV_DEVICE_AUTH_OK);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH_TWO) == HV_DEVICE_AUTH_ACTION_CONFLICT);
+    HvDeviceAuthEvent event = {0};
+    memcpy(event.request_id, REQUEST, sizeof(REQUEST));
+    event.stage = HV_DEVICE_AUTH_STAGE_TARGET_REAPPEARED;
+    event.target_pid = INT32_MAX; event.observed_pid = 42;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH_TWO, &event) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.events[state.event_count - 1].target_pid == INT32_MAX && state.events[state.event_count - 1].observed_pid == 42);
+    CHECK(state.startup_events[state.startup_event_count - 1].target_pid == INT32_MAX);
+    event.target_pid = -1;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH_TWO, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    event.target_pid = 0; event.observed_pid = -1;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH_TWO, &event) == HV_DEVICE_AUTH_INVALID_REQUEST);
+    hv_device_auth_publish(1, 0);
+    hv_device_auth_snapshot(&state);
+    CHECK(!state.enabled && state.launch_action == HV_DEVICE_AUTH_ACTION_FORCE_QUIT);
+    hv_device_auth_publish(1, 1);
+    hv_device_auth_snapshot(&state);
+    CHECK(!state.enabled); /* Returning to the foreground never resumes a forced attempt. */
+    CHECK(hv_device_auth_enable_with_action(HV_DEVICE_AUTH_MODE_BAA, HV_DEVICE_AUTH_ACTION_FORCE_QUIT, LAUNCH_TWO) == HV_DEVICE_AUTH_LAUNCH_REUSED);
+    hv_device_auth_begin(SESSION_TWO);
+    hv_device_auth_snapshot(&state);
+    CHECK(!state.enabled && state.launch_action == HV_DEVICE_AUTH_ACTION_NORMAL_QUIT);
+    CHECK(state.enable_attempts == 0 && state.startup_event_count == 0);
+}
+
 int main(void) {
     RUN(metadata_and_default_denial);
     RUN(enable_diagnostics_preserve_authorization);
@@ -609,6 +663,7 @@ int main(void) {
     RUN(fixed_event_fields_and_bounded_history);
     RUN(fixed_guest_preflight_observations);
     RUN(startup_facts_survive_request_traffic_and_reset_only_with_new_launch);
+    RUN(launch_action_is_explicit_immutable_and_revocable);
     RUN(stale_host_state_is_not_revived_by_a_late_publication);
     hv_device_auth_end();
     CHECK(hv_device_auth_set_wakeup(NULL, NULL));

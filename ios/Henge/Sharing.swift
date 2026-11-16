@@ -56,12 +56,23 @@ struct HelperHealthSnapshot: Equatable {
     }
 
     var isConnected: Bool { valid && !session.isEmpty && helperProtocol == 4 && agentSeenSeconds >= 0 && agentSeenSeconds < 30 }
-    var supportsAuthExperiment: Bool { isConnected && helperVersion > 0 && [1, 2].contains(authExperimentProtocol) }
-    var supportsAuthColdStart: Bool { isConnected && helperVersion >= 9 && authExperimentProtocol == 2 }
+    var supportsAuthExperiment: Bool { isConnected && helperVersion > 0 && authExperimentProtocol >= 1 }
+    var supportsAuthColdStart: Bool { isConnected && helperVersion >= 9 && authExperimentProtocol >= 2 }
+    var supportsVerifiedExit: Bool { isConnected && helperVersion >= 10 && authExperimentProtocol >= 3 }
+    var supportsAuthForceQuit: Bool { supportsVerifiedExit }
+    func permitsVerifiedExit(forSession expected: String) -> Bool {
+        supportsVerifiedExit && !expected.isEmpty && UUID(uuidString: expected) != nil &&
+            session.caseInsensitiveCompare(expected) == .orderedSame
+    }
+    func permitsForceQuit(forSession expected: String) -> Bool { permitsVerifiedExit(forSession: expected) }
     // An explicitly old capability is evidence for an update. A missing version
     // or capability alone remains unknown, never proof of an old installation.
     var requiresAuthColdStartUpdate: Bool {
         isConnected && ((helperVersion > 0 && helperVersion < 9) || authExperimentProtocol == 1)
+    }
+    var requiresVerifiedExitUpdate: Bool {
+        isConnected && ((helperVersion > 0 && helperVersion < 10) ||
+            (authExperimentProtocol > 0 && authExperimentProtocol < 3))
     }
     var connectionTitle: String {
         if !valid { return "Status unavailable" }
@@ -116,6 +127,8 @@ struct HelperHealthSnapshot: Equatable {
          "auth_experiment_capability_confirmed": supportsAuthExperiment,
          "auth_cold_start_capability_confirmed": supportsAuthColdStart,
          "auth_cold_start_update_required": requiresAuthColdStartUpdate,
+         "auth_force_quit_capability_confirmed": supportsAuthForceQuit,
+         "auth_verified_exit_capability_confirmed": supportsVerifiedExit,
          "connected": isConnected, "agent_seen_seconds": agentSeenSeconds, "probe_seen_seconds": probeSeenSeconds,
          "install_seen_seconds": installSeenSeconds, "startup_stage": startup.rawValue, "install_stage": install.rawValue,
          "install_error": installError.rawValue, "install_exit_code": installExitCode]
