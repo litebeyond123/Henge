@@ -309,9 +309,13 @@ static int injectedFixture(void) {
         return NSTerminateNow;
     }
     if (self.quitDelay > 0) {
-        [NSTimer scheduledTimerWithTimeInterval:self.quitDelay repeats:NO block:^(__unused NSTimer *timer) {
+        // NSTerminateLater switches AppKit to NSModalPanelRunLoopMode until
+        // this reply. A scheduledTimer registers only in the default mode,
+        // so it cannot model a delayed response in that termination loop.
+        NSTimer *replyTimer = [NSTimer timerWithTimeInterval:self.quitDelay repeats:NO block:^(__unused NSTimer *timer) {
             [sender replyToApplicationShouldTerminate:YES];
         }];
+        [NSRunLoop.mainRunLoop addTimer:replyTimer forMode:NSModalPanelRunLoopMode];
         return NSTerminateLater;
     }
     return self.refuseQuit ? NSTerminateCancel : NSTerminateNow;
