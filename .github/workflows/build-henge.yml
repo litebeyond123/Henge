@@ -92,6 +92,7 @@ jobs:
           sh tests/run_auth_bridge.sh 2>&1 | tee "$HENGE_BUILD_LOG_DIR/device-auth-bridge-tests.log"
 
       - name: Test temporary adapter in an owned macOS fixture
+        if: ${{ !cancelled() }}
         working-directory: Henge
         run: python3 tests/test_guest_auth_experiment.py 2>&1 | tee "$HENGE_BUILD_LOG_DIR/device-auth-guest-tests.log"
 

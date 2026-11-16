@@ -12,6 +12,7 @@
 static unsigned checks;
 static atomic_bool interruptNextWait = false;
 static atomic_uint interruptions = 0;
+static atomic_int lastWaitStatus = -1;
 
 static void require(BOOL value, const char *message) {
     if (!value) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
@@ -21,12 +22,28 @@ pid_t HengeAuthTestWaitPID(pid_t pid, int *status, int options) {
     if (atomic_exchange(&interruptNextWait, false)) {
         atomic_fetch_add(&interruptions, 1); errno = EINTR; return -1;
     }
-    return waitpid(pid, status, options);
+    pid_t result = waitpid(pid, status, options);
+    if (result > 0 && status) atomic_store(&lastWaitStatus, *status);
+    return result;
+}
+
+/* Fixed numeric evidence only; never dump a response, payload, or filesystem
+ * path when a native assertion fails on a remote runner. */
+static void printExitEvidence(NSDictionary *diagnostics) {
+    int status = atomic_load(&lastWaitStatus);
+    fprintf(stderr, "child-exit-evidence raw_status=%d actual_exit=%ld actual_signal=%ld native_errno=%ld latency_ms=%ld raw_exit=%d raw_signal=%d\n",
+        status, (long)[diagnostics[@"childExitCode"] integerValue],
+        (long)[diagnostics[@"childSignal"] integerValue],
+        (long)[diagnostics[@"errorCode"] integerValue],
+        (long)[diagnostics[@"latencyMs"] integerValue],
+        status >= 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+        status >= 0 && WIFSIGNALED(status) ? WTERMSIG(status) : 0);
 }
 
 static NSDictionary *run(NSString *path, NSInteger operation, NSData *input, NSUInteger timeout,
                          NSString *expected, NSData **secretResult) {
     HengeAuthSetTestSignerPath(path);
+    atomic_store(&lastWaitStatus, -1);
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
     __block NSDictionary *diag = nil;
     __block NSData *result = nil;
@@ -40,6 +57,7 @@ static NSDictionary *run(NSString *path, NSInteger operation, NSData *input, NSU
     });
     require(dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC)) == 0, "bounded child completion");
     require(!wasMain, "child completion is off main thread");
+    if (![diag[@"outcome"] isEqual:expected]) printExitEvidence(diag);
     require([diag[@"outcome"] isEqual:expected], "expected child outcome");
     require([diag[@"isolatedSigner"] isEqual:@YES], "child scope recorded");
     require(NSProcessInfo.processInfo.systemUptime - start < 3.5, "deadline and reap remain bounded");
@@ -77,8 +95,14 @@ int main(int argc, const char *argv[]) {
             NSUInteger budget = [expected isEqual:@"child_timed_out"] ? 400 : 1800;
             NSDictionary *diag = run(path, 2, input, budget, expected, [expected isEqual:@"success"] ? &response : NULL);
             if ([expected isEqual:@"success"]) require(response.length > 0, "complete successful result returned");
-            if ([mode isEqual:@"early-exit"]) require([diag[@"childExitCode"] isEqual:@7], "actual child exit code retained");
-            if ([mode isEqual:@"signal-exit"]) require([diag[@"childSignal"] isEqual:@(SIGTERM)], "actual child signal retained");
+            if ([mode isEqual:@"early-exit"]) {
+                if (![diag[@"childExitCode"] isEqual:@7]) printExitEvidence(diag);
+                require([diag[@"childExitCode"] isEqual:@7], "actual child exit code retained");
+            }
+            if ([mode isEqual:@"signal-exit"]) {
+                if (![diag[@"childSignal"] isEqual:@(SIGTERM)]) printExitEvidence(diag);
+                require([diag[@"childSignal"] isEqual:@(SIGTERM)], "actual child signal retained");
+            }
         }
         require(atomic_load(&interruptions) == 1, "injected waitpid EINTR was exercised");
         run([directory stringByAppendingPathComponent:@"missing-helper"], 2, input, 400, @"child_spawn_failed", NULL);

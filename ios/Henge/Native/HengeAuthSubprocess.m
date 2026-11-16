@@ -102,7 +102,20 @@ void HengeAuthRunSignerChild(NSInteger operation, NSData *input, NSUInteger time
             if (!setup) setup = posix_spawn_file_actions_addclose(&actions, incoming[1]);
             if (!setup) setup = posix_spawn_file_actions_addclose(&actions, outgoing[0]);
             if (!setup) { setup = posix_spawnattr_init(&attributes); hasAttributes = setup == 0; }
-            if (!setup) setup = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+            // A GCD worker can have blocked signals, and ignored dispositions
+            // survive exec. The one-shot signer needs its own normal signal
+            // handling rather than inheriting Henge's worker-thread context.
+            sigset_t mask, defaults;
+            sigemptyset(&mask);
+            sigemptyset(&defaults);
+            for (NSUInteger i = 0; i < 5; i++) {
+                const int signals[] = {SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGPIPE};
+                sigaddset(&defaults, signals[i]);
+            }
+            if (!setup) setup = posix_spawnattr_setsigmask(&attributes, &mask);
+            if (!setup) setup = posix_spawnattr_setsigdefault(&attributes, &defaults);
+            if (!setup) setup = posix_spawnattr_setflags(&attributes,
+                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
             char *const arguments[] = {(char *)path.fileSystemRepresentation, "--request-stdin", NULL};
             NSString *home = [@"HOME=" stringByAppendingString:NSHomeDirectory()];
             NSString *temporary = [@"TMPDIR=" stringByAppendingString:NSTemporaryDirectory()];
