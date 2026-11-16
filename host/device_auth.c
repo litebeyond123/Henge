@@ -55,6 +55,9 @@ static struct {
     HvDeviceAuthEvent events[HV_DEVICE_AUTH_EVENT_COUNT];
     uint64_t event_times[HV_DEVICE_AUTH_EVENT_COUNT];
     size_t event_next, event_count;
+    HvDeviceAuthEvent startup_events[HV_DEVICE_AUTH_STARTUP_EVENT_COUNT];
+    uint64_t startup_times[HV_DEVICE_AUTH_STARTUP_EVENT_COUNT];
+    size_t startup_count;
     HvDeviceAuthWakeup wakeup;
     void *wakeup_context;
     Slot slot;
@@ -148,6 +151,22 @@ static int active_locked(uint64_t now) {
     return service.session[0] && service.running && service.foreground && fresh_locked(now);
 }
 
+static int startup_stage(HvDeviceAuthStage stage) {
+    return (stage >= HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED && stage <= HV_DEVICE_AUTH_STAGE_ADAPTER_READY) ||
+        (stage >= HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING && stage <= HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED) ||
+        stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED || stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_DISABLED;
+}
+
+_Static_assert((HV_DEVICE_AUTH_STAGE_ADAPTER_READY - HV_DEVICE_AUTH_STAGE_LAUNCH_REQUESTED + 1) +
+    (HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED - HV_DEVICE_AUTH_STAGE_TARGET_PROCESS_RUNNING + 1) + 2 <=
+    HV_DEVICE_AUTH_STARTUP_EVENT_COUNT, "startup cache must hold every allowed stage");
+
+static void reset_startup_locked(void) {
+    memset(service.startup_events, 0, sizeof(service.startup_events));
+    memset(service.startup_times, 0, sizeof(service.startup_times));
+    service.startup_count = 0;
+}
+
 static void event_locked(const HvDeviceAuthEvent *input, int from_guest, uint64_t now) {
     size_t index = service.event_next;
     HvDeviceAuthEvent *event = &service.events[index];
@@ -159,6 +178,15 @@ static void event_locked(const HvDeviceAuthEvent *input, int from_guest, uint64_
     service.event_times[index] = now;
     service.event_next = (index + 1) % HV_DEVICE_AUTH_EVENT_COUNT;
     if (service.event_count < HV_DEVICE_AUTH_EVENT_COUNT) service.event_count++;
+    if (service.launch_id[0] && startup_stage(event->stage)) {
+        size_t i = 0;
+        while (i < service.startup_count && service.startup_events[i].stage != event->stage) i++;
+        if (i < HV_DEVICE_AUTH_STARTUP_EVENT_COUNT) {
+            if (i == service.startup_count) service.startup_count++;
+            service.startup_events[i] = *event;
+            service.startup_times[i] = now;
+        }
+    }
 }
 
 static int slot_context_current_locked(void) {
@@ -278,6 +306,7 @@ void hv_device_auth_begin(const char *session) {
     memset(service.events, 0, sizeof(service.events));
     memset(service.event_times, 0, sizeof(service.event_times));
     service.event_next = service.event_count = 0;
+    reset_startup_locked();
     notify_locked();
     pthread_mutex_unlock(&service.mutex);
 }
@@ -286,6 +315,7 @@ void hv_device_auth_end(void) {
     lock_service();
     revoke_locked(HV_DEVICE_AUTH_SESSION_CHANGED, now_ms());
     service.session[0] = service.launch_id[0] = 0;
+    reset_startup_locked();
     service.mode = HV_DEVICE_AUTH_MODE_NONE;
     service.running = service.foreground = service.published = 0;
     notify_locked();
@@ -333,6 +363,7 @@ HvDeviceAuthError hv_device_auth_enable(HvDeviceAuthMode mode, const char *launc
             memcpy(service.launch_id, launch, sizeof(launch));
             service.mode = mode;
             service.enabled = 1;
+            reset_startup_locked();
             host_event_locked(HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED, HV_DEVICE_AUTH_OK, now, 0, 0);
         }
     }
@@ -394,6 +425,17 @@ void hv_device_auth_snapshot(HvDeviceAuthState *out) {
         size_t index = (start + i) % HV_DEVICE_AUTH_EVENT_COUNT;
         out->events[i] = service.events[index];
         out->events[i].age_ms = now >= service.event_times[index] ? now - service.event_times[index] : 0;
+    }
+    out->startup_event_count = service.startup_count;
+    for (size_t i = 0; i < service.startup_count; i++) {
+        HvDeviceAuthEvent event = service.startup_events[i];
+        event.age_ms = now >= service.startup_times[i] ? now - service.startup_times[i] : 0;
+        size_t at = i;
+        while (at && out->startup_events[at - 1].sequence > event.sequence) {
+            out->startup_events[at] = out->startup_events[at - 1];
+            at--;
+        }
+        out->startup_events[at] = event;
     }
     pthread_mutex_unlock(&service.mutex);
 }
@@ -723,6 +765,8 @@ static const char *const stage_names[] = {
     "target_process_running", "target_process_not_running", "policy_flags_unavailable", "policy_runtime_on", "policy_runtime_off",
     "policy_library_flag_on", "policy_library_flag_off", "policy_dyld_env_allowed", "policy_dyld_env_not_allowed",
     "policy_library_exception_on", "policy_library_exception_off",
+    "policy_predicts_restriction", "policy_predicts_permission", "quit_requested", "quit_completed",
+    "quit_refused", "quit_timeout", "target_exited_before_adapter", "adapter_initialization_failed",
     "session_inactive", "host_request_queued", "host_request_started", "host_request_completed", "host_request_failed",
     "host_request_cancelled", "host_bridge_enabled", "host_bridge_disabled"
 };

@@ -222,6 +222,7 @@ __attribute__((constructor)) static void initializeAdapter(void) {
         dispatch_source_set_timer(stateTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, NSEC_PER_SEC / 4);
         dispatch_source_set_event_handler(stateTimer, ^{ refreshState(); });
         dispatch_resume(stateTimer);
-        event(request, @"adapter_ready", cachedActive() ? nil : HengeAuthError(1002), 0, 0, 0);
+        BOOL ready = cachedActive();
+        event(request, ready ? @"adapter_ready" : @"adapter_initialization_failed", ready ? nil : HengeAuthError(1002), 0, 0, 0);
     }
 }

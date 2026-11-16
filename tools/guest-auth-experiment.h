@@ -40,6 +40,7 @@ void HengeAuthEvent(NSString *session, NSString *launchID, NSString *requestID, 
 void HengeAuthFlushEvents(void);
 NSString *HengeAuthEventPath(void);
 BOOL HengeAuthEventWasRecorded(NSString *launchID, NSString *stage);
+BOOL HengeAuthReadyEventSucceeded(NSDictionary *event);
 NSError *HengeAuthError(NSInteger code);
 double HengeAuthMonotonic(void);
 void HengeAuthCaptureTestConfiguration(void);

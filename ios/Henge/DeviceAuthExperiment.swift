@@ -24,7 +24,7 @@ struct DeviceAuthExperimentSection: View {
     private var progress: DeviceAuthProgress { DeviceAuthProgress.read(state: state, helper: helper) }
 
     var body: some View {
-        Section("ChatGPT authentication · Test8") {
+        Section("ChatGPT authentication · Test9") {
             Text(progress.title).font(.headline)
             Text(progress.detail).font(.footnote).foregroundStyle(.secondary)
             Picker("Path", selection: $mode) {
@@ -39,7 +39,7 @@ struct DeviceAuthExperimentSection: View {
                     state = DeviceAuthSnapshot.state()
                 }
             } else {
-                Button("Start ChatGPT with iPad authentication") {
+                Button("Quit and start ChatGPT with iPad authentication") {
                     Diagnostics.recordAuthControl(.startRequested, mode: mode)
                     HostServices.shared.refreshForAuthenticationStart()
                     let selected = mode == "baa" ? HV_DEVICE_AUTH_MODE_BAA : HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN
@@ -53,12 +53,20 @@ struct DeviceAuthExperimentSection: View {
             if let actionError { Text("Could not start: \(actionError)").font(.caption).foregroundStyle(.red) }
             LabeledContent("Mac helper", value: helper.helperVersion > 0 ? "\(helper.helperVersion) · \(helper.connectionTitle)" : "Version unconfirmed · \(helper.connectionTitle)")
                 .font(.caption)
+            if helper.requiresAuthColdStartUpdate {
+                Text("Update the Mac helper with Install / Repair below. This test needs Helper 9's normal quit and cold-start capability.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if progress.adapterReadiness == "confirmed" {
+                LabeledContent("Adapter handshake", value: enabled ? "Confirmed for this attempt" : "Previously confirmed; permission stopped")
+                    .font(.caption)
+            }
             if progress.processObservation != "not_recorded" {
                 LabeledContent("ChatGPT at preflight", value: progress.processObservation == "running" ? "Running app observed" : "No running app observed")
                     .font(.caption)
             }
             if progress.stage != "none" { LabeledContent("Result stage", value: progress.stage).font(.caption.monospaced()) }
-            Text("Update the Mac helper once with Install / Repair in Sharing below. In the Mac, use ChatGPT → Quit ChatGPT or press ⌘Q; closing its window may leave it running. Then tap Start here. The helper launches the original app with a temporary adapter if its signature allows it.")
+            Text("Save your work in ChatGPT first. This button asks ChatGPT to quit normally, waits for its process to exit, then starts the original app once with a temporary adapter. Check the Mac for any save or quit prompt. The helper does not force-quit the app. macOS decides whether the adapter can load; signed policy information is a prediction, not a launch result.")
                 .font(.footnote).foregroundStyle(.secondary)
             Text("The BAA path uses a separate iPad signing process. Both paths return real Apple results; a generated result does not establish that Chat accepts it. Backgrounding Henge or ending the Mac session stops permission. No VM recreation is needed.")
                 .font(.footnote).foregroundStyle(.secondary)

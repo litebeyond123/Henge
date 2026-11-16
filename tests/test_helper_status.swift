@@ -17,6 +17,23 @@ import Foundation
         }
         let connected = try decode(value)
         check(connected.valid && connected.isConnected && connected.install == .confirmed)
+        check(!connected.supportsAuthColdStart && !connected.requiresAuthColdStartUpdate) // Missing fields are unknown.
+        value["helper_version"] = 8; value["auth_experiment_protocol"] = 1
+        let earlier = try decode(value)
+        check(earlier.supportsAuthExperiment && !earlier.supportsAuthColdStart && earlier.requiresAuthColdStartUpdate)
+        value["helper_version"] = 9; value["auth_experiment_protocol"] = 2
+        let current = try decode(value)
+        check(current.supportsAuthExperiment && current.supportsAuthColdStart && !current.requiresAuthColdStartUpdate)
+        check(current.diagnostics["auth_cold_start_capability_confirmed"] as? Bool == true)
+        value.removeValue(forKey: "helper_version")
+        let versionMissing = try decode(value)
+        check(!versionMissing.supportsAuthColdStart && !versionMissing.requiresAuthColdStartUpdate)
+        value["helper_version"] = 9; value.removeValue(forKey: "auth_experiment_protocol")
+        let capabilityMissing = try decode(value)
+        check(!capabilityMissing.supportsAuthColdStart && !capabilityMissing.requiresAuthColdStartUpdate)
+        value["auth_experiment_protocol"] = 1
+        check(try decode(value).requiresAuthColdStartUpdate) // An explicit earlier capability is evidence.
+        value["auth_experiment_protocol"] = 2
         value["agent_seen_s"] = 30
         let disconnected = try decode(value)
         check(!disconnected.isConnected && disconnected.install == .confirmed)

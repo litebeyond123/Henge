@@ -56,7 +56,13 @@ struct HelperHealthSnapshot: Equatable {
     }
 
     var isConnected: Bool { valid && !session.isEmpty && helperProtocol == 4 && agentSeenSeconds >= 0 && agentSeenSeconds < 30 }
-    var supportsAuthExperiment: Bool { isConnected && helperVersion > 0 && authExperimentProtocol == 1 }
+    var supportsAuthExperiment: Bool { isConnected && helperVersion > 0 && [1, 2].contains(authExperimentProtocol) }
+    var supportsAuthColdStart: Bool { isConnected && helperVersion >= 9 && authExperimentProtocol == 2 }
+    // An explicitly old capability is evidence for an update. A missing version
+    // or capability alone remains unknown, never proof of an old installation.
+    var requiresAuthColdStartUpdate: Bool {
+        isConnected && ((helperVersion > 0 && helperVersion < 9) || authExperimentProtocol == 1)
+    }
     var connectionTitle: String {
         if !valid { return "Status unavailable" }
         if session.isEmpty { return "Mac is not running" }
@@ -108,6 +114,8 @@ struct HelperHealthSnapshot: Equatable {
         ["status_available": valid, "session": session, "helper_protocol": helperProtocol, "helper_pid": helperPID,
          "helper_version": helperVersion, "auth_experiment_protocol": authExperimentProtocol,
          "auth_experiment_capability_confirmed": supportsAuthExperiment,
+         "auth_cold_start_capability_confirmed": supportsAuthColdStart,
+         "auth_cold_start_update_required": requiresAuthColdStartUpdate,
          "connected": isConnected, "agent_seen_seconds": agentSeenSeconds, "probe_seen_seconds": probeSeenSeconds,
          "install_seen_seconds": installSeenSeconds, "startup_stage": startup.rawValue, "install_stage": install.rawValue,
          "install_error": installError.rawValue, "install_exit_code": installExitCode]

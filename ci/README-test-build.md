@@ -1,6 +1,6 @@
 # Henge 0.4 test packages
 
-The test release is version **0.4.0**, build **4009**. This build setup starts
+The test release is version **0.4.0**, build **4010**. This build setup starts
 from the successful `2ed42fcf61f2f71eae15b57b8b4d8014fef9ab0f` workflow and
 keeps its `xcode-27` runner and dependency build procedure. It does not contain
 a prebuilt 0.4 app. A successful macOS build is required to produce one.
@@ -18,7 +18,7 @@ TrollStore **Henge.tipa** first, and uploads it with a JSON manifest and SHA-256
 checksum. Select `include_ipa` only if an additional sideloading IPA is needed.
 On `litebeyond123/Henge`, a successful push build of
 `work/0.4-ipados17-test` also publishes the validated package as the
-`v0.4.0-test8` prerelease. The publication job checks the package digest,
+`v0.4.0-test9` prerelease. The publication job checks the package digest,
 version, build and full source commit against this run's manifest before
 uploading it. That separate job alone has repository write permission.
 Other repositories and branches only receive build artifacts. The workflow
@@ -48,7 +48,10 @@ adapter resources. Signer-only entitlements must remain absent from Henge's
 main executable. Test 8 adds persistent startup-attempt diagnostics, explicit running helper capability,
 and authentication progress at the top of Details. The report separates a test
 that never started from a failed launch or Apple operation. Usage and limitations
-are in `docs/release-test8.md`.
+are in `docs/release-test8.md`. Test 9 replaces the local signing-policy refusal
+with one real OS-enforced launch after a verified normal application exit. The
+macOS fixture exercises cold restart, a declined quit, cancellation, and adapter
+handshake failures. Current usage and limits are in `docs/release-test9.md`.
 
 ## Local checks
 
@@ -72,7 +75,7 @@ installer receipts and helper startup transitions immediately in the native log;
 see `docs/release-test4.1.md`.
 
 Validate an actual downloaded build against the full source commit used by its
-workflow. The default expected version/build are 0.4.0/4009:
+workflow. The default expected version/build are 0.4.0/4010:
 
 ```sh
 python3 ci/validate-package.py /path/to/Henge.tipa \

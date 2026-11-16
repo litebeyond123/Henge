@@ -78,6 +78,18 @@ static int auth_json(const char *json, AuthJSON *out, int event) {
     return 1;
 }
 
+static void auth_add_events(Text *json, const HvDeviceAuthEvent *events, size_t count) {
+    for (size_t i=0;i<count;i++) {
+        const HvDeviceAuthEvent *e=&events[i];
+        if (i) adds(json,",");
+        addf(json,"{\"sequence\":%llu,\"age_ms\":%llu,\"from_guest\":%s,\"request_id\":\"%s\",\"launch_id\":\"%s\","
+            "\"stage\":\"%s\",\"errorDomain\":\"%s\",\"errorCode\":%lld,\"elapsedMs\":%u,\"inputBytes\":%u,\"resultBytes\":%u}",
+            (unsigned long long)e->sequence,(unsigned long long)e->age_ms,e->from_guest?"true":"false",e->request_id,e->launch_id,
+            hv_device_auth_stage_name(e->stage),hv_device_auth_domain_name(e->error_domain),(long long)e->error_code,
+            e->elapsed_ms,e->input_bytes,e->result_bytes);
+    }
+}
+
 char *hv_share_auth_state(void) {
     HvDeviceAuthState state;
     hv_device_auth_snapshot(&state);
@@ -95,15 +107,9 @@ char *hv_share_auth_state(void) {
         state.enable_attempts?hv_device_auth_error_name(state.last_enable_error):"not_attempted",
         !state.enable_attempts?"not_attempted":state.last_enable_mode==HV_DEVICE_AUTH_MODE_NONE?"invalid":hv_device_auth_mode_name(state.last_enable_mode),
         state.backend_registered?"true":"false",state.last_enable_backend_registered?"true":"false");
-    for (size_t i=0;i<state.event_count;i++) {
-        const HvDeviceAuthEvent *e=&state.events[i];
-        if (i) adds(&json,",");
-        addf(&json,"{\"sequence\":%llu,\"age_ms\":%llu,\"from_guest\":%s,\"request_id\":\"%s\",\"launch_id\":\"%s\","
-            "\"stage\":\"%s\",\"errorDomain\":\"%s\",\"errorCode\":%lld,\"elapsedMs\":%u,\"inputBytes\":%u,\"resultBytes\":%u}",
-            (unsigned long long)e->sequence,(unsigned long long)e->age_ms,e->from_guest?"true":"false",e->request_id,e->launch_id,
-            hv_device_auth_stage_name(e->stage),hv_device_auth_domain_name(e->error_domain),(long long)e->error_code,
-            e->elapsed_ms,e->input_bytes,e->result_bytes);
-    }
+    auth_add_events(&json,state.events,state.event_count);
+    adds(&json,"],\"startup_events\":[");
+    auth_add_events(&json,state.startup_events,state.startup_event_count);
     adds(&json,"],\"serverAcceptanceVerified\":false}\n");
     return json.s;
 }

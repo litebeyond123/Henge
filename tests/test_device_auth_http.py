@@ -329,7 +329,9 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         stages = ["target_process_running", "target_process_not_running", "policy_flags_unavailable",
                   "policy_runtime_on", "policy_runtime_off", "policy_library_flag_on", "policy_library_flag_off",
                   "policy_dyld_env_allowed", "policy_dyld_env_not_allowed", "policy_library_exception_on",
-                  "policy_library_exception_off"]
+                  "policy_library_exception_off", "policy_predicts_restriction", "policy_predicts_permission",
+                  "quit_requested", "quit_completed", "quit_refused", "quit_timeout",
+                  "target_exited_before_adapter", "adapter_initialization_failed"]
         event = {"protocol": 1, "launch_id": LAUNCH, "request_id": REQUEST,
                  "errorCode": 0, "elapsedMs": 0, "inputBytes": 0, "resultBytes": 0}
         for stage in stages:
@@ -342,7 +344,7 @@ class DeviceAuthHTTPTests(unittest.TestCase):
             self.assert_error(self.server.auth_post(dict(event, stage=stage), "event"), 400, "invalid_request")
         self.assert_error(self.server.auth_post(dict(event, stage=stages[0], signatureInfo="SYNTHETIC_INPUT_MATERIAL"), "event"),
                           400, "invalid_auth_json")
-        # The observed facts do not replace the separate, unchanged 1010 refusal.
+        # Old helper receipts remain readable; new policy predictions are only observations.
         refused = dict(event, stage="signature_policy_blocked", errorDomain="HengeAuthBridge", errorCode=1010)
         self.assertEqual(self.server.auth_post(refused, "event").status, 200)
         state = self.server.auth_state()
@@ -362,6 +364,58 @@ class DeviceAuthHTTPTests(unittest.TestCase):
         self.assertEqual((state["accepted_requests"], state["completed_requests"]), (0, 0))
         self.assertEqual(self.server.control("stats"), "wakes 0 takes 0")
         self.assertFalse(state["serverAcceptanceVerified"])
+
+    def test_startup_cache_survives_ring_wrap_and_state_stays_within_guest_limit(self):
+        self.enable()
+        stages = ["launch_requested", "target_not_found", "target_identity_mismatch", "target_signature_invalid",
+                  "signature_policy_blocked", "already_running", "launch_started", "launch_failed", "launch_timeout",
+                  "adapter_loaded", "adapter_not_loaded", "adapter_target_rejected", "adapter_abi_mismatch", "adapter_ready",
+                  "target_process_running", "target_process_not_running", "policy_flags_unavailable", "policy_runtime_on",
+                  "policy_runtime_off", "policy_library_flag_on", "policy_library_flag_off", "policy_dyld_env_allowed",
+                  "policy_dyld_env_not_allowed", "policy_library_exception_on", "policy_library_exception_off",
+                  "policy_predicts_restriction", "policy_predicts_permission", "quit_requested", "quit_completed",
+                  "quit_refused", "quit_timeout", "target_exited_before_adapter", "adapter_initialization_failed"]
+        event = {"protocol": 1, "launch_id": LAUNCH, "request_id": REQUEST,
+                 "errorDomain": "com.apple.MobileActivation.ErrorDomain", "errorCode": -(2 ** 31),
+                 "elapsedMs": 300000, "inputBytes": 128 * 1024, "resultBytes": 96 * 1024}
+        for stage in stages:
+            self.assertEqual(self.server.auth_post(dict(event, stage=stage), "event").status, 200)
+        for _ in range(70):
+            self.assertEqual(self.server.auth_post(dict(event, stage="probe_result"), "event").status, 200)
+        response = self.server.request("GET", PREFIX + "state")
+        self.assertEqual(response.status, 200)
+        self.assert_no_store(response)
+        self.assertLess(len(response.body), 32 * 1024)  # Existing guest parser's hard bound.
+        state = json.loads(response.body)
+        # Include the maximum decimal width of service-owned sequence/age values
+        # and a longest-stage recent ring without manufacturing billions of events.
+        sequence_age_growth = sum(40 - len(str(item["sequence"])) - len(str(item["age_ms"]))
+                                  for item in state["events"] + state["startup_events"])
+        stage_growth = 32 * (max(map(len, stages)) - len("probe_result"))
+        self.assertLess(len(response.body) + sequence_age_growth + stage_growth, 32 * 1024)
+        self.assertEqual(len(state["events"]), 32)
+        self.assertEqual({item["stage"] for item in state["events"]}, {"probe_result"})
+        self.assertEqual([item["stage"] for item in state["startup_events"]], ["host_bridge_enabled"] + stages)
+        self.assertTrue(all(item["launch_id"] == LAUNCH for item in state["startup_events"]))
+        # Repeated fixed stages replace their own slot, never another startup fact.
+        self.assertEqual(self.server.auth_post(dict(event, stage="quit_requested"), "event").status, 200)
+        cached = self.server.auth_state()["startup_events"]
+        self.assertEqual(len(cached), len(stages) + 1)
+        self.assertEqual(cached[-1]["stage"], "quit_requested")
+        self.assertEqual([item["sequence"] for item in cached], sorted(item["sequence"] for item in cached))
+        self.assertEqual(self.server.control("disable"), "ok")
+        stopped_response = self.server.request("GET", PREFIX + "state")
+        self.assertEqual(stopped_response.status, 200)
+        self.assertLess(len(stopped_response.body) + sequence_age_growth + stage_growth + 40, 32 * 1024)
+        stopped = json.loads(stopped_response.body)
+        self.assertEqual(len(stopped["startup_events"]), len(stages) + 2)
+        self.assertIn("adapter_ready", [item["stage"] for item in stopped["startup_events"]])
+        self.assertEqual(self.server.control("enable public_token " + LAUNCH_TWO), "enabled ok")
+        fresh = self.server.auth_state()
+        self.assertEqual(len(fresh["startup_events"]), 1)
+        self.assertEqual(fresh["startup_events"][0]["launch_id"], LAUNCH_TWO)
+        self.assertEqual(self.server.control("stats"), "wakes 0 takes 0")
+        self.assertFalse(fresh["serverAcceptanceVerified"])
 
     def test_background_discards_claimed_response_and_requires_new_enable(self):
         self.enable()

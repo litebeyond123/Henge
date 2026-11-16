@@ -60,6 +60,16 @@ static NSMutableDictionary *envelope(NSString *operation, NSDictionary *result) 
               @"diagnostics": @{@"status": @"success", @"errorDomain": @"", @"errorCode": @0}} mutableCopy];
 }
 static int unitTests(void) {
+    check(HengeAuthReadyEventSucceeded(@{@"stage": @"adapter_ready", @"errorDomain": @"", @"errorCode": @0}),
+          "only explicit zero-error adapter handshake establishes readiness");
+    for (NSDictionary *event in @[
+        @{@"stage": @"adapter_ready", @"errorDomain": @"HengeAuthBridge", @"errorCode": @1002},
+        @{@"stage": @"adapter_ready", @"errorDomain": @"", @"errorCode": @NO},
+        @{@"stage": @"adapter_ready", @"errorDomain": @"", @"errorCode": @"0"},
+        @{@"stage": @"adapter_ready", @"errorDomain": @"HengeAuthBridge", @"errorCode": @0},
+        @{@"stage": @"adapter_ready", @"errorCode": @0},
+        @{@"stage": @"adapter_loaded", @"errorDomain": @"", @"errorCode": @0}])
+        check(!HengeAuthReadyEventSucceeded(event), "missing, malformed or failed adapter handshake cannot report ready");
     NSMutableDictionary *state = [@{@"protocol": @1, @"enabled": @YES, @"session": session,
                                      @"launch_id": launch, @"mode": @"public_token"} mutableCopy];
     check(HengeAuthValidateState(json(state)) != nil, "current launch state accepted");
@@ -128,10 +138,10 @@ static int unitTests(void) {
     check(HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureRuntime), entitlementsKey: allowed}),
           "hardened runtime permits declared third-party dynamic library loading");
     check(!HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureRuntime), entitlementsKey:
-          @{@"com.apple.security.cs.disable-library-validation": @YES}}), "missing DYLD entitlement blocks launch");
+          @{@"com.apple.security.cs.disable-library-validation": @YES}}), "missing DYLD entitlement predicts a loading restriction");
     check(!HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureRuntime), entitlementsKey:
-          @{@"com.apple.security.cs.allow-dyld-environment-variables": @YES}}), "missing library-validation exception blocks launch");
-    check(!HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureLibraryValidation)}), "explicit library validation blocks foreign adapter");
+          @{@"com.apple.security.cs.allow-dyld-environment-variables": @YES}}), "missing library-validation exception predicts a loading restriction");
+    check(!HengeAuthSignaturePolicy(@{flagsKey: @(kSecCodeSignatureLibraryValidation)}), "explicit library validation predicts a foreign-adapter restriction");
     for (unsigned mask = 0; mask < 16; mask++) {
         BOOL runtime = (mask & 1) != 0, libraryFlag = (mask & 2) != 0;
         BOOL dyld = (mask & 4) != 0, exception = (mask & 8) != 0;
@@ -233,7 +243,7 @@ static int injectedFixture(void) {
     } else {
         [device generateTokenWithCompletionHandler:^(NSData *t, NSError *e) { token = t; error = e; dispatch_semaphore_signal(done); }];
         ok &= waitFor(done) && originalTokens == 0;
-        if ([scenario isEqual:@"public_success"]) {
+        if ([scenario isEqual:@"public_success"] || [scenario isEqual:@"closed_window_restart"]) {
             ok &= !error && [token isEqual:[@"SYNTHETIC_TOKEN_DO_NOT_LOG" dataUsingEncoding:NSUTF8StringEncoding]];
             __block id signature;
             [DCBAASigner.sharedSigner signatureForData:[NSData dataWithBytes:"x" length:1] completion:^(id s, id a, NSError *e) {
@@ -251,6 +261,7 @@ static int injectedFixture(void) {
         }
     }
     NSDictionary *result = @{@"passed": @(ok), @"scenario": scenario ?: @"missing",
+                              @"pid": @(getpid()),
                               @"original_token_calls": @(originalTokens),
                               @"original_single_calls": @(originalSingles), @"original_multiple_calls": @(originalMultiples)};
     NSData *data = json(result);
@@ -259,11 +270,23 @@ static int injectedFixture(void) {
     usleep(250000);
     return ok ? 0 : 1;
 }
-static int closedWindowFixture(NSString *marker) {
+@interface HengeQuitFixtureDelegate : NSObject <NSApplicationDelegate>
+@property BOOL refuseQuit;
+@end
+@implementation HengeQuitFixtureDelegate
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+    return self.refuseQuit ? NSTerminateCancel : NSTerminateNow;
+}
+@end
+static int closedWindowFixture(NSString *marker, BOOL refuseQuit) {
     // Only our owned fixture uses this entry point. Close a real AppKit window,
     // keep the main process running, and exit cooperatively when the test asks.
     NSApplication *application = NSApplication.sharedApplication;
     [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    __attribute__((objc_precise_lifetime)) HengeQuitFixtureDelegate *delegate = [HengeQuitFixtureDelegate new];
+    delegate.refuseQuit = refuseQuit;
+    application.delegate = delegate;
     [application finishLaunching];
     NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 120, 80)
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
@@ -280,17 +303,44 @@ static int closedWindowFixture(NSString *marker) {
     if (![data writeToFile:marker options:NSDataWritingAtomic error:NULL]) return 2;
     NSString *stop = [marker stringByAppendingString:@".stop"];
     double deadline = HengeAuthMonotonic() + 60;
-    while (HengeAuthMonotonic() < deadline) {
-        if ([NSFileManager.defaultManager fileExistsAtPath:stop]) return 0;
-        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-    }
-    return 3;
+    __block BOOL timedOut = NO;
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
+        BOOL stopped = [NSFileManager.defaultManager fileExistsAtPath:stop];
+        if (stopped || HengeAuthMonotonic() >= deadline) {
+            timedOut = !stopped;
+            [timer invalidate];
+            [application stop:nil];
+            NSEvent *wake = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint
+                modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
+            [application postEvent:wake atStart:YES];
+        }
+    }];
+    // A real NSApplication event loop handles the normal quit Apple event;
+    // refusal is expressed by its delegate, not a fabricated terminate result.
+    [application run];
+    [timer invalidate];
+    application.delegate = nil;
+    return timedOut ? 3 : 0;
+}
+static int launchOutcomeFixture(NSString *scenario, NSString *resultPath) {
+    NSDictionary *result = @{@"passed": @YES, @"scenario": scenario, @"pid": @(getpid())};
+    if (![json(result) writeToFile:resultPath options:NSDataWritingAtomic error:NULL]) return 2;
+    // These own targets deliberately exit without a successful adapter. The
+    // launcher must not convert their exit into a claim of OS policy rejection.
+    usleep(200000);
+    return [scenario isEqual:@"early_exit"] ? 42 : 0;
 }
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 2 && !strcmp(argv[1], "--unit")) return unitTests();
         if (argc == 3 && !strcmp(argv[1], "--hold-closed-window"))
-            return closedWindowFixture([NSString stringWithUTF8String:argv[2]]);
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], NO);
+        if (argc == 3 && !strcmp(argv[1], "--refuse-quit-closed-window"))
+            return closedWindowFixture([NSString stringWithUTF8String:argv[2]], YES);
+        NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+        NSString *scenario = info[@"HengeFixtureScenario"];
+        if ([@[@"hardened_filtered", @"early_exit", @"error_ready", @"loaded_then_exit"] containsObject:scenario ?: @""])
+            return launchOutcomeFixture(scenario, info[@"HengeFixtureResultPath"]);
         return injectedFixture();
     }
 }

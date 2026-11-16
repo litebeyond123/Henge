@@ -510,6 +510,14 @@ static void fixed_guest_preflight_observations(void) {
         {"policy_dyld_env_not_allowed", HV_DEVICE_AUTH_STAGE_POLICY_DYLD_ENV_NOT_ALLOWED},
         {"policy_library_exception_on", HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_ON},
         {"policy_library_exception_off", HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_OFF},
+        {"policy_predicts_restriction", HV_DEVICE_AUTH_STAGE_POLICY_PREDICTS_RESTRICTION},
+        {"policy_predicts_permission", HV_DEVICE_AUTH_STAGE_POLICY_PREDICTS_PERMISSION},
+        {"quit_requested", HV_DEVICE_AUTH_STAGE_QUIT_REQUESTED},
+        {"quit_completed", HV_DEVICE_AUTH_STAGE_QUIT_COMPLETED},
+        {"quit_refused", HV_DEVICE_AUTH_STAGE_QUIT_REFUSED},
+        {"quit_timeout", HV_DEVICE_AUTH_STAGE_QUIT_TIMEOUT},
+        {"target_exited_before_adapter", HV_DEVICE_AUTH_STAGE_TARGET_EXITED_BEFORE_ADAPTER},
+        {"adapter_initialization_failed", HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED},
     };
     setup(idle_wakeup);
     HvDeviceAuthEvent event = {0};
@@ -538,6 +546,52 @@ static void fixed_guest_preflight_observations(void) {
     CHECK(state.accepted_requests == 0 && state.completed_requests == 0 && atomic_load(&wakes) == 0);
 }
 
+static void startup_facts_survive_request_traffic_and_reset_only_with_new_launch(void) {
+    setup(idle_wakeup);
+    HvDeviceAuthEvent event = {0};
+    memcpy(event.request_id, REQUEST, sizeof(REQUEST));
+    const HvDeviceAuthStage startup[] = {HV_DEVICE_AUTH_STAGE_QUIT_REQUESTED, HV_DEVICE_AUTH_STAGE_QUIT_COMPLETED,
+        HV_DEVICE_AUTH_STAGE_LAUNCH_STARTED, HV_DEVICE_AUTH_STAGE_ADAPTER_LOADED, HV_DEVICE_AUTH_STAGE_ADAPTER_READY};
+    for (size_t i = 0; i < sizeof startup / sizeof startup[0]; i++) {
+        event.stage = startup[i];
+        CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    }
+    event.stage = HV_DEVICE_AUTH_STAGE_PROBE_RESULT;
+    for (int i = 0; i < 96; i++) CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    HvDeviceAuthState state;
+    hv_device_auth_snapshot(&state);
+    CHECK(state.event_count == HV_DEVICE_AUTH_EVENT_COUNT && state.startup_event_count == 6);
+    for (size_t i = 0; i < state.event_count; i++) CHECK(state.events[i].stage == HV_DEVICE_AUTH_STAGE_PROBE_RESULT);
+    CHECK(state.startup_events[5].stage == HV_DEVICE_AUTH_STAGE_ADAPTER_READY);
+    uint64_t old_sequence = state.startup_events[1].sequence;
+    event.stage = HV_DEVICE_AUTH_STAGE_QUIT_REQUESTED;
+    CHECK(hv_device_auth_record_event(SESSION, LAUNCH, &event) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.startup_event_count == 6 && state.startup_events[5].stage == HV_DEVICE_AUTH_STAGE_QUIT_REQUESTED);
+    CHECK(state.startup_events[5].sequence > old_sequence);
+    for (size_t i = 1; i < state.startup_event_count; i++)
+        CHECK(state.startup_events[i - 1].sequence < state.startup_events[i].sequence);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_BAA, LAUNCH_TWO) == HV_DEVICE_AUTH_MODE_CONFLICT);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.startup_event_count == 6); /* A failed enable cannot erase the authorized launch's evidence. */
+    hv_device_auth_disable();
+    hv_device_auth_snapshot(&state);
+    CHECK(!state.enabled && state.startup_event_count == 7);
+    CHECK(state.startup_events[6].stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_DISABLED);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH_TWO) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.startup_event_count == 1 && state.startup_events[0].stage == HV_DEVICE_AUTH_STAGE_HOST_BRIDGE_ENABLED);
+    CHECK(!strcmp(state.startup_events[0].launch_id, LAUNCH_TWO));
+    hv_device_auth_begin(SESSION_TWO);
+    hv_device_auth_snapshot(&state);
+    CHECK(state.startup_event_count == 0);
+    hv_device_auth_publish(1, 1);
+    CHECK(hv_device_auth_enable(HV_DEVICE_AUTH_MODE_PUBLIC_TOKEN, LAUNCH) == HV_DEVICE_AUTH_OK);
+    hv_device_auth_end();
+    hv_device_auth_snapshot(&state);
+    CHECK(state.startup_event_count == 0);
+}
+
 int main(void) {
     RUN(metadata_and_default_denial);
     RUN(enable_diagnostics_preserve_authorization);
@@ -554,6 +608,7 @@ int main(void) {
     RUN(rate_limit_is_enforced_before_backend);
     RUN(fixed_event_fields_and_bounded_history);
     RUN(fixed_guest_preflight_observations);
+    RUN(startup_facts_survive_request_traffic_and_reset_only_with_new_launch);
     RUN(stale_host_state_is_not_revived_by_a_late_publication);
     hv_device_auth_end();
     CHECK(hv_device_auth_set_wakeup(NULL, NULL));

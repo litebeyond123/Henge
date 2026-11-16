@@ -70,7 +70,7 @@ def macho(entitlements=None, der=None, minimum=0x110000, platform=2,
     return header + commands + sign
 
 
-def guest_app_archive(binary=None, extra=None, build="8"):
+def guest_app_archive(binary=None, extra=None, build=validator.EXPECTED_HELPER_BUILD):
     info = {"CFBundleIdentifier": "com.henge.guesthelper", "CFBundleExecutable": "henge-agent",
             "CFBundleVersion": build, "CFBundlePackageType": "APPL", "LSUIElement": True,
             "LSMinimumSystemVersion": "13.0", "NSLocalNetworkUsageDescription": "Connect to Henge."}
@@ -93,7 +93,7 @@ def guest_app_archive(binary=None, extra=None, build="8"):
 def members():
     info = {
         "CFBundleIdentifier": "com.henge.app", "CFBundleExecutable": "Henge",
-        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4009",
+        "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4010",
         "MinimumOSVersion": "17.0", "HengeBuildCommit": COMMIT[:12],
         "HengeBuildDate": "2026-11-15T00:00:00Z",
     }
@@ -155,7 +155,8 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(validator.EXPECTED_HELPER_BUILD, runtime.group(1))
         bundle = plistlib.loads((ROOT / "tools/HengeHelper-Info.plist").read_bytes())
         self.assertEqual(bundle["CFBundleVersion"], validator.EXPECTED_HELPER_BUILD)
-        for stale in ("7", "9", 8):
+        current = int(validator.EXPECTED_HELPER_BUILD)
+        for stale in (str(current - 1), str(current + 1), current):
             files = members()
             files["henge-helper.app.tar.gz"] = guest_app_archive(build=stale)
             self.write(files)

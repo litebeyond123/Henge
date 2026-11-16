@@ -15,6 +15,7 @@ extern "C" {
 #define HV_DEVICE_AUTH_TIMEOUT_DEFAULT_MS 12000u
 #define HV_DEVICE_AUTH_STATE_MAX_AGE_MS 5000u
 #define HV_DEVICE_AUTH_EVENT_COUNT 32u
+#define HV_DEVICE_AUTH_STARTUP_EVENT_COUNT 40u
 
 typedef enum {
     HV_DEVICE_AUTH_MODE_NONE = 0,
@@ -117,6 +118,16 @@ typedef enum {
     HV_DEVICE_AUTH_STAGE_POLICY_DYLD_ENV_NOT_ALLOWED,
     HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_ON,
     HV_DEVICE_AUTH_STAGE_POLICY_LIBRARY_EXCEPTION_OFF,
+    /* Signed flags predict a launch outcome; the OS still decides whether to
+       load the unmodified original app and independently signed adapter. */
+    HV_DEVICE_AUTH_STAGE_POLICY_PREDICTS_RESTRICTION,
+    HV_DEVICE_AUTH_STAGE_POLICY_PREDICTS_PERMISSION,
+    HV_DEVICE_AUTH_STAGE_QUIT_REQUESTED,
+    HV_DEVICE_AUTH_STAGE_QUIT_COMPLETED,
+    HV_DEVICE_AUTH_STAGE_QUIT_REFUSED,
+    HV_DEVICE_AUTH_STAGE_QUIT_TIMEOUT,
+    HV_DEVICE_AUTH_STAGE_TARGET_EXITED_BEFORE_ADAPTER,
+    HV_DEVICE_AUTH_STAGE_ADAPTER_INITIALIZATION_FAILED,
     HV_DEVICE_AUTH_STAGE_SESSION_INACTIVE,
     /* Host-only stages cannot be submitted by the guest event route. */
     HV_DEVICE_AUTH_STAGE_HOST_REQUEST_QUEUED,
@@ -159,6 +170,10 @@ typedef struct {
     int backend_registered, last_enable_backend_registered;
     size_t event_count;
     HvDeviceAuthEvent events[HV_DEVICE_AUTH_EVENT_COUNT]; /* Oldest first. */
+    /* Current launch only, newest observation per fixed startup stage, sorted
+       by service sequence. Request/probe traffic cannot evict these facts. */
+    size_t startup_event_count;
+    HvDeviceAuthEvent startup_events[HV_DEVICE_AUTH_STARTUP_EVENT_COUNT];
 } HvDeviceAuthState;
 
 typedef struct {
